@@ -5,13 +5,15 @@ Status: Development/Alpha
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. The program WiseMan-TimeLord probably should have done before doing other image based llm applications WiseMan-TimeLord have produced, this will be a simple image generation project, but eventually cover several encoders and image generation models.
 
 ### Requirements:
-- We will be programming to Python 3.12 or Python 3.13, and windows 10.
+- We will be programming to whatever is optimal between Python 3.11-3.13, and windows 10 22h2.
 - Vulkan 1.3 card is available with Vulkan 1.4 installed, but its on gpu 1 not gpu 0. On gpu 1 there is 8GB. we are not using GPU 0, gpu 1 is for the monitors. When compiling for Vulkan we will also ensure to include cpu optimizations too, so its optimized for, Vulkan, F16C, AVX, AVX2, FMA, if possible.
-- CPU is a zen 2 3900x with AOCL installed. if cannot load to Vulkan we will use by default 21 threads on the CPU. on the CPU we compile for F16C, AVX, AVX2, FMA, if possible.
-- Libraries for encoder, possibly we could have llama.cpp vulkan, download source and build.
+- CPU is aimed at zen 2 with AOCL installed. if cannot load to Vulkan. We compile CPU libraries/packages for F16C, AVX, AVX2, FMA, where possible. CPU will always use by default 85% threads on the CPU, where multi-thread will enhance performance during significant phases. Installer should detect the number of threads/cores during installation, and write this down to a key in ".\data\constants.ini". .
+- Libraries for encoder, possibly we could have llama.cpp vulkan, and stick that on the 8GB of vram on the passive secondary rx 470 (this is not hip, so stick to vulkan). 
 - Libraries for image generation, Stable Diffusion on CPU, if not able to be done on vulkan. If vulkan is an option then put the image generation model on the GPU, and have the encoder on the CPU instead.
+
+### Models...
+I put Q# because it should support any quantization, the model variety will be expanded upon later....
 - intended Encoding model, "Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf" and "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
-", I put Q# because it should support any quantization.
 - intended Image generation model "z_image_turbo-Q#.gguf" and "ae.safetensors". (again this should cover all quantizations)
 
 ### Structure:
