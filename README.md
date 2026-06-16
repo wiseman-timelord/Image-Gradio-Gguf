@@ -51,7 +51,7 @@ Image-Generator-Gguf/
 A small program in python with gradio 5...
 - Fixing compiling in installer.
 - Completing installer.
-- Implementing PyQt, or is it ok for now in browser?
+- Implementing PyQt (???), for built-in browser, for fake application style interface.
 - Rename to "Image-Gradio-Gguf"
 - Program needs to install and load without issus.
 - Test UI and json loading/saving.
