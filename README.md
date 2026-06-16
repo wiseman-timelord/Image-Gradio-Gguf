@@ -38,6 +38,7 @@ Image-Generator-Gguf/
 │   ├── constants.ini              # System constants & defaults
 │   └── persistent.json            # User configuration (auto-managed)
 ├── scripts/                       # All scripts have 6-10 letter names
+│   ├── __init__.py                # Empty init file.
 │   ├── configure.py                # Configuration, and all global variables/constants/maps/lists are here.
 │   ├── display.py                  # Gradio, Browser, Python Displays.
 │   ├── inference.py                  # Image generation, Model Handling, Text Generation.
