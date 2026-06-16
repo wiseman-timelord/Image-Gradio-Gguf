@@ -4,6 +4,39 @@ Status: Development/Alpha
 ### Description
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. The program WiseMan-TimeLord probably should have done before doing other image based llm applications WiseMan-TimeLord have produced, this will be a simple image generation project, but eventually cover several encoders and image generation models.
 
+### Media
+- Installer is looking nice now...
+```
+  ==============================================================================
+      Image-Generator-Gguf — Install Method
+  ==============================================================================
+
+
+
+  System Detections...
+     Platform: Windows 10; Python 3.12.4
+     Build Tools: Git OK; CMake OK
+     Architecture: SSE, SSE2, SSSE3, SSE4.1, SSE4.2, AVX, AVX2, F16C, FMA
+     Hardware: CPUs 24; GPUs 0, 1; Vulkan 1.4.341
+
+
+  -------------------------------------------------------------------------------
+
+
+     1. Clean Install (Purge First)
+
+     2. Check/Install (Fix Missing Packages/Libraries)
+
+     3. Refresh Configs (Only Remake Ini/Json)
+
+
+
+  ===============================================================================
+  Selection; Menu Options = 1-3, Abandon Install = A:
+
+
+```
+
 ### Requirements:
 - We will be programming towards Python ~3.12 and windows 10 22h2.
 - Vulkan 1.3 card is available with Vulkan 1.4 installed, but its on gpu 1 not gpu 0. On gpu 1 there is =>8GB. we are not using GPU 0, GPU 0 is for the monitors. When compiling for Vulkan we will also ensure to include cpu optimizations too, so its optimized for, Vulkan, F16C, AVX, AVX2, FMA, where possible.
