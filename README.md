@@ -1,4 +1,4 @@
-![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_generation.jpg)
+![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Generator-Gguf
 Status: Development/Alpha
 
