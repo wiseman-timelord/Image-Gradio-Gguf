@@ -85,36 +85,22 @@ Environment:
   warnings.warn(
 
 ```
-- Installer is looking nice now (~A003)...
+- Installer script has clever features such as route for Check/Reinstall, which can be a time-saver if you are on wireless broadband (A007)...
 ```
-  ==============================================================================
-      Image-Generator-Gguf — Install Method
-  ==============================================================================
+(...)
 
+  Backend compile  (Vulkan)  —  llama.cpp + stable-diffusion.cpp...
+  -----------------------------------------------------------------
 
+  llama.cpp...
+    llama-cli.exe already present, skipping clone and build.
+    llama.cpp  →  success (binary already present)
 
-  System Detections...
-     Platform: Windows 10; Python 3.12.4
-     Build Tools: Git OK; CMake OK
-     Architecture: SSE, SSE2, SSSE3, SSE4.1, SSE4.2, AVX, AVX2, F16C, FMA
-     Hardware: CPUs 24; GPUs 0, 1; Vulkan 1.4.341
+  stable-diffusion.cpp...
+    sd.exe not present, cloning and building...
+    Cloning stable-diffusion.cpp (ref: master) — attempt 1/3
 
-
-  -------------------------------------------------------------------------------
-
-
-     1. Clean Install (Purge First)
-
-     2. Check/Install (Fix Missing Packages/Libraries)
-
-     3. Refresh Configs (Only Remake Ini/Json)
-
-
-
-  ===============================================================================
-  Selection; Menu Options = 1-3, Abandon Install = A:
-
-
+(...)
 ```
 
 ### Requirements:
