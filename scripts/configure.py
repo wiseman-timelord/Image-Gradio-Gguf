@@ -33,6 +33,9 @@ CLIP_SKIP_CHOICES = [1, 2, 3]
 BATCH_COUNT_CHOICES = [1, 2, 3, 4]
 OUTPUT_FORMATS    = ["png", "jpg", "bmp"]
 
+# Key used by the unified bottom status bar shared across all pages.
+STATUS_BAR_KEY: str = "status"
+
 
 # ---------------------------------------------------------------------------
 # Runtime state  (transient — not persisted)
