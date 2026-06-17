@@ -64,18 +64,7 @@ I put Q# because it should support any quantization, the model variety will be e
 - intended Image generation model "z_image_turbo-Q#.gguf" and "ae.safetensors". (again this should cover all quantizations)
 
 ### Structure:
-- Initial plan...
-```
-.\Image-Generator-Gguf.bat  (name of program)
-.\launcher.py
-.\installer.py
-.\scripts\ (folder containing other required scripts, all having one word logical relating name with 6-10 letters)
-.\data\constants.ini  (any constants the main program needs to be aware of from install)
-.\data\persistent.json   (all variables reqired for the configuration page).
-.\output\   (folder with output images)
-.\models\   (default folder for models, though it should handle it if they are not there. The user is expected to set where the models are in the configuration page when the program loads).
-```
-...current result...
+- Current plan for sripts is...
 ```
 Image-Generator-Gguf/
 ├── Image-Generator-Gguf.bat      # Windows launcher batch file
@@ -97,11 +86,9 @@ Image-Generator-Gguf/
 ### Development:
 A small program in python with gradio 5...
 - Fixing compiling in installer.
-- Completing installer.
 - Implementing PyQt (???), for built-in browser, for fake application style interface.
-- Rename to "Image-Gradio-Gguf"
+- Rename to "Image-Gradio-Gguf". Uncertain.
 - Program needs to install and load without issus.
-- Test UI and json loading/saving.
 - Test inference.
 - Add edit image feature.
 
