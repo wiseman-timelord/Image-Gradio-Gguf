@@ -29,8 +29,6 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
   Diffusion: NOT SET
   VAE      : NOT SET
 
-C:\Inference_Files\Image-Generator-Gguf\Image-Generator-Gguf\scripts\display.py:558: UserWarning: The parameters have been moved from the Blocks constructor to the launch() method in Gradio 6.0: theme. Please pass these parameters to launch() instead.
-  with gr.Blocks(title="Image Generator GGUF",
 * Running on local URL:  http://127.0.0.1:7860
 * To create a public link, set `share=True` in `launch()`.
 ```
