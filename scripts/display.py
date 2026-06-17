@@ -82,71 +82,93 @@ def _thread_choices() -> List[int]:
 _gen: Dict[str, Any] = {}
 
 
+def _models_configured() -> bool:
+    """Return True if all three model paths are set and exist on disk."""
+    c = configure.load_persistent()
+    return all(
+        c.get(k) and Path(c[k]).exists()
+        for k in ("encoder_model_path", "imagegen_model_path", "vae_model_path")
+    )
+
+
 def _build_generate_tab_inner() -> None:
     """Build Generate tab widgets; store refs in _gen for later wiring."""
     cfg = _cfg()
     presets = configure.get_generation_presets()
+    configured = _models_configured()
 
-    gr.Markdown("## Generate Image")
-    gr.Markdown(
-        "Enter a prompt and click **Generate**. "
-        "Set model paths on the **Configuration** tab first."
-    )
+    prompt_ph  = ("Describe the image you want to generate..."
+                  if configured else "Set locations of models on Configuration page first...")
+    neg_ph     = ("Things to exclude..."
+                  if configured else "Set locations of models on Configuration page first...")
 
     with gr.Row():
+        # ── Left column: settings + gallery ──────────────────────────────────
         with gr.Column(scale=3):
+            gr.Markdown("### Settings")
             _gen["prompt_tb"] = gr.Textbox(
                 label="Prompt",
-                placeholder="Describe the image you want to generate...",
-                lines=4, max_lines=10,
+                placeholder=prompt_ph,
+                lines=2, max_lines=10,
                 value=cfg.get("last_prompt", ""),
             )
             _gen["negative_tb"] = gr.Textbox(
                 label="Negative Prompt",
-                placeholder="Things to exclude...",
-                lines=2,
+                placeholder=neg_ph,
+                lines=2, max_lines=10,
                 value=cfg.get("negative_prompt", ""),
             )
             with gr.Row():
-                _gen["generate_btn"] = gr.Button("Generate", variant="primary", size="lg")
-                _gen["stop_btn"]     = gr.Button("Stop", variant="stop")
-            _gen["output_gallery"] = gr.Gallery(
-                label="Generated Images",
-                columns=2, rows=1, height="auto", object_fit="contain",
-            )
-
-        with gr.Column(scale=2):
-            gr.Markdown("### Settings")
-            _gen["preset_dd"] = gr.Dropdown(
-                label="Preset", choices=list(presets.keys()), value="Fast (Turbo)",
-            )
+                _gen["preset_dd"] = gr.Dropdown(
+                    label="Preset", choices=list(presets.keys()), value="Fast (Turbo)",
+                )
+                _gen["enhance_chk"] = gr.Checkbox(label="Enhance prompt with LLM encoder", value=True)
+                
             with gr.Row():
                 _gen["width_dd"]  = gr.Dropdown(label="Width",  choices=configure.IMAGE_SIZES,
                                                 value=cfg.get("imagegen_width", 512))
                 _gen["height_dd"] = gr.Dropdown(label="Height", choices=configure.IMAGE_SIZES,
                                                 value=cfg.get("imagegen_height", 512))
-            _gen["steps_dd"] = gr.Dropdown(
-                label="Steps", choices=configure.STEP_CHOICES,
-                value=cfg.get("imagegen_steps", 4),
-            )
-            _gen["sampler_dd"] = gr.Dropdown(
-                label="Sampler", choices=list(configure.SAMPLER_MAP.keys()),
-                value=cfg.get("imagegen_sampling", "euler_a"),
-            )
-            _gen["cfg_scale_sld"] = gr.Slider(
-                label="CFG Scale", minimum=0.5, maximum=20.0, step=0.5,
-                value=cfg.get("imagegen_cfg_scale", 1.0),
-            )
+                _gen["sampler_dd"] = gr.Dropdown(
+                    label="Sampler", choices=list(configure.SAMPLER_MAP.keys()),
+                    value=cfg.get("imagegen_sampling", "euler_a"),
+                )
+            
             with gr.Row():
+                _gen["steps_dd"] = gr.Dropdown(
+                    label="Steps", choices=configure.STEP_CHOICES,
+                    value=cfg.get("imagegen_steps", 4),
+                )
+                _gen["cfg_scale_sld"] = gr.Slider(
+                    label="CFG Scale", minimum=0.5, maximum=20.0, step=0.5,
+                    value=cfg.get("imagegen_cfg_scale", 1.0),
+                )
                 _gen["seed_num"] = gr.Number(label="Seed (-1 = random)",
                                              value=cfg.get("imagegen_seed", -1), precision=0)
                 _gen["batch_dd"] = gr.Dropdown(label="Batch Count",
                                                choices=configure.BATCH_COUNT_CHOICES,
-                                               value=cfg.get("imagegen_batch_count", 1))
-            _gen["enhance_chk"] = gr.Checkbox(label="Enhance prompt with LLM encoder", value=True)
+                                               value=cfg.get("imagegen_batch_count", 1)
+                )                               
+
             _gen["save_btn"]    = gr.Button("Save as Default", size="sm")
 
-    # Preset change can be wired immediately (no status output needed)
+        # ── Right column: prompts + generate ─────────────────────────────────
+        with gr.Column(scale=2):
+
+            with gr.Row(visible=configured) as _gen["generate_row"]:
+                _gen["generate_btn"] = gr.Button("Generate", variant="primary", size="lg")
+                _gen["stop_btn"]     = gr.Button("Stop", variant="stop")
+                 
+
+            _gen["output_gallery"] = gr.Gallery(
+                label="Generated Images",
+                columns=2, rows=1, height="auto", object_fit="contain",
+            )
+
+
+
+
+    # Preset change wired immediately
     presets_map = presets
 
     def apply_preset(name: str):
@@ -164,6 +186,24 @@ def _build_generate_tab_inner() -> None:
 
 def _wire_generate_events(status_box: gr.Textbox) -> None:
     """Register Generate tab event handlers that output to shared status_box."""
+    import threading
+
+    # ── Inactivity timeout (20 min after last generation finishes) ──
+    _INACTIVITY_SECONDS = 20 * 60
+    _timeout_timer: Dict[str, Any] = {"handle": None}
+
+    def _reset_inactivity_timer():
+        if _timeout_timer["handle"] is not None:
+            _timeout_timer["handle"].cancel()
+        t = threading.Timer(_INACTIVITY_SECONDS, inference.unload_models)
+        t.daemon = True
+        t.start()
+        _timeout_timer["handle"] = t
+
+    def _cancel_inactivity_timer():
+        if _timeout_timer["handle"] is not None:
+            _timeout_timer["handle"].cancel()
+            _timeout_timer["handle"] = None
 
     def do_generate(prompt, negative, width, height, steps, sampler,
                     cfg_scale, seed, batch, enhance,
@@ -175,6 +215,9 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             return [], "Image generation model not configured. Go to Configuration tab."
         if not c.get("vae_model_path") or not Path(c["vae_model_path"]).exists():
             return [], "VAE model not configured. Go to Configuration tab."
+
+        # Cancel any pending unload while we are generating
+        _cancel_inactivity_timer()
 
         gen_cfg = dict(c)
         gen_cfg.update(
@@ -194,6 +237,10 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
         result = inference.generate_image(prompt.strip(), gen_cfg,
                                           progress_callback=prog_cb)
+
+        # Start inactivity timer now that generation is finished
+        _reset_inactivity_timer()
+
         if result["success"] and result["output_path"]:
             msg = (f"{result['message']} | Seed: {result['seed_used']} "
                    f"| Time: {result['elapsed_seconds']}s")
@@ -233,6 +280,25 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         outputs=status_box,
     )
 
+    # ── Refresh generate_row visibility when prompt changes ──
+    # (covers the case where config was done and user returns to Generate tab)
+    def _refresh_generate_row(prompt_val):
+        configured = _models_configured()
+        prompt_ph = ("Describe the image you want to generate..."
+                     if configured else "Set locations of models on Configuration page first...")
+        neg_ph    = ("Things to exclude..."
+                     if configured else "Set locations of models on Configuration page first...")
+        return (
+            gr.update(visible=configured),
+            gr.update(placeholder=prompt_ph),
+            gr.update(placeholder=neg_ph),
+        )
+
+    _gen["prompt_tb"].focus(
+        _refresh_generate_row,
+        inputs=_gen["prompt_tb"],
+        outputs=[_gen["generate_row"], _gen["prompt_tb"], _gen["negative_tb"]],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -250,53 +316,44 @@ def _build_config_tab_inner() -> None:
     threads = _thread_choices()
     dt      = configure.get_default_threads()
 
-    gr.Markdown("## Configuration")
-    gr.Markdown(
-        "Set model paths and backend options. "
-        "Use **Browse** to locate files or **Scan** to auto-detect in `models/`."
-    )
-
     # ── Model paths ──
     gr.Markdown("### Model Paths")
     with gr.Row():
-        with gr.Column():
-            _cfg_w["enc_path_tb"] = gr.Textbox(
-                label="Encoder Model (GGUF)",
-                value=cfg.get("encoder_model_path", ""),
-                placeholder="Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q4_K_M.gguf",
-                info="LLM for prompt enhancement. Any Q# quantization.",
-            )
-            _cfg_w["enc_name_tb"] = gr.Textbox(label="Encoder Name",
-                                     value=cfg.get("encoder_model_name", ""))
-            with gr.Row():
-                _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm")
-                _cfg_w["enc_scan_btn"]   = gr.Button("Scan models/", size="sm")
+        _cfg_w["enc_path_tb"] = gr.Textbox(
+            label="Encoder Model",
+            value=cfg.get("encoder_model_path", ""),
+            placeholder="Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q4_K_M.gguf",
+            info="LLM for prompt enhancement. Any Q# quantization.",
+            scale=8,
+        )
+        _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+    # Hidden name textboxes kept for save_all compatibility — not shown
+    _cfg_w["enc_name_tb"] = gr.Textbox(
+        value=cfg.get("encoder_model_name", ""), visible=False)
 
-        with gr.Column():
-            _cfg_w["diff_path_tb"] = gr.Textbox(
-                label="Image Generation Model (GGUF)",
-                value=cfg.get("imagegen_model_path", ""),
-                placeholder="z_image_turbo-Q4_K_M.gguf",
-                info="Diffusion model. Any Q# quantization.",
-            )
-            _cfg_w["diff_name_tb"] = gr.Textbox(label="Diffusion Name",
-                                      value=cfg.get("imagegen_model_name", ""))
-            with gr.Row():
-                _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm")
-                _cfg_w["diff_scan_btn"]   = gr.Button("Scan models/", size="sm")
+    with gr.Row():
+        _cfg_w["diff_path_tb"] = gr.Textbox(
+            label="Diffusion Model",
+            value=cfg.get("imagegen_model_path", ""),
+            placeholder="z_image_turbo-Q4_K_M.gguf",
+            info="Diffusion model. Any Q# quantization.",
+            scale=8,
+        )
+        _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+    _cfg_w["diff_name_tb"] = gr.Textbox(
+        value=cfg.get("imagegen_model_name", ""), visible=False)
 
-        with gr.Column():
-            _cfg_w["vae_path_tb"] = gr.Textbox(
-                label="VAE Model (Safetensors)",
-                value=cfg.get("vae_model_path", ""),
-                placeholder="ae.safetensors",
-                info="Autoencoder for image decoding.",
-            )
-            _cfg_w["vae_name_tb"] = gr.Textbox(label="VAE Name",
-                                     value=cfg.get("vae_model_name", ""))
-            with gr.Row():
-                _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm")
-                _cfg_w["vae_scan_btn"]   = gr.Button("Scan models/", size="sm")
+    with gr.Row():
+        _cfg_w["vae_path_tb"] = gr.Textbox(
+            label="VAE Model",
+            value=cfg.get("vae_model_path", ""),
+            placeholder="ae.safetensors",
+            info="Autoencoder for image decoding.",
+            scale=8,
+        )
+        _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+    _cfg_w["vae_name_tb"] = gr.Textbox(
+        value=cfg.get("vae_model_name", ""), visible=False)
 
     # ── Backend selection ──
     is_cpu_only = configure.get_install_type() == "cpu_only"
@@ -313,62 +370,77 @@ def _build_config_tab_inner() -> None:
             "CPU = run on processor. Vulkan GPU N = run on that GPU."
         )
     with gr.Row():
-        _cfg_w["enc_backend_dd"] = gr.Dropdown(
-            label="Encoder Backend",
-            choices=choices,
-            value=_default_backend_value("backend_encoder"),
-            info="Where to run the LLM prompt encoder.",
-            interactive=not is_cpu_only,
-        )
-        _cfg_w["img_backend_dd"] = gr.Dropdown(
-            label="ImageGen Backend",
-            choices=choices,
-            value=_default_backend_value("backend_imagegen"),
-            info="Where to run image diffusion.",
-            interactive=not is_cpu_only,
-        )
 
-    # ── Encoder (LLM) settings ──
-    gr.Markdown("### Encoder (LLM) Settings")
-    with gr.Row():
-        _cfg_w["enc_threads_dd"] = gr.Dropdown(
-            label="CPU Threads",
-            choices=threads,
-            value=cfg.get("encoder_threads", dt),
-            info=f"Detected default: {dt} (85% of {configure.get_cpu_info()['cores_logical']} logical cores)",
-        )
-        _cfg_w["enc_batch_dd"] = gr.Dropdown(label="Batch Size",
-                                   choices=configure.BATCH_SIZE_CHOICES,
-                                   value=cfg.get("encoder_batch_size", 512))
-        _cfg_w["enc_ctx_dd"] = gr.Dropdown(label="Context Size",
-                                 choices=configure.CTX_SIZE_CHOICES,
-                                 value=cfg.get("encoder_ctx_size", 4096))
-        _cfg_w["enc_ngl_dd"] = gr.Dropdown(label="GPU Layers (-1 = all)",
-                                 choices=configure.GPU_LAYER_CHOICES,
-                                 value=0 if is_cpu_only else cfg.get("encoder_gpu_layers", -1),
-                                 info="Layers to offload to GPU. Not applicable for CPU-only install." if is_cpu_only else "Layers to offload to GPU. Ignored for CPU backend.",
-                                 interactive=not is_cpu_only,
-                                 )
-    _cfg_w["enc_flash_chk"] = gr.Checkbox(
-        label="Flash Attention",
-        value=cfg.get("encoder_flash_attn", True),
-        info="Reduces VRAM usage for long contexts.",
-    )
+        with gr.Column(scale=2):
+            _cfg_w["enc_backend_dd"] = gr.Dropdown(
+                label="Encoder Backend",
+                choices=choices,
+                value=_default_backend_value("backend_encoder"),
+                info="Where to run the LLM prompt encoder.",
+                interactive=not is_cpu_only,
+            )
 
-    # ── ImageGen settings ──
-    gr.Markdown("### Image Generation Settings")
+
+        with gr.Column(scale=2):
+            _cfg_w["img_backend_dd"] = gr.Dropdown(
+                label="ImageGen Backend",
+                choices=choices,
+                value=_default_backend_value("backend_imagegen"),
+                info="Where to run image diffusion.",
+                interactive=not is_cpu_only,
+            )
+
     with gr.Row():
-        _cfg_w["img_threads_dd"] = gr.Dropdown(
-            label="CPU Threads",
-            choices=threads,
-            value=cfg.get("imagegen_threads", dt),
-        )
-        _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
-                                  choices=configure.CLIP_SKIP_CHOICES,
-                                  value=cfg.get("imagegen_clip_skip", 2))
-        _cfg_w["out_fmt_dd"] = gr.Dropdown(label="Output Format",
-                                 choices=configure.OUTPUT_FORMATS,
-                                 value=cfg.get("output_format", "png"))
+
+        with gr.Column(scale=2):
+
+            # ── Encoder (LLM) settings ──
+            gr.Markdown("### Encoder (LLM) Settings")
+            with gr.Row():
+                _cfg_w["enc_threads_dd"] = gr.Dropdown(
+                    label="CPU Threads",
+                    choices=threads,
+                    value=cfg.get("encoder_threads", dt),
+                )
+                _cfg_w["enc_batch_dd"] = gr.Dropdown(label="Batch Size",
+                                           choices=configure.BATCH_SIZE_CHOICES,
+                                           value=cfg.get("encoder_batch_size", 512))
+                _cfg_w["enc_ctx_dd"] = gr.Dropdown(label="Context Size",
+                                         choices=configure.CTX_SIZE_CHOICES,
+                                         value=cfg.get("encoder_ctx_size", 4096))
+
+            with gr.Row():
+
+                _cfg_w["enc_ngl_dd"] = gr.Dropdown(label="GPU Layers",
+                                         choices=configure.GPU_LAYER_CHOICES,
+                                         value=0 if is_cpu_only else cfg.get("encoder_gpu_layers", -1),
+                                         info="Not applicable for CPU-only install." if is_cpu_only else "(-1 = all).",
+                                         interactive=not is_cpu_only,
+                                         )                
+                _cfg_w["enc_flash_chk"] = gr.Checkbox(
+                    label="Flash Attention",
+                    value=cfg.get("encoder_flash_attn", True),
+                    info="Reduces VRAM usage for long contexts.",
+                )
+
+       
+        with gr.Column(scale=2):
+            # ── ImageGen settings ──
+            gr.Markdown("### Image Generation Settings")
+            with gr.Row():
+                _cfg_w["img_threads_dd"] = gr.Dropdown(
+                    label="CPU Threads",
+                    choices=threads,
+                    value=cfg.get("imagegen_threads", dt),
+                )
+                _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
+                                          choices=configure.CLIP_SKIP_CHOICES,
+                                          value=cfg.get("imagegen_clip_skip", 2))
+
+            with gr.Row():
+                _cfg_w["out_fmt_dd"] = gr.Dropdown(label="Output Format",
+                                         choices=configure.OUTPUT_FORMATS,
+                                         value=cfg.get("output_format", "png"))
 
     # ── Prompt template ──
     gr.Markdown("### Advanced")
@@ -380,7 +452,9 @@ def _build_config_tab_inner() -> None:
     )
 
     # ── Save ──
-    _cfg_w["save_all_btn"] = gr.Button("Save All Configuration", variant="primary", size="lg")
+    with gr.Row():
+        _cfg_w["save_all_btn"]    = gr.Button("Save All Configuration", variant="primary", size="lg")
+        _cfg_w["unload_btn"]      = gr.Button("Unload Models", variant="secondary", size="lg")
 
     # ── Events: browse & scan — no status output, wire immediately ──
     def _browse():
@@ -390,25 +464,6 @@ def _build_config_tab_inner() -> None:
     _cfg_w["enc_browse_btn"].click(_browse,  outputs=[_cfg_w["enc_path_tb"],  _cfg_w["enc_name_tb"]])
     _cfg_w["diff_browse_btn"].click(_browse, outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"]])
     _cfg_w["vae_browse_btn"].click(_browse,  outputs=[_cfg_w["vae_path_tb"],  _cfg_w["vae_name_tb"]])
-
-    def _scan(keyword: str, ext: str):
-        models_dir = configure.get_models_dir()
-        if not models_dir.exists():
-            return "", ""
-        models = inference.scan_directory(str(models_dir), (ext,))
-        cats   = inference.categorize_models(models)
-        for cat in ("encoder", "diffusion", "vae", "unknown"):
-            for m in cats.get(cat, []):
-                if keyword.lower() in m.get("filename", "").lower():
-                    return m["file"], m.get("filename", "")
-        return "", ""
-
-    _cfg_w["enc_scan_btn"].click(lambda: _scan("qwen",  ".gguf"),
-                       outputs=[_cfg_w["enc_path_tb"],  _cfg_w["enc_name_tb"]])
-    _cfg_w["diff_scan_btn"].click(lambda: _scan("turbo", ".gguf"),
-                        outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"]])
-    _cfg_w["vae_scan_btn"].click(lambda: _scan("ae",    ".safetensors"),
-                       outputs=[_cfg_w["vae_path_tb"],  _cfg_w["vae_name_tb"]])
 
 
 def _wire_config_events(status_box: gr.Textbox) -> None:
@@ -454,6 +509,11 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["img_threads_dd"], w["img_clip_dd"], w["out_fmt_dd"],
             w["prompt_template_tb"],
         ],
+        outputs=status_box,
+    )
+
+    w["unload_btn"].click(
+        lambda: (inference.unload_models(), "Models unloaded.")[1],
         outputs=status_box,
     )
 
@@ -554,11 +614,6 @@ def _copy_to_clipboard(text: str) -> str:
 def _build_debug_tab_inner() -> gr.Textbox:
     """Build Debug tab widgets; copy/refresh wired immediately (no status output needed
     for refresh). Copy result wired later via _wire_debug_events."""
-    gr.Markdown("## Debug / System Info")
-    gr.Markdown(
-        "Live system info sourced from `constants.ini` and runtime state. "
-        "Click **Refresh** to update. Click **Copy** to copy to clipboard."
-    )
     with gr.Row():
         _dbg["refresh_btn"] = gr.Button("Refresh", variant="primary")
         _dbg["copy_btn"]    = gr.Button("Copy to Clipboard")
