@@ -875,7 +875,7 @@ def _detect_build_tools() -> Tuple[Optional[Path], Optional[Path]]:
 
 def _print_install_banner(cpu: Dict[str, Any], vk: Dict[str, Any]) -> None:
     git, cmake = _detect_build_tools()
-    header("Image-Generator-Gguf — Install Method")
+    header("Image-Gradio-Gguf — Install Method")
     print()
     print()
     print("  System Detections...")
@@ -944,7 +944,7 @@ def _run_deps(cpu: Dict[str, Any]) -> None:
 
 def _print_backend_banner(vk: Dict[str, Any]) -> None:
     vk_label = "detected" if vk["available"] else "not detected"
-    header("Image-Generator-Gguf — Backend Selection")
+    header("Image-Gradio-Gguf — Backend Selection")
     print()
     print()
     print()
@@ -1043,7 +1043,7 @@ def main() -> None:
     args = parser.parse_args()
     
     ensure_dirs()
-    header("Image-Generator-Gguf — Initialize Install")
+    header("Image-Gradio-Gguf — Initialize Install")
     
     if args.detect_only:
         cpu, vk = run_detection()
@@ -1083,7 +1083,7 @@ def main() -> None:
         if choice == "1":
             t0 = time.time()
             use_vulkan = _choose_backend(vk)
-            header("Image-Generator-Gguf — Installation")
+            header("Image-Gradio-Gguf — Installation")
             _purge_for_clean_install()
             write_constants(cpu, vk, use_vulkan=use_vulkan)
             write_default_persistent(cpu)
@@ -1094,7 +1094,7 @@ def main() -> None:
         if choice == "2":
             t0 = time.time()
             use_vulkan = _choose_backend(vk)
-            header("Image-Generator-Gguf — Installation")
+            header("Image-Gradio-Gguf — Installation")
             write_constants(cpu, vk, use_vulkan=use_vulkan)
             write_default_persistent(cpu)
             _run_deps(cpu)

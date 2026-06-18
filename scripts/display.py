@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/env python3
 """
 display.py - Gradio 5 UI for Image Generator GGUF.
 Three tabs: Generate | Configuration | Debug / Info
@@ -11,6 +11,7 @@ import os
 import platform
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +75,43 @@ def _thread_choices() -> List[int]:
     return configure.get_thread_choices()
 
 
+def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
+    """
+    Given a diffusion model path, look for ae.safetensors in the same directory.
+    Returns (vae_full_path, vae_stem) or ("", "") if not found.
+    """
+    if not diff_path_str:
+        return "", ""
+    p = Path(diff_path_str).expanduser()
+    if not p.exists():
+        return "", ""
+    parent = p.parent
+    # Search for ae.safetensors (case-insensitive)
+    for f in parent.iterdir():
+        if f.is_file() and f.name.lower() == "ae.safetensors":
+            return str(f), f.stem
+    return "", ""
+
+
+# ---------------------------------------------------------------------------
+# Recent images helpers
+# ---------------------------------------------------------------------------
+
+def _get_recent_images(max_images: int = 50) -> List[str]:
+    """Return paths of images in the output folder, newest first."""
+    out_dir = configure.get_output_dir()
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    try:
+        files = [
+            f for f in out_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in exts
+        ]
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        return [str(f) for f in files[:max_images]]
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Tab 1 — Generate  (UI widgets + event wiring split for shared status)
 # ---------------------------------------------------------------------------
@@ -103,7 +141,7 @@ def _build_generate_tab_inner() -> None:
                   if configured else "Set locations of models on Configuration page first...")
 
     with gr.Row():
-        # ── Left column: settings + gallery ──────────────────────────────────
+        # ── Left column: settings ────────────────────────────────────────────
         with gr.Column(scale=3):
             gr.Markdown("### Settings")
             _gen["prompt_tb"] = gr.Textbox(
@@ -122,18 +160,21 @@ def _build_generate_tab_inner() -> None:
                 _gen["preset_dd"] = gr.Dropdown(
                     label="Preset", choices=list(presets.keys()), value="Fast (Turbo)",
                 )
-                _gen["enhance_chk"] = gr.Checkbox(label="Enhance prompt with LLM encoder", value=True)
-                
+                _gen["sampler_dd"] = gr.Dropdown(
+                    label="Sampler", choices=list(configure.SAMPLER_MAP.keys()),
+                    value=cfg.get("imagegen_sampling", "euler_a"),
+                )
+
             with gr.Row():
                 _gen["width_dd"]  = gr.Dropdown(label="Width",  choices=configure.IMAGE_SIZES,
                                                 value=cfg.get("imagegen_width", 512))
                 _gen["height_dd"] = gr.Dropdown(label="Height", choices=configure.IMAGE_SIZES,
                                                 value=cfg.get("imagegen_height", 512))
-                _gen["sampler_dd"] = gr.Dropdown(
-                    label="Sampler", choices=list(configure.SAMPLER_MAP.keys()),
-                    value=cfg.get("imagegen_sampling", "euler_a"),
+                _gen["output_fmt_dd"] = gr.Dropdown(
+                    label="Output Format", choices=configure.OUTPUT_FORMATS,
+                    value=cfg.get("output_format", "png"),
                 )
-            
+
             with gr.Row():
                 _gen["steps_dd"] = gr.Dropdown(
                     label="Steps", choices=configure.STEP_CHOICES,
@@ -148,25 +189,29 @@ def _build_generate_tab_inner() -> None:
                 _gen["batch_dd"] = gr.Dropdown(label="Batch Count",
                                                choices=configure.BATCH_COUNT_CHOICES,
                                                value=cfg.get("imagegen_batch_count", 1)
-                )                               
+                )
 
             _gen["save_btn"]    = gr.Button("Save as Default", size="sm")
 
-        # ── Right column: prompts + generate ─────────────────────────────────
+        # ── Right column: generate + gallery ────────────────────────────────
         with gr.Column(scale=2):
-
             with gr.Row(visible=configured) as _gen["generate_row"]:
                 _gen["generate_btn"] = gr.Button("Generate", variant="primary", size="lg")
                 _gen["stop_btn"]     = gr.Button("Stop", variant="stop")
-                 
 
             _gen["output_gallery"] = gr.Gallery(
                 label="Generated Images",
-                columns=2, rows=1, height="auto", object_fit="contain",
+                columns=2, rows=2,
+                height=585,
+                object_fit="contain",
             )
 
-
-
+            # ── Recent images strip (horizontal scroll, thumbnails) ──
+            _gen["recent_strip"] = gr.HTML(
+                value="",
+                label=None,
+                elem_id="recent-strip-wrap",
+            )
 
     # Preset change wired immediately
     presets_map = presets
@@ -205,8 +250,38 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             _timeout_timer["handle"].cancel()
             _timeout_timer["handle"] = None
 
+    # ── Recent images strip renderer ──
+    def _render_recent_strip() -> str:
+        paths = _get_recent_images()
+        if not paths:
+            return (
+                '<div id="recent-strip-wrap">'
+                '<div id="recent-strip-label">Recent Images</div>'
+                '<div id="recent-strip"><span id="recent-empty">No images generated yet.</span></div>'
+                '</div>'
+            )
+        thumbs = []
+        for p in paths:
+            # Convert to a file:// URL the browser can load; forward-slash for Windows
+            url = Path(p).as_uri()
+            fname = Path(p).name
+            thumbs.append(
+                f'<img class="recent-thumb" src="{url}" title="{fname}" '
+                f'onclick="(function(src){{var g=document.querySelector(\'#output_gallery img\');'
+                f'if(!g)return;'
+                f'document.querySelectorAll(\'.recent-thumb\').forEach(function(t){{t.classList.remove(\'selected\');}});'
+                f'this.classList.add(\'selected\');}}).call(this,\'{url}\')" />'
+            )
+        body = "\n".join(thumbs)
+        return (
+            '<div id="recent-strip-wrap">'
+            '<div id="recent-strip-label">Recent Images</div>'
+            f'<div id="recent-strip">{body}</div>'
+            '</div>'
+        )
+
     def do_generate(prompt, negative, width, height, steps, sampler,
-                    cfg_scale, seed, batch, enhance,
+                    cfg_scale, seed, batch, output_format,
                     progress=gr.Progress()):
         if not prompt or not prompt.strip():
             return [], "Please enter a prompt."
@@ -226,9 +301,9 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             imagegen_cfg_scale=float(cfg_scale),
             imagegen_seed=int(seed), imagegen_batch_count=int(batch),
             negative_prompt=negative,
+            output_format=output_format,
         )
-        if not enhance:
-            gen_cfg["encoder_model_path"] = ""
+        # Always use encoder if path is set; no toggle needed
 
         configure.APP_STATE["cancel_requested"] = False
 
@@ -244,16 +319,16 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         if result["success"] and result["output_path"]:
             msg = (f"{result['message']} | Seed: {result['seed_used']} "
                    f"| Time: {result['elapsed_seconds']}s")
-            return [result["output_path"]], msg
-        return [], result.get("message", "Unknown error")
+            return [result["output_path"]], msg, _render_recent_strip()
+        return [], result.get("message", "Unknown error"), _render_recent_strip()
 
     _gen["generate_btn"].click(
         do_generate,
         inputs=[_gen["prompt_tb"], _gen["negative_tb"],
                 _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
                 _gen["sampler_dd"], _gen["cfg_scale_sld"],
-                _gen["seed_num"], _gen["batch_dd"], _gen["enhance_chk"]],
-        outputs=[_gen["output_gallery"], status_box],
+                _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"]],
+        outputs=[_gen["output_gallery"], status_box, _gen["recent_strip"]],
     )
 
     _gen["stop_btn"].click(
@@ -262,13 +337,14 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         outputs=status_box,
     )
 
-    def save_defaults(width, height, steps, sampler, cfg_scale, seed, batch, neg):
+    def save_defaults(width, height, steps, sampler, cfg_scale, seed, batch, neg, output_format):
         configure.update_persistent({
             "imagegen_width": int(width), "imagegen_height": int(height),
             "imagegen_steps": int(steps), "imagegen_sampling": sampler,
             "imagegen_cfg_scale": float(cfg_scale),
             "imagegen_seed": int(seed), "imagegen_batch_count": int(batch),
             "negative_prompt": neg,
+            "output_format": output_format,
         })
         return "Defaults saved!"
 
@@ -276,12 +352,12 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         save_defaults,
         inputs=[_gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
                 _gen["sampler_dd"], _gen["cfg_scale_sld"],
-                _gen["seed_num"], _gen["batch_dd"], _gen["negative_tb"]],
+                _gen["seed_num"], _gen["batch_dd"], _gen["negative_tb"],
+                _gen["output_fmt_dd"]],
         outputs=status_box,
     )
 
     # ── Refresh generate_row visibility when prompt changes ──
-    # (covers the case where config was done and user returns to Generate tab)
     def _refresh_generate_row(prompt_val):
         configured = _models_configured()
         prompt_ph = ("Describe the image you want to generate..."
@@ -316,46 +392,44 @@ def _build_config_tab_inner() -> None:
     threads = _thread_choices()
     dt      = configure.get_default_threads()
 
-    # ── Model paths ──
+    # ── Model paths (encoder + diffusion on one row) ──
     gr.Markdown("### Model Paths")
-    with gr.Row():
-        _cfg_w["enc_path_tb"] = gr.Textbox(
-            label="Encoder Model",
-            value=cfg.get("encoder_model_path", ""),
-            placeholder="Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q4_K_M.gguf",
-            info="LLM for prompt enhancement. Any Q# quantization.",
-            scale=8,
-        )
-        _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
-    # Hidden name textboxes kept for save_all compatibility — not shown
-    _cfg_w["enc_name_tb"] = gr.Textbox(
-        value=cfg.get("encoder_model_name", ""), visible=False)
+    # Path textboxes are hidden — used internally by browse callbacks and save
+    _cfg_w["enc_path_tb"]  = gr.Textbox(value=cfg.get("encoder_model_path", ""),  visible=False)
+    _cfg_w["diff_path_tb"] = gr.Textbox(value=cfg.get("imagegen_model_path", ""), visible=False)
 
     with gr.Row():
-        _cfg_w["diff_path_tb"] = gr.Textbox(
-            label="Diffusion Model",
-            value=cfg.get("imagegen_model_path", ""),
-            placeholder="z_image_turbo-Q4_K_M.gguf",
-            info="Diffusion model. Any Q# quantization.",
-            scale=8,
-        )
-        _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
-    _cfg_w["diff_name_tb"] = gr.Textbox(
-        value=cfg.get("imagegen_model_name", ""), visible=False)
+        with gr.Column(scale=4):
+            with gr.Row():
+                _cfg_w["enc_name_tb"] = gr.Textbox(
+                    label="Encoder Name",
+                    value=cfg.get("encoder_model_name", ""),
+                    placeholder="Qwen3-4b-Z-Image-Turbo",
+                    info="Encoder model file stem — auto-filled when you Browse.",
+                    interactive=True,
+                    scale=8,
+                )
+                _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
 
-    with gr.Row():
-        _cfg_w["vae_path_tb"] = gr.Textbox(
-            label="VAE Model",
-            value=cfg.get("vae_model_path", ""),
-            placeholder="ae.safetensors",
-            info="Autoencoder for image decoding.",
-            scale=8,
-        )
-        _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+        with gr.Column(scale=4):
+            with gr.Row():
+                _cfg_w["diff_name_tb"] = gr.Textbox(
+                    label="Diffusion Name",
+                    value=cfg.get("imagegen_model_name", ""),
+                    placeholder="z_image_turbo",
+                    info="Diffusion model file stem — auto-filled when you Browse.",
+                    interactive=True,
+                    scale=8,
+                )
+                _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+
+    # ── VAE path is auto-detected from diffusion model folder; stored hidden ──
+    _cfg_w["vae_path_tb"] = gr.Textbox(
+        value=cfg.get("vae_model_path", ""), visible=False)
     _cfg_w["vae_name_tb"] = gr.Textbox(
         value=cfg.get("vae_model_name", ""), visible=False)
 
-    # ── Backend selection ──
+    # ── Backend selection + CPU threads (consolidated) ──
     is_cpu_only = configure.get_install_type() == "cpu_only"
 
     gr.Markdown("### Backend Selection")
@@ -370,7 +444,6 @@ def _build_config_tab_inner() -> None:
             "CPU = run on processor. Vulkan GPU N = run on that GPU."
         )
     with gr.Row():
-
         with gr.Column(scale=2):
             _cfg_w["enc_backend_dd"] = gr.Dropdown(
                 label="Encoder Backend",
@@ -380,6 +453,13 @@ def _build_config_tab_inner() -> None:
                 interactive=not is_cpu_only,
             )
 
+        with gr.Column(scale=1):
+            _cfg_w["threads_dd"] = gr.Dropdown(
+                label="CPU Threads (both encoder & imagegen)",
+                choices=threads,
+                value=cfg.get("encoder_threads", dt),
+                info="Leave some free for browsing etc.",
+            )
 
         with gr.Column(scale=2):
             _cfg_w["img_backend_dd"] = gr.Dropdown(
@@ -391,17 +471,10 @@ def _build_config_tab_inner() -> None:
             )
 
     with gr.Row():
-
+        # ── Encoder (LLM) settings ──
         with gr.Column(scale=2):
-
-            # ── Encoder (LLM) settings ──
             gr.Markdown("### Encoder (LLM) Settings")
             with gr.Row():
-                _cfg_w["enc_threads_dd"] = gr.Dropdown(
-                    label="CPU Threads",
-                    choices=threads,
-                    value=cfg.get("encoder_threads", dt),
-                )
                 _cfg_w["enc_batch_dd"] = gr.Dropdown(label="Batch Size",
                                            choices=configure.BATCH_SIZE_CHOICES,
                                            value=cfg.get("encoder_batch_size", 512))
@@ -410,37 +483,25 @@ def _build_config_tab_inner() -> None:
                                          value=cfg.get("encoder_ctx_size", 4096))
 
             with gr.Row():
-
                 _cfg_w["enc_ngl_dd"] = gr.Dropdown(label="GPU Layers",
                                          choices=configure.GPU_LAYER_CHOICES,
                                          value=0 if is_cpu_only else cfg.get("encoder_gpu_layers", -1),
                                          info="Not applicable for CPU-only install." if is_cpu_only else "(-1 = all).",
                                          interactive=not is_cpu_only,
-                                         )                
+                                         )
                 _cfg_w["enc_flash_chk"] = gr.Checkbox(
                     label="Flash Attention",
                     value=cfg.get("encoder_flash_attn", True),
                     info="Reduces VRAM usage for long contexts.",
                 )
 
-       
+        # ── ImageGen settings ──
         with gr.Column(scale=2):
-            # ── ImageGen settings ──
             gr.Markdown("### Image Generation Settings")
             with gr.Row():
-                _cfg_w["img_threads_dd"] = gr.Dropdown(
-                    label="CPU Threads",
-                    choices=threads,
-                    value=cfg.get("imagegen_threads", dt),
-                )
                 _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
                                           choices=configure.CLIP_SKIP_CHOICES,
                                           value=cfg.get("imagegen_clip_skip", 2))
-
-            with gr.Row():
-                _cfg_w["out_fmt_dd"] = gr.Dropdown(label="Output Format",
-                                         choices=configure.OUTPUT_FORMATS,
-                                         value=cfg.get("output_format", "png"))
 
     # ── Prompt template ──
     gr.Markdown("### Advanced")
@@ -457,13 +518,38 @@ def _build_config_tab_inner() -> None:
         _cfg_w["unload_btn"]      = gr.Button("Unload Models", variant="secondary", size="lg")
 
     # ── Events: browse & scan — no status output, wire immediately ──
-    def _browse():
+    def _browse_encoder():
         p = _browse_file()
         return (p, Path(p).stem) if p else (gr.update(), gr.update())
 
-    _cfg_w["enc_browse_btn"].click(_browse,  outputs=[_cfg_w["enc_path_tb"],  _cfg_w["enc_name_tb"]])
-    _cfg_w["diff_browse_btn"].click(_browse, outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"]])
-    _cfg_w["vae_browse_btn"].click(_browse,  outputs=[_cfg_w["vae_path_tb"],  _cfg_w["vae_name_tb"]])
+    def _browse_diffusion():
+        p = _browse_file()
+        if p:
+            stem = Path(p).stem
+            vae_path, vae_name = _detect_vae(p)
+            return p, stem, vae_path, vae_name
+        return gr.update(), gr.update(), gr.update(), gr.update()
+
+    _cfg_w["enc_browse_btn"].click(
+        _browse_encoder,
+        outputs=[_cfg_w["enc_path_tb"], _cfg_w["enc_name_tb"]]
+    )
+    _cfg_w["diff_browse_btn"].click(
+        _browse_diffusion,
+        outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"],
+                 _cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
+    )
+
+    # When diffusion path is changed manually, auto-detect VAE
+    def _on_diff_path_change(path: str):
+        vae_path, vae_name = _detect_vae(path)
+        return vae_path, vae_name
+
+    _cfg_w["diff_path_tb"].change(
+        _on_diff_path_change,
+        inputs=_cfg_w["diff_path_tb"],
+        outputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
+    )
 
 
 def _wire_config_events(status_box: gr.Textbox) -> None:
@@ -471,9 +557,9 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
     w = _cfg_w
 
     def save_all(ep, en, dp, dn, vp, vn,
-                 enc_back, img_back,
-                 et, eb, ec, engl, ef,
-                 it, ic, of, pt):
+                 enc_back, img_back, threads,
+                 eb, ec, engl, ef,
+                 ic, pt):
         enc_parsed = configure.parse_backend_choice(enc_back)
         img_parsed = configure.parse_backend_choice(img_back)
         configure.update_persistent({
@@ -485,14 +571,13 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "encoder_vulkan_device": enc_parsed["vulkan_device"],
             "imagegen_vulkan_device": img_parsed["vulkan_device"],
             "vulkan_device":         img_parsed["vulkan_device"],
-            "encoder_threads":     int(et),
+            "encoder_threads":     int(threads),
+            "imagegen_threads":    int(threads),
             "encoder_batch_size":  int(eb),
             "encoder_ctx_size":    int(ec),
             "encoder_gpu_layers":  int(engl),
             "encoder_flash_attn":  bool(ef),
-            "imagegen_threads":    int(it),
             "imagegen_clip_skip":  int(ic),
-            "output_format":       of,
             "prompt_template":     pt,
             "first_run":           False,
         })
@@ -503,11 +588,10 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
         inputs=[
             w["enc_path_tb"], w["enc_name_tb"], w["diff_path_tb"], w["diff_name_tb"],
             w["vae_path_tb"], w["vae_name_tb"],
-            w["enc_backend_dd"], w["img_backend_dd"],
-            w["enc_threads_dd"], w["enc_batch_dd"], w["enc_ctx_dd"],
+            w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
+            w["enc_batch_dd"], w["enc_ctx_dd"],
             w["enc_ngl_dd"], w["enc_flash_chk"],
-            w["img_threads_dd"], w["img_clip_dd"], w["out_fmt_dd"],
-            w["prompt_template_tb"],
+            w["img_clip_dd"], w["prompt_template_tb"],
         ],
         outputs=status_box,
     )
@@ -523,78 +607,82 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
 # ---------------------------------------------------------------------------
 
 def _collect_debug() -> str:
-    import time
-    cpu  = configure.get_cpu_info()
-    vk   = configure.get_vulkan_info()
-    mem  = utilities.get_memory_info()
-    bs   = utilities.get_build_status()
-    cfg  = configure.load_persistent()
-    env  = utilities.get_relevant_env()
-
-    enc_path  = cfg.get("encoder_model_path", "")
-    diff_path = cfg.get("imagegen_model_path", "")
-    vae_path  = cfg.get("vae_model_path", "")
-
-    L: List[str] = []
-    L.append("=" * 72)
-    L.append(f"  DEBUG REPORT  {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    L.append("=" * 72)
-
-    L.append(f"\nPython  : {platform.python_version()}")
+    """Collect system information; returns a string. Errors are caught and shown."""
     try:
-        import gradio as gr
-        L.append(f"Gradio  : {gr.__version__}")
-    except Exception:
-        L.append("Gradio  : not importable")
-    L.append(f"Platform: {platform.platform()}")
+        import time
+        cpu  = configure.get_cpu_info()
+        vk   = configure.get_vulkan_info()
+        mem  = utilities.get_memory_info()
+        bs   = utilities.get_build_status()
+        cfg  = configure.load_persistent()
+        env  = utilities.get_relevant_env()
 
-    L.append(f"\nCPU     : {cpu['brand']}  [{cpu['vendor']}]  {cpu['cores_logical']} threads")
-    L.append(f"Default : {cpu['default_threads']} threads (85%)")
-    L.append(f"AVX2:{cpu['has_avx2']}  F16C:{cpu['has_f16c']}  FMA:{cpu['has_fma']}  "
-             f"AVX512:{cpu['has_avx512']}  AOCL:{cpu['has_aocl']}")
+        enc_path  = cfg.get("encoder_model_path", "")
+        diff_path = cfg.get("imagegen_model_path", "")
+        vae_path  = cfg.get("vae_model_path", "")
 
-    if mem:
-        L.append(f"\nRAM     : {mem.get('ram_used_mb','?')} / "
-                 f"{mem.get('ram_total_mb','?')} MB  ({mem.get('ram_percent','?')}%)")
+        L: List[str] = []
+        L.append("=" * 72)
+        L.append(f"  DEBUG REPORT  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        L.append("=" * 72)
 
-    L.append(f"\nVulkan  : {vk['available']}  ver={vk['version']}")
-    L.append(f"SDK     : {vk['sdk'] or 'not set'}")
-    for d in vk["devices"]:
-        L.append(f"  GPU{d['index']}: {d['name']}")
+        L.append(f"\nPython  : {platform.python_version()}")
+        try:
+            import gradio as gr
+            L.append(f"Gradio  : {gr.__version__}")
+        except Exception:
+            L.append("Gradio  : not importable")
+        L.append(f"Platform: {platform.platform()}")
 
-    L.append(f"\nllama.cpp : {'built  ' + bs['llama_path'] if bs['llama_built'] else 'NOT BUILT'}")
-    L.append(f"sd.cpp    : {'built  ' + bs['sd_path']    if bs['sd_built']    else 'NOT BUILT'}")
+        L.append(f"\nCPU     : {cpu['brand']}  [{cpu['vendor']}]  {cpu['cores_logical']} threads")
+        L.append(f"Default : {cpu['default_threads']} threads (85%)")
+        L.append(f"AVX2:{cpu['has_avx2']}  F16C:{cpu['has_f16c']}  FMA:{cpu['has_fma']}  "
+                 f"AVX512:{cpu['has_avx512']}  AOCL:{cpu['has_aocl']}")
 
-    ll = inference.find_llama_cli()
-    sd = inference.find_sd_cpp()
-    L.append(f"\nllama-cli : {ll or 'NOT FOUND'}")
-    L.append(f"sd exe    : {sd or 'NOT FOUND'}")
+        if mem:
+            L.append(f"\nRAM     : {mem.get('ram_used_mb','?')} / "
+                     f"{mem.get('ram_total_mb','?')} MB  ({mem.get('ram_percent','?')}%)")
 
-    def _status(p: str) -> str:
-        if not p:
-            return "NOT SET"
-        return ("EXISTS  " if Path(p).exists() else "MISSING ") + p
+        L.append(f"\nVulkan  : {vk['available']}  ver={vk['version']}")
+        L.append(f"SDK     : {vk['sdk'] or 'not set'}")
+        for d in vk["devices"]:
+            L.append(f"  GPU{d['index']}: {d['name']}")
 
-    L.append(f"\nEncoder  : {_status(enc_path)}")
-    L.append(f"Diffusion: {_status(diff_path)}")
-    L.append(f"VAE      : {_status(vae_path)}")
+        L.append(f"\nllama.cpp : {'built  ' + bs['llama_path'] if bs['llama_built'] else 'NOT BUILT'}")
+        L.append(f"sd.cpp    : {'built  ' + bs['sd_path']    if bs['sd_built']    else 'NOT BUILT'}")
 
-    L.append(f"\nEnc backend : {cfg.get('backend_encoder','?')}")
-    L.append(f"Img backend : {cfg.get('backend_imagegen','?')}")
-    L.append(f"Enc threads : {cfg.get('encoder_threads','?')}")
-    L.append(f"Img threads : {cfg.get('imagegen_threads','?')}")
-    L.append(f"Size        : {cfg.get('imagegen_width','?')}×{cfg.get('imagegen_height','?')}")
-    L.append(f"Steps       : {cfg.get('imagegen_steps','?')}  "
-             f"CFG: {cfg.get('imagegen_cfg_scale','?')}  "
-             f"Sampler: {cfg.get('imagegen_sampling','?')}")
+        ll = inference.find_llama_cli()
+        sd = inference.find_sd_cpp()
+        L.append(f"\nllama-cli : {ll or 'NOT FOUND'}")
+        L.append(f"sd exe    : {sd or 'NOT FOUND'}")
 
-    if env:
-        L.append(f"\nEnvironment:")
-        for k, v in sorted(env.items()):
-            L.append(f"  {k} = {v}")
+        def _status(p: str) -> str:
+            if not p:
+                return "NOT SET"
+            return ("EXISTS  " if Path(p).exists() else "MISSING ") + p
 
-    L.append("\n" + "=" * 72)
-    return "\n".join(L)
+        L.append(f"\nEncoder  : {_status(enc_path)}")
+        L.append(f"Diffusion: {_status(diff_path)}")
+        L.append(f"VAE      : {_status(vae_path)}")
+
+        L.append(f"\nEnc backend : {cfg.get('backend_encoder','?')}")
+        L.append(f"Img backend : {cfg.get('backend_imagegen','?')}")
+        L.append(f"Enc threads : {cfg.get('encoder_threads','?')}")
+        L.append(f"Img threads : {cfg.get('imagegen_threads','?')}")
+        L.append(f"Size        : {cfg.get('imagegen_width','?')}×{cfg.get('imagegen_height','?')}")
+        L.append(f"Steps       : {cfg.get('imagegen_steps','?')}  "
+                 f"CFG: {cfg.get('imagegen_cfg_scale','?')}  "
+                 f"Sampler: {cfg.get('imagegen_sampling','?')}")
+
+        if env:
+            L.append(f"\nEnvironment:")
+            for k, v in sorted(env.items()):
+                L.append(f"  {k} = {v}")
+
+        L.append("\n" + "=" * 72)
+        return "\n".join(L)
+    except Exception as e:
+        return f"Error collecting debug info:\n\n{traceback.format_exc()}"
 
 
 def _copy_to_clipboard(text: str) -> str:
@@ -612,26 +700,53 @@ def _copy_to_clipboard(text: str) -> str:
 
 
 def _build_debug_tab_inner() -> gr.Textbox:
-    """Build Debug tab widgets; copy/refresh wired immediately (no status output needed
-    for refresh). Copy result wired later via _wire_debug_events."""
+    """Build Debug tab widgets; copy/refresh wired later."""
     with gr.Row():
         _dbg["refresh_btn"] = gr.Button("Refresh", variant="primary")
         _dbg["copy_btn"]    = gr.Button("Copy to Clipboard")
+    # Pre-populate with debug info (no need for app.load)
     _dbg["info_text"] = gr.Textbox(
         label="System Information",
         interactive=False,
         lines=38, max_lines=80,
         autoscroll=False,
+        value=_collect_debug(),   # Call directly to show info on load
     )
 
     _dbg["refresh_btn"].click(_collect_debug, outputs=_dbg["info_text"])
-    return _dbg["info_text"]   # required for app.load wiring
+    return _dbg["info_text"]
 
 
 def _wire_debug_events(status_box: gr.Textbox) -> None:
     """Register Debug tab copy event that outputs to shared status_box."""
     _dbg["copy_btn"].click(
         _copy_to_clipboard, inputs=_dbg["info_text"], outputs=status_box
+    )
+
+
+def _render_recent_strip_standalone() -> str:
+    """Module-level wrapper so app.load can reference it before _wire_generate_events runs."""
+    paths = _get_recent_images()
+    if not paths:
+        return (
+            '<div id="recent-strip-wrap">'
+            '<div id="recent-strip-label">Recent Images</div>'
+            '<div id="recent-strip"><span id="recent-empty">No images generated yet.</span></div>'
+            '</div>'
+        )
+    thumbs = []
+    for p in paths:
+        url = Path(p).as_uri()
+        fname = Path(p).name
+        thumbs.append(
+            f'<img class="recent-thumb" src="{url}" title="{fname}" />'
+        )
+    body = "\n".join(thumbs)
+    return (
+        '<div id="recent-strip-wrap">'
+        '<div id="recent-strip-label">Recent Images</div>'
+        f'<div id="recent-strip">{body}</div>'
+        '</div>'
     )
 
 
@@ -643,7 +758,65 @@ def build_app() -> gr.Blocks:
     """Assemble and return the Gradio application."""
     configure.ensure_data_dirs()
 
-    with gr.Blocks(title="Image Generator GGUF") as app:
+    _css = """
+#exit-btn {
+    min-height: 3.5rem !important;
+    background: #a93226 !important;
+    border-color: #922b21 !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+    font-size: 1rem !important;
+}
+#exit-btn:hover { background: #c0392b !important; }
+
+#recent-strip-wrap {
+    border: 1px solid var(--border-color-primary, #444);
+    border-radius: 6px;
+    padding: 6px 8px;
+    background: var(--background-fill-secondary, #1a1a1a);
+}
+#recent-strip-label {
+    font-size: 0.75rem;
+    color: var(--body-text-color-subdued, #888);
+    margin-bottom: 4px;
+    user-select: none;
+}
+#recent-strip {
+    display: flex;
+    flex-direction: row;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 4px;
+    min-height: 80px;
+}
+#recent-strip::-webkit-scrollbar { height: 5px; }
+#recent-strip::-webkit-scrollbar-track { background: transparent; }
+#recent-strip::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+.recent-thumb {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+    width: 80px;
+    height: 80px;
+    object-fit: cover;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: border-color 0.15s, transform 0.1s;
+}
+.recent-thumb:hover { border-color: var(--color-accent, #888); transform: scale(1.05); }
+.recent-thumb.selected { border-color: var(--button-primary-background-fill, #6e7bff); }
+#recent-empty {
+    font-size: 0.8rem;
+    color: var(--body-text-color-subdued, #888);
+    line-height: 80px;
+    padding-left: 4px;
+}
+"""
+
+    with gr.Blocks(title="Image Generator GGUF", css=_css) as app:
         gr.Markdown("# Image Generator GGUF")
         gr.Markdown(
             "Local image generation using GGUF diffusion models "
@@ -662,13 +835,6 @@ def build_app() -> gr.Blocks:
                 info_text = _build_debug_tab_inner()
 
         # ── Unified bottom bar (spans below all tabs) ─────────────────────────
-        gr.HTML("""
-<style>
-  #bottom-bar { margin-top: 0.75rem; padding-top: 0.5rem; align-items: stretch; }
-  #exit-btn { min-height: 3.5rem !important; background: #a93226 !important; border-color: #922b21 !important; color: #fff !important; font-weight: 700 !important; font-size: 1rem !important; }
-  #exit-btn:hover { background: #c0392b !important; }
-</style>
-""")
         with gr.Row(elem_id="bottom-bar"):
             shared_status = gr.Textbox(
                 value="Ready.",
@@ -691,11 +857,11 @@ def build_app() -> gr.Blocks:
         exit_btn.click(lambda: os._exit(0), inputs=[], outputs=[])
 
         # Wire all per-tab events to the shared status box.
-        # We do this by calling the wiring helpers now that shared_status exists.
         _wire_generate_events(shared_status)
         _wire_config_events(shared_status)
         _wire_debug_events(shared_status)
 
-        app.load(_collect_debug, outputs=info_text)
+        # Populate recent images strip on load
+        app.load(_render_recent_strip_standalone, outputs=_gen["recent_strip"])
 
     return app
