@@ -10,7 +10,7 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/generate_page.jpg)
 
 - Configure page...  
-![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/configureation_page.jpg)
+![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/configuration_page.jpg)
 
 - Program starts something like this (A005)...
 ```
