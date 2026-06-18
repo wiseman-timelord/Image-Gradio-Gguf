@@ -111,10 +111,7 @@ Image-Generator-Gguf/
 
 ### Development:
 A small program in python with gradio 5...
-- Fixing compiling in installer.
 - Implementing PyQt (???), for built-in browser, for fake application style interface.
-- Rename to "Image-Gradio-Gguf". Uncertain.
-- Program needs to install and load without issus.
 - Test inference.
 - Add edit image feature.
 
