@@ -6,21 +6,20 @@ Status: Development/Alpha
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. The program WiseMan-TimeLord probably should have done before doing other image based llm applications WiseMan-TimeLord have produced, this will be a simple image generation project, but eventually cover several encoders and image generation models.
 
 ### Media
-- Main/Generation page...  
+- Main/Generation page (A010)...  
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/generate_page.jpg)
 
-- Configure page...  
+- Configure page (A010)...  
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/configuration_page.jpg)
 
-- Program starts something like this (A005)...
+- Program starts something like this (A010)...
 ```
-
   Starting application at http://127.0.0.1:7860
 
 
   ============================================================
     Image Generator GGUF
-    Python 3.12.4  |  Gradio 6.18.0
+    Python 3.12.4  |  Gradio 6.19.0
   ============================================================
 
   CPU     : AMD Ryzen 9 3900X 12-Core Processor
@@ -38,6 +37,7 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 
 * Running on local URL:  http://127.0.0.1:7860
 * To create a public link, set `share=True` in `launch()`.
+
 ```
 - Installer script has Check/Reinstall feature, incase issues during install (A007)...
 ```
