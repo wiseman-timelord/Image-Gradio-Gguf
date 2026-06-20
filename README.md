@@ -68,13 +68,13 @@ Currently...
 - If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, I cant remember the exact prompt, but you can compare it to my picture of a Woodchuck standing next to a pile of wood and juggling small logs of wood.
 
 ### Notation:
-- I strongly advise generating 256x256 images unless you need them larger, as 256x256 images took 22 seconds where as 512x512 images took multiple minuts, on my older hardware. This is not such a problem if you have newer hardware such as 4090, did I mention I need sponsorship/donation so I too can have such hardware. 
+- If you have older hardware, then I strongly advise generating 256x256 images unless you need them larger, as 256x256 images took 22 seconds where as 512x512 images took multiple minuts, on my older hardware. This is not such a problem if you have newer hardware such as 4090. 
 - As shown in the images on the readme.md, I was not able to load Z-Image-Turbo in Q4_KM completely to a 8GB GPU without using the option to put the ae.safetensors on the CPU, but I would not use less than a Q4_KM z-image-turbo. This is in addition in my case the Qwen3 model being on the CPU already, but this is no issue as the Encoding is a small task.
 - The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3 is the only encoder, but not that old that its naff. 
 
 ### Development:
-Its reasonably fleshed out now for one of my apps, but there are still some improvements possible...
-- Add AI edit image feature, ie outpaint, etc. Requires research and UI rethink, ie what is possible with Qwen3 encoder and z-image diffuser, will it involve additional models, because if so, not so interested, unless they are tiny additions. It would involve a panel and controls switching/hiding, because there will be spacing issues if there are any more controls on generation page.
+Development is somewhat stopped for now due to funding issues, in the mean time you could check out my donation/sponsorship links on profile page, but there are still some improvements possible/planned...
+- Add AI edit image feature, ie outpaint, etc. Requires Flux-Klein support because Z-image-turbo only supports generation and not editing. The UI woudl also require a rethink, ie what are the options and how am I going to fit them in. It would also need a Qwen 3 z-image Encoder.
 
 ### Structure:
 - Current plan for scripts is...
