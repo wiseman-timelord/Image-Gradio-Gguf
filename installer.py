@@ -42,6 +42,8 @@ REQUIREMENTS = [
     "gradio==6.19.0",
     "Pillow==12.2.0",
     "numpy==2.4.6",
+    "PyQt6==6.9.1",
+    "PyQt6-WebEngine==6.9.0",
 ]
 
 # ---------------------------------------------------------------------------
@@ -394,6 +396,14 @@ def write_default_persistent(cpu: Dict[str, Any]) -> None:
         "negative_prompt": "",
         "ui_theme": "Default",
         "first_run": True,
+        # Qt app-window geometry, saved on shutdown and restored on next
+        # launch (see launcher.py AppWindow). -1 sentinels mean "no saved
+        # position yet" — Qt/the OS will choose a default placement.
+        "window_x": -1,
+        "window_y": -1,
+        "window_width": 1280,
+        "window_height": 860,
+        "window_maximized": False,
     }
     tmp = _PERSIST_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -434,22 +444,33 @@ def install_deps() -> bool:
     try:
         subprocess.run(
             [str(vpy), "-m", "pip", "install", "--upgrade", "pip"],
-            check=True, capture_output=True, text=True, timeout=120,
+            check=True, capture_output=True, text=True, timeout=300,
         )
     except Exception as e:
         log(f"pip upgrade warning: {e}")
     all_ok = True
+    # Flat 30-minute ceiling per package. Large wheels (PyQt6-WebEngine is
+    # ~200MB) or a slow connection can legitimately take a while; 300s was
+    # cutting that off mid-download. Output is streamed live (not captured)
+    # so progress is visible instead of looking frozen for up to 30 minutes.
+    PKG_TIMEOUT = 1800
     for req in REQUIREMENTS:
-        log(f"  Installing {req}...")
+        log(f"  Installing {req}... (up to {PKG_TIMEOUT // 60} min)")
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [str(vpy), "-m", "pip", "install", req],
-                check=True, capture_output=True, text=True, timeout=300,
+                timeout=PKG_TIMEOUT,
             )
-            log(f"  {req} OK")
-        except subprocess.CalledProcessError as e:
-            log(f"  FAILED: {req}")
-            log(f"    {e.stderr[-300:] if e.stderr else ''}")
+            if proc.returncode == 0:
+                log(f"  {req} OK")
+            else:
+                log(f"  FAILED: {req} (exit code {proc.returncode})")
+                all_ok = False
+        except subprocess.TimeoutExpired:
+            log(f"  FAILED: {req} — exceeded {PKG_TIMEOUT // 60} minute limit")
+            all_ok = False
+        except Exception as e:
+            log(f"  FAILED: {req} — {e}")
             all_ok = False
     return all_ok
 

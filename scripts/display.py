@@ -23,6 +23,33 @@ import scripts.inference as inference
 
 
 # ---------------------------------------------------------------------------
+# Exit handling
+# ---------------------------------------------------------------------------
+# The "Exit Program" button click runs on a Gradio/Starlette worker thread,
+# not the Qt GUI thread launcher.py creates. launcher.py registers a
+# thread-safe handler here (via set_exit_handler) that signals the Qt
+# window to close, so window-geometry saving and shutdown all happen in
+# one place (launcher.py's _shutdown()). If nothing registers a handler
+# (e.g. display.py is ever driven without launcher.py), fall back to a
+# plain process exit so the button still works.
+_exit_handler: Optional[Any] = None
+
+
+def set_exit_handler(handler) -> None:
+    """Register the function to call when 'Exit Program' is clicked.
+    Called once by launcher.py during startup."""
+    global _exit_handler
+    _exit_handler = handler
+
+
+def _handle_exit_click() -> None:
+    if _exit_handler is not None:
+        _exit_handler()
+    else:
+        os._exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -1084,7 +1111,7 @@ scroll/wrap behavior to pass through to the row of thumbnails. ── */
                 min_width=140,
             )
 
-        exit_btn.click(lambda: os._exit(0), inputs=[], outputs=[])
+        exit_btn.click(_handle_exit_click, inputs=[], outputs=[])
 
         # Wire all per-tab events to the shared status box.
         _wire_generate_events(shared_status)

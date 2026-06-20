@@ -86,6 +86,13 @@ OUTPUT_FORMATS    = ["png", "jpg", "bmp"]
 # Key used by the unified bottom status bar shared across all pages.
 STATUS_BAR_KEY: str = "status"
 
+# ---------------------------------------------------------------------------
+# Qt app-window geometry (persisted across sessions by launcher.py)
+# ---------------------------------------------------------------------------
+WINDOW_GEOMETRY_UNSET: int = -1   # sentinel for "no saved x/y yet"
+WINDOW_DEFAULT_WIDTH:  int = 1280
+WINDOW_DEFAULT_HEIGHT: int = 860
+
 
 # ---------------------------------------------------------------------------
 # Runtime state  (transient — not persisted)
@@ -402,6 +409,14 @@ def _default_persistent() -> Dict[str, Any]:
         "negative_prompt": "",
         "ui_theme": "Default",
         "first_run": True,
+        # Qt app-window geometry, saved on shutdown and restored on next
+        # launch (see launcher.py AppWindow). -1 sentinels mean "no saved
+        # position yet" — Qt/the OS will choose a default placement.
+        "window_x": WINDOW_GEOMETRY_UNSET,
+        "window_y": WINDOW_GEOMETRY_UNSET,
+        "window_width": WINDOW_DEFAULT_WIDTH,
+        "window_height": WINDOW_DEFAULT_HEIGHT,
+        "window_maximized": False,
     }
 
 
@@ -421,13 +436,19 @@ def save_constants(config: configparser.ConfigParser) -> None:
 
 
 def load_persistent() -> Dict[str, Any]:
+    """Load persistent.json, backfilling any keys that are missing because
+    the file was written by an older version of the program (e.g. before
+    the window-geometry keys existed). Saved values always win; defaults
+    only fill genuine gaps, so this never overwrites real user data."""
     path = get_persistent_path()
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    return data
+                    merged = _default_persistent()
+                    merged.update(data)
+                    return merged
         except (json.JSONDecodeError, IOError):
             pass
     return _default_persistent()
@@ -447,6 +468,46 @@ def update_persistent(updates: Dict[str, Any]) -> Dict[str, Any]:
     data.update(updates)
     save_persistent(data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Window geometry (Qt app window position/size — see launcher.py)
+# ---------------------------------------------------------------------------
+
+def get_window_geometry() -> Dict[str, Any]:
+    """Return saved Qt window geometry, validated/sanitized:
+        {"x": int, "y": int, "width": int, "height": int, "maximized": bool}
+    x/y are WINDOW_GEOMETRY_UNSET (-1) if no position has been saved yet —
+    callers should treat that as "let the OS/Qt choose a default position"
+    rather than literally moving the window to (-1, -1)."""
+    cfg = load_persistent()
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    width  = max(640, _int("window_width", WINDOW_DEFAULT_WIDTH))
+    height = max(480, _int("window_height", WINDOW_DEFAULT_HEIGHT))
+    x = _int("window_x", WINDOW_GEOMETRY_UNSET)
+    y = _int("window_y", WINDOW_GEOMETRY_UNSET)
+    maximized = bool(cfg.get("window_maximized", False))
+
+    return {"x": x, "y": y, "width": width, "height": height, "maximized": maximized}
+
+
+def save_window_geometry(x: int, y: int, width: int, height: int,
+                          maximized: bool) -> None:
+    """Persist Qt window geometry. Called from launcher.py's shutdown
+    sequence so the window reopens where/how the user left it."""
+    update_persistent({
+        "window_x": int(x),
+        "window_y": int(y),
+        "window_width": int(width),
+        "window_height": int(height),
+        "window_maximized": bool(maximized),
+    })
 
 
 def resolve_model_path(path_str: str,
