@@ -12,15 +12,13 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 - Configure page now featuring Diffuser Placement (A012)...  
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/configuration_page.jpg)
 
-- Program starts something like this (A010)...
+- Program starts something like this (A013)...
 ```
-  Starting application at http://127.0.0.1:7860
+================================================================================
+      Image-Gradio-Gguf: Starting Program...
+================================================================================
 
-
-  ============================================================
-    Image Generator GGUF
-    Python 3.12.4  |  Gradio 6.19.0
-  ============================================================
+  Versioning: Python 3.12.4; Gradio 6.19.0
 
   CPU     : AMD Ryzen 9 3900X 12-Core Processor
   Threads : 21 (85% of 24 logical cores)
@@ -28,12 +26,15 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
     GPU0: NVIDIA GeForce GTX 1060 3GB
     GPU1: Radeon (TM) RX 470 Graphics
 
-  llama-cli : C:\Inference_Files\Image-Generator-Gguf\Image-Generator-Gguf\data\llama_cpp_binaries\llama-cli.exe
-  sd        : C:\Inference_Files\Image-Generator-Gguf\Image-Generator-Gguf\data\stable_diffusion_binaries\sd-cli.exe
+  llama-cli : C:\Inference_Files\Image-Gradio-Gguf\Image-Gradio-Gguf\data\llama_cpp_binaries\llama-cli.exe
+  sd        : C:\Inference_Files\Image-Gradio-Gguf\Image-Gradio-Gguf\data\stable_diffusion_binaries\sd-cli.exe
 
-  Encoder  : NOT SET
-  Diffusion: NOT SET
-  VAE      : NOT SET
+  Encoder  : OK — G:/LargeModels/Text and Image/Qwen3-4b-Z-Image-Turbo-AbliteratedV1-GGUF/Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q4_K_M.gguf
+  Diffusion: OK — G:/LargeModels/Text and Image/Z-Image-Turbo-GGUF/z_image_turbo-Q4_0.gguf
+  VAE      : OK — G:\LargeModels\Text and Image\Z-Image-Turbo-GGUF\ae.safetensors
+
+[gallery] Scanning for Thumbnails....
+[gallery] Rescanned C:\Inference_Files\Image-Gradio-Gguf\Image-Gradio-Gguf\output: 3 images
 
 * Running on local URL:  http://127.0.0.1:7860
 * To create a public link, set `share=True` in `launch()`.
