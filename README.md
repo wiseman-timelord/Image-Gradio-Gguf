@@ -109,7 +109,7 @@ Currently...
 
 ### Notation:
 - As shown in the images on the readme.md, I was not able to load Z-Image-Turbo in Q4_KM completely to a 8GB GPU without using the option to put the ae.safetensors on the CPU, but I would not use less than a Q4_KM z-image-turbo. This is in addition in my case the Qwen3 model being on the CPU already, but this is no issue as the Encoding is a small task.
-- The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3, but not that old that its naff. 
+- The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3 is the only encoder, but not that old that its naff. 
 
 ### Development:
 A small program in python with gradio 5...
