@@ -68,8 +68,7 @@ Currently...
 - The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3 is the only encoder, but not that old that its naff. 
 
 ### Development:
-A small program in python with gradio 5...
-- Implementing PyQt (???), for built-in browser, for fake application style interface.
+Its reasonably fleshed out now for one of my apps, but there are still some improvements possible...
 - Add edit image feature.
 
 ### Structure:
