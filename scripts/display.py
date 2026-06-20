@@ -303,7 +303,7 @@ def _build_generate_tab_inner() -> None:
                 # Generate on its final yield; the .click() handler below
                 # branches on the button's current label to decide whether
                 # this click should start or cancel a generation.
-                _gen["generate_btn"] = gr.Button("Generate", variant="primary", size="lg")
+                _gen["generate_btn"] = gr.Button("Generate Image", variant="primary", size="lg")
 
             # Single currently-selected/in-progress image — the ONLY image
             # shown here is either the most recent generation, the live
@@ -321,7 +321,7 @@ def _build_generate_tab_inner() -> None:
                 label="Generated Image",
                 type="filepath",
                 value=_idle_preview_image(),
-                height=550,
+                height=configure.PREVIEW_IMAGE_HEIGHT,
                 interactive=False,
                 show_label=True,
                 container=True,
@@ -402,8 +402,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         """
         gallery_now  = _get_recent_images()
         preview_now  = _idle_preview_image()
-        _btn_generate = gr.update(value="Generate", variant="primary")
-        _btn_stop     = gr.update(value="Stop", variant="stop")
+        _btn_generate = gr.update(value="Generate Image", variant="primary")
+        _btn_stop     = gr.update(value="Stop Generation", variant="stop")
 
         if not prompt or not prompt.strip():
             yield preview_now, gallery_now, "Please enter a prompt.", _btn_generate
@@ -1023,18 +1023,20 @@ font-size: 1rem !important;
 }
 #exit-btn:hover { background: #c0392b !important; }
 
-/* ── Preview box: the box height (550px) is already fixed by the height=550
-kwarg. gr.Image in Gradio 6.19.0 has NO object_fit kwarg (only gr.Gallery
-does), so fit-to-box behavior must be driven entirely by CSS here. Gradio's
-own native rule is `.image-frame img { width:100%; height:100%;
-object-fit:scale-down }` — scale-down only ever shrinks an oversized image,
-it never enlarges one smaller than the box (e.g. a 256x256 generation
-inside this 550px box), which is why small images rendered tiny. We
-replicate the same width/height:100% sizing (required for object-fit to
-have any box to fit against) but swap in object-fit:contain so it scales
-BOTH directions — shrinking large images and enlarging small ones, always
-preserving aspect ratio. The Svelte scope hash on Gradio's own rule can
-out-rank generic selectors depending on load order, so target the
+/* ── Preview box: the box height is driven by configure.PREVIEW_IMAGE_HEIGHT
+(see the __PREVIEW_IMG_HEIGHT__px placeholder below, substituted once at the
+end of this string) — the SAME value passed to the gr.Image(height=...)
+kwarg above, so the two can never disagree. gr.Image in Gradio 6.19.0 has
+NO object_fit kwarg (only gr.Gallery does), so fit-to-box behavior must be
+driven entirely by CSS here. Gradio's own native rule is `.image-frame img
+{ width:100%; height:100%; object-fit:scale-down }` — scale-down only ever
+shrinks an oversized image, it never enlarges one smaller than the box
+(e.g. a 256x256 generation inside this box), which is why small images
+rendered tiny. We replicate the same width/height:100% sizing (required for
+object-fit to have any box to fit against) but swap in object-fit:contain
+so it scales BOTH directions — shrinking large images and enlarging small
+ones, always preserving aspect ratio. The Svelte scope hash on Gradio's own
+rule can out-rank generic selectors depending on load order, so target the
 structural classes directly with #id + class stacking to win the cascade
 regardless of load order. ─────────────────────────────────────────────── */
 #preview-img.gradio-container,
@@ -1043,8 +1045,8 @@ regardless of load order. ──────────────────
 #preview-img .image-container.svelte-12vrxzd,
 #preview-img .image-frame,
 #preview-img .image-frame.svelte-12vrxzd {
-height: 550px !important;
-max-height: 550px !important;
+height: __PREVIEW_IMG_HEIGHT__px !important;
+max-height: __PREVIEW_IMG_HEIGHT__px !important;
 }
 #preview-img img,
 #preview-img .image-frame img,
@@ -1110,6 +1112,10 @@ scroll/wrap behavior to pass through to the row of thumbnails. ── */
     height: 0 !important;
 }
 """
+    # Substitute the preview-box height placeholder with the single shared
+    # constant (configure.PREVIEW_IMAGE_HEIGHT) — same value used for the
+    # gr.Image(height=...) kwarg, so the two can never drift apart again.
+    _css = _css.replace("__PREVIEW_IMG_HEIGHT__", str(configure.PREVIEW_IMAGE_HEIGHT))
 
     with gr.Blocks(title="Image-Gradio-Gguf") as app:
         gr.Markdown("# Image-Gradio-Gguf")

@@ -98,6 +98,15 @@ OUTPUT_FORMATS    = ["png", "jpg", "bmp"]
 # Key used by the unified bottom status bar shared across all pages.
 STATUS_BAR_KEY: str = "status"
 
+# Generate tab preview box height (pixels). Single source of truth — used
+# both for the gr.Image(height=...) kwarg in display.py AND for the
+# #preview-img CSS rule in the same file. The CSS carries !important and
+# would silently override the Python kwarg if the two ever disagreed, so
+# changing this one constant is the only thing that should ever be needed
+# to resize the preview box; display.py interpolates it into the CSS string
+# rather than hardcoding the pixel value a second time.
+PREVIEW_IMAGE_HEIGHT: int = 500
+
 # ---------------------------------------------------------------------------
 # Qt app-window geometry (persisted across sessions by launcher.py)
 # ---------------------------------------------------------------------------
