@@ -39,9 +39,9 @@ _MODELS_DIR  = _ROOT / "models"
 _OUTPUT_DIR  = _ROOT / "output"
 
 REQUIREMENTS = [
-    "gradio>=6.19",
-    "Pillow>=10.0",
-    "numpy>=1.26",
+    "gradio==6.19.0",
+    "Pillow==12.2.0",
+    "numpy==2.4.6",
 ]
 
 # ---------------------------------------------------------------------------
