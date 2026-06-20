@@ -42,8 +42,9 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 ```
 
 ### Requirements:
-- Platform - Programming towards and testing upon, Windows 10 22h2 with Python 3.12, it may work on Windows 11 and nearby versions of Python. T.B.A.
-- Graphics- Programming towards and testing upon, Vulkan 1.3 card with, Vulkan 1.4 compatible driver and Vulkan SDK, installed.
+- Operating System - Deepseek assesed this as Windows 10-11, however I am testing on Windows 10 22h2.
+- Python - Deepseek assesed this as Python versions 3.11-3.13, however I am testing on Python 3.12.
+- Graphics- Testing on Vulkan 1.3 card with Vulkan 1.4 SDK installed. Also usually its a min DirectX 11.1 GPU for gradio/pyqt6 (browser interface).
 - Processor - Detecting/supporting, SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, AVX, AVX2, AVX512, F16C, FMA, architecture features. Testing upon Zen 2 with AOCL installed. 
 - Libraries - Required libraries is handled by the installer script, but they include both, Llama.Cpp and Stable Diffusion.
 
