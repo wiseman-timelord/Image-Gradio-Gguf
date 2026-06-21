@@ -699,7 +699,7 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
                     round(diffusion_elapsed / steps_for_avg, 3))
             result.update(
                 success=True, output_path=str(output_path),
-                message=f"Saved {output_name} ({elapsed:.1f}s)",
+                message=f"Saved {output_name} ({int(round(elapsed))}s)",
                 seed_used=seed,
                 elapsed_seconds=round(elapsed, 2),
             )

@@ -460,30 +460,31 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 _phase["total_steps"] = info["total_steps"]
 
         def _format_status() -> str:
-            """Build the '(Phase N/2): ...' status string with a live
-            timer, using historical TIMING_STATS for an ETA when available."""
+            """Build the 'Generate Stage N/2; ... Phase {step}/{total}...###s'
+            status string. Seconds are always whole numbers (no split
+            seconds) per the fixed status-bar format — never decimals."""
             name = _phase["name"]
-            elapsed = time.time() - _phase["phase_start"]
-            ts = configure.TIMING_STATS
+            elapsed_s = int(time.time() - _phase["phase_start"])
 
             if name == "encoding":
-                known = ts.get("encoder_seconds", 0.0)
-                if known > 0:
-                    remaining = max(0.0, known - elapsed)
-                    return (f"Generating (Phase 1/2): Encoding... "
-                            f"{elapsed:0.1f}s (~{remaining:0.1f}s left)")
-                return f"Generating (Phase 1/2): Encoding... {elapsed:0.1f}s"
+                # enhance_prompt() (inference.py) is a single-shot llama-cli
+                # call with no per-token step/total reported back through
+                # progress_callback, so step/total are only ever populated
+                # once a step-aware encoder backend supplies them. Until
+                # then this degrades to a plain running timer rather than
+                # showing a fabricated "0/0".
+                step = _phase.get("step", 0)
+                total = _phase.get("total_steps", 0)
+                step_part = f" {step}/{total}" if total else ""
+                return (f"Generate Stage 1/2; Encoding Phase{step_part}..."
+                        f"{elapsed_s}s")
 
             # diffusion
             step = _phase.get("step", 0)
             total = _phase.get("total_steps", 0) or int(gen_cfg.get("imagegen_steps", 0))
-            per_step = ts.get("diffusion_per_step_seconds", 0.0)
-            step_label = f" (Step {step}/{total})" if total else ""
-            if per_step > 0 and total:
-                remaining = max(0.0, (total - step) * per_step)
-                return (f"Generating (Phase 2/2): Diffusing{step_label}... "
-                        f"{elapsed:0.1f}s (~{remaining:0.1f}s left)")
-            return f"Generating (Phase 2/2): Diffusing{step_label}... {elapsed:0.1f}s"
+            step_part = f" {step}/{total}" if total else ""
+            return (f"Generate Stage 2/2; Diffusing Phase{step_part}..."
+                    f"{elapsed_s}s")
 
         def worker():
             try:
@@ -499,6 +500,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         t.start()
 
         last_shown_img = None
+        last_shown_second = -1
         first_tick = True
         # Button switches to "..Please Wait.." the moment the worker thread starts.
         # Only send that update on the FIRST poll tick — re-sending the same
@@ -508,16 +510,29 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # preview image) and intermittently knocking out its object-fit
         # CSS override. Once the button is already showing "..Please Wait..", later
         # ticks pass a true no-op (gr.update()) for it.
+        #
+        # The status string itself is also throttled to once per whole
+        # second (last_shown_second), independent of the 0.15s poll
+        # cadence — the timer display only ever shows whole seconds, so
+        # there is no reason to push a new status string more than once a
+        # second even though we keep polling faster for image/button
+        # responsiveness.
         while not _phase["done"]:
             img = _status_image(_phase["name"])
-            status_text = _format_status()
+            current_second = int(time.time() - _phase["phase_start"])
             btn_update = _btn_wait if first_tick else gr.update()
             first_tick = False
+
+            status_update = gr.update()
+            if current_second != last_shown_second:
+                last_shown_second = current_second
+                status_update = _format_status()
+
             if img and img != last_shown_img:
                 last_shown_img = img
-                yield img, gr.update(), status_text, btn_update
+                yield img, gr.update(), status_update, btn_update
             else:
-                yield gr.update(), gr.update(), status_text, btn_update
+                yield gr.update(), gr.update(), status_update, btn_update
             time.sleep(0.15)
         t.join()
 
@@ -534,7 +549,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             except Exception as e:
                 print(f"[generate] output file STAT FAILED: {out_path}  {e}", flush=True)
             msg = (f"{result['message']} | Seed: {result['seed_used']} "
-                   f"| Time: {result['elapsed_seconds']}s")
+                   f"| Time: {int(round(result['elapsed_seconds']))}s")
             new_gallery = _get_recent_images()
             yield str(out_path), new_gallery, msg, _btn_generate
             # Auto-save the settings that just successfully produced an
