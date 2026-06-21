@@ -119,16 +119,17 @@ REM Run launcher.py directly through the venv python executable.
 REM Using the venv python directly avoids activate.bat PATH issues while
 REM still ensuring all venv packages are available.
 if not exist "%VENVPY%" goto :no_venv
+timeout /t 1 >nul
 
-cls
+cls  ::rem this line for debug
 echo ================================================================================
 echo       Image-Gradio-Gguf: Starting Program...
 echo ================================================================================
 echo.
 "%VENVPY%" launcher.py
 echo.
-echo   Application exited. Press any key to return to menu.
-pause >nul
+echo   Application exited.
+timeout /t 2 >nul
 goto :menu
 
 
@@ -149,7 +150,8 @@ echo.
 %SYSPYTHON% installer.py
 
 echo.
-echo   Press any key to return to menu.
+echo   Installer exited.
+timeout /t 2 >nul
 pause >nul
 goto :menu
 
