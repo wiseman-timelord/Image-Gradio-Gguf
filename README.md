@@ -77,7 +77,7 @@ Currently...
 
 ### Development:
 Development is somewhat stopped for now due to, v1 done (working + nice) and funding issues, in the mean time you could check out my donation/sponsorship links on profile page, but there are still some improvements possible/planned...
-- Improvement through, testing/use and correcting/fixing, still things I keep noticing and fixing, see releases.
+- Done all noted improvements, though possibly will still notice a few things that can be improved, see recent releases.
 - Add AI edit image feature, ie outpaint, etc. Requires Flux-Klein support because Z-image-turbo only supports generation and not editing. The UI woudl also require a rethink, ie what are the options and how am I going to fit them in. It would also need a Qwen 3 Flux Klein Encoder. If you would like to see the project reach "add image editing via SD Klein and Qwen3 for SD", then please support via sponsor/donate via kofi/patreon, otherwise development may grind to a halt here at some unexpected point.
 
 
