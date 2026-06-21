@@ -296,13 +296,9 @@ def _build_generate_tab_inner() -> None:
             gr.Markdown("### Output")
             with gr.Row(visible=configured) as _gen["generate_row"]:
                 # Single dynamic button: shows "Generate" (primary) when idle
-                # and switches to "Stop" (red/stop variant) while a
-                # generation is running. Avoids showing an irrelevant
-                # Generate button mid-run or an irrelevant Stop button when
-                # idle. do_generate() flips it to Stop on entry and back to
-                # Generate on its final yield; the .click() handler below
-                # branches on the button's current label to decide whether
-                # this click should start or cancel a generation.
+                # and switches to "..Please Wait.." (disabled) while a
+                # generation is running. do_generate() flips it to Please Wait
+                # on entry and back to Generate on its final yield.
                 _gen["generate_btn"] = gr.Button("Generate Image", variant="primary", size="lg")
 
             # Single currently-selected/in-progress image — the ONLY image
@@ -386,24 +382,24 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             _timeout_timer["handle"] = None
 
     def do_generate(prompt, negative, width, height, steps, sampler,
-                    cfg_scale, seed, batch, output_format):
+    cfg_scale, seed, batch, output_format):
         """
         Generator: yields (preview_img, gallery, status, btn_update) tuples
         so the preview box can switch between program_encoding.jpg /
         program_diffusion.jpg while generation runs, WITHOUT using Gradio's
         built-in progress bar anywhere (gallery, preview, or otherwise).
-        btn_update flips the single Generate/Stop button to its "Stop"
-        appearance for the duration of the run and back to "Generate" on
-        the final yield (including early-exit validation failures, which
-        never started a run and so should leave the button as Generate).
-        Final yield swaps the preview to the finished image and rescans
-        .\\output into the gallery — the gallery never receives a per-call
-        image list, only full folder rescans.
+        btn_update flips the single Generate/Please Wait button to its
+        "..Please Wait.." appearance for the duration of the run and back
+        to "Generate" on the final yield (including early-exit validation
+        failures, which never started a run and so should leave the button
+        as Generate). Final yield swaps the preview to the finished image
+        and rescans .\\output into the gallery — the gallery never receives
+        a per-call image list, only full folder rescans.
         """
         gallery_now  = _get_recent_images()
         preview_now  = _idle_preview_image()
-        _btn_generate = gr.update(value="Generate Image", variant="primary")
-        _btn_stop     = gr.update(value="Stop Generation", variant="stop")
+        _btn_generate = gr.update(value="Generate Image", variant="primary", interactive=True)
+        _btn_wait     = gr.update(value="..Please Wait..", variant="primary", interactive=False)
 
         if not prompt or not prompt.strip():
             yield preview_now, gallery_now, "Please enter a prompt.", _btn_generate
@@ -504,18 +500,18 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
         last_shown_img = None
         first_tick = True
-        # Button switches to "Stop" the moment the worker thread starts.
+        # Button switches to "..Please Wait.." the moment the worker thread starts.
         # Only send that update on the FIRST poll tick — re-sending the same
         # gr.update() on every 0.15s tick forces Gradio to re-render the
         # button node repeatedly, which was cascading into a layout
         # recalculation of sibling nodes in the same column (incl. the
         # preview image) and intermittently knocking out its object-fit
-        # CSS override. Once the button is already showing "Stop", later
+        # CSS override. Once the button is already showing "..Please Wait..", later
         # ticks pass a true no-op (gr.update()) for it.
         while not _phase["done"]:
             img = _status_image(_phase["name"])
             status_text = _format_status()
-            btn_update = _btn_stop if first_tick else gr.update()
+            btn_update = _btn_wait if first_tick else gr.update()
             first_tick = False
             if img and img != last_shown_img:
                 last_shown_img = img
@@ -559,29 +555,23 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
 
     def on_generate_click(prompt, negative, width, height, steps, sampler,
-                          cfg_scale, seed, batch, output_format,
-                          current_label):
-        """Dispatch a click on the single dynamic button. While idle the
-        button reads "Generate" and a click starts a run (delegating to the
-        do_generate generator, which yields its own button-state updates).
-        While a run is in progress the button reads "Stop" and a click only
-        requests cancellation — it must NOT start a second concurrent run."""
-        if current_label == "Stop":
-            configure.APP_STATE["cancel_requested"] = True
-            yield gr.update(), gr.update(), "Cancel requested...", gr.update(value="Stop", variant="stop")
-            return
+    cfg_scale, seed, batch, output_format):
+        """Dispatch a click on the single dynamic button. The button reads
+        "Generate" when idle and starts a run (delegating to the do_generate
+        generator, which yields its own button-state updates). While a run
+        is in progress the button is disabled and shows "..Please Wait..",
+        preventing concurrent runs."""
         yield from do_generate(prompt, negative, width, height, steps, sampler,
-                               cfg_scale, seed, batch, output_format)
+    cfg_scale, seed, batch, output_format)
 
     _gen["generate_btn"].click(
         on_generate_click,
         inputs=[_gen["prompt_tb"], _gen["negative_tb"],
-                _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
-                _gen["sampler_dd"], _gen["cfg_scale_sld"],
-                _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"],
-                _gen["generate_btn"]],
+        _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
+        _gen["sampler_dd"], _gen["cfg_scale_sld"],
+        _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
-                 _gen["generate_btn"]],
+        _gen["generate_btn"]],
     )
 
     def on_gallery_select(evt: gr.SelectData):

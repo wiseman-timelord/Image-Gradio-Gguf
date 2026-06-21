@@ -123,7 +123,6 @@ APP_STATE: Dict[str, Any] = {
     "last_image_path": "",
     "last_prompt": "",
     "is_building": False,
-    "cancel_requested": False,
 }
 
 # ---------------------------------------------------------------------------

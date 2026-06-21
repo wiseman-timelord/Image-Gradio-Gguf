@@ -681,12 +681,6 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
                     progress_callback(line.strip()[:100], 0.3, info)
                 except Exception:
                     pass
-            if configure.APP_STATE.get("cancel_requested"):
-                process.kill()
-                result["message"] = "Generation cancelled."
-                result["elapsed_seconds"] = round(time.time() - t0, 2)
-                configure.APP_STATE["cancel_requested"] = False
-                return result
 
         process.wait(timeout=600)
         elapsed = time.time() - t0
@@ -746,13 +740,11 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
 def unload_models() -> None:
     """
     Unload / release models.
-
     The current backends (llama-cli, sd-cli) are launched as one-shot
     subprocesses, so there is no persistent process to kill.  This function
     resets APP_STATE so that a subsequent generation re-validates paths and
     starts fresh.  If persistent model-server processes are added later,
     terminate them here.
     """
-    configure.APP_STATE["cancel_requested"] = False
     configure.APP_STATE["last_image_path"]  = ""
     configure.APP_STATE["models_unloaded"]  = True
