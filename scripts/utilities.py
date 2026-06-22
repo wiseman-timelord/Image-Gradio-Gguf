@@ -43,105 +43,17 @@ def quick_hash(file_path: str, nbytes: int = 8192) -> str:
 # ---------------------------------------------------------------------------
 # CPU feature detection
 # ---------------------------------------------------------------------------
-
-def detect_cpu_features() -> Dict[str, Any]:
-    import math
-    logical = os.cpu_count() or 4
-    f: Dict[str, Any] = {
-        "architecture": _cpu_arch(),
-        "vendor": "unknown",
-        "brand": platform.processor() or "unknown",
-        "cores_logical": logical,
-        "default_threads": max(1, math.ceil(logical * 0.85)),
-        "has_avx": False, "has_avx2": False, "has_f16c": False,
-        "has_fma": False, "has_avx512": False, "has_sse4_2": False,
-        "has_aocl": False, "compile_flags": [],
-    }
-    if f["architecture"] in ("x86_64", "x86"):
-        _detect_x86_features(f)
-
-    for p in (os.environ.get("AOCL_ROOT", ""), os.environ.get("AOCL_PATH", ""),
-              r"C:\Program Files\AMD\AOCL", r"C:\AOCL"):
-        if p and Path(p).exists():
-            f["has_aocl"] = True
-            break
-
-    flags = []
-    for feat, flag in (("has_avx", "GGML_AVX=ON"), ("has_avx2", "GGML_AVX2=ON"),
-                       ("has_f16c", "GGML_F16C=ON"), ("has_fma", "GGML_FMA=ON"),
-                       ("has_avx512", "GGML_AVX512=ON")):
-        if f[feat]:
-            flags.append(flag)
-    f["compile_flags"] = flags
-    return f
-
-
-def _cpu_arch() -> str:
-    m = platform.machine().lower()
-    if m in ("amd64", "x86_64"):
-        return "x86_64"
-    if m in ("i386", "i686", "x86"):
-        return "x86"
-    if "aarch64" in m:
-        return "aarch64"
-    if "arm" in m:
-        return "arm"
-    return m
-
-
-def _detect_x86_features(f: Dict[str, Any]) -> None:
-    cpu_name = f["brand"].lower()
-    if platform.system() == "Windows":
-        try:
-            r = subprocess.run(["wmic", "cpu", "get", "Name", "/value"],
-                               capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                for line in r.stdout.strip().splitlines():
-                    if line.startswith("Name="):
-                        f["brand"] = line.split("=", 1)[1].strip()
-                        cpu_name = f["brand"].lower()
-                        break
-        except Exception:
-            pass
-
-    try:
-        import cpuinfo  # type: ignore
-        info = cpuinfo.get_cpu_info()
-        fl = [x.lower() for x in info.get("flags", [])]
-        f.update(has_avx="avx" in fl, has_avx2="avx2" in fl,
-                 has_f16c="f16c" in fl, has_fma="fma" in fl,
-                 has_sse4_2="sse4_2" in fl,
-                 has_avx512=any("avx512" in x for x in fl))
-        if info.get("brand_raw"):
-            f["brand"] = info["brand_raw"]
-        return
-    except ImportError:
-        pass
-
-    _infer_from_cpu_name(cpu_name, f)
-
-
-def _infer_from_cpu_name(name: str, f: Dict[str, Any]) -> None:
-    n = name.lower()
-    is_amd = any(k in n for k in ("amd", "ryzen", "epyc", "threadripper"))
-    is_intel = any(k in n for k in ("intel", "core", "xeon"))
-
-    if is_amd:
-        f["vendor"] = "AMD"
-        if any(k in n for k in ("ryzen", "epyc", "threadripper")):
-            f.update(has_avx=True, has_avx2=True, has_f16c=True,
-                     has_fma=True, has_sse4_2=True)
-    elif is_intel:
-        f["vendor"] = "Intel"
-        f.update(has_avx=True, has_sse4_2=True)
-        if any(k in n for k in ("ultra", "meteor", "arrow", "raptor", "alder",
-                                "tiger", "ice", "comet", "coffee", "kaby",
-                                "skylake", "broadwell", "haswell")):
-            f.update(has_avx2=True, has_f16c=True, has_fma=True)
-    elif f["architecture"] == "x86_64":
-        f.update(has_avx=True, has_avx2=True, has_f16c=True,
-                 has_fma=True, has_sse4_2=True)
-
+# CPU feature detection (instruction sets, vendor/brand, thread defaults)
+# happens once, at install time, in installer.py's detect_cpu() — the
+# canonical detector, run before scripts/ even exists on a fresh install,
+# which writes the results to data/constants.ini. At runtime this script's
+# package reads that file back via configure.get_cpu_info() /
+# configure.get_default_threads() rather than re-detecting; there is no
+# detect_cpu_features() here to avoid a second, easily-drifting copy of the
+# same logic (see installer.py's CPU_FEATURES list and detect_cpu() for the
+# real implementation, and configure.py's CPU_FEATURES mirror for the
+# documented list of instruction-set keys that round-trip through
+# constants.ini).
 
 # ---------------------------------------------------------------------------
 # Vulkan detection

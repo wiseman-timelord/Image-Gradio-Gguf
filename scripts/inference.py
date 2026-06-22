@@ -686,7 +686,20 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
         elapsed = time.time() - t0
         diffusion_elapsed = time.time() - diffusion_t0
 
-        if process.returncode == 0 and output_path.exists():
+        # sd.cpp saves batch outputs with a _0/_1/... index suffix:
+        #   img_TIMESTAMP_sSEED_0.jpg, img_TIMESTAMP_sSEED_1.jpg, …
+        # For batch=1 it still appends _0, so we check for the _0 file
+        # first; the bare path is kept as a fallback for any sd.cpp build
+        # that omits the suffix on single-image runs.
+        batch_count = int(cfg.get("imagegen_batch_count", 1))
+        first_batch_path = output_path.with_name(
+            output_path.stem + "_0" + output_path.suffix
+        )
+        actual_output_path = (
+            first_batch_path if first_batch_path.exists() else output_path
+        )
+
+        if process.returncode == 0 and (actual_output_path.exists() or output_path.exists()):
             # Record diffusion timing for next-generation ETA, using
             # whichever step count we actually observed (falls back to the
             # configured total if no step lines matched the parser).
@@ -697,14 +710,19 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
                 configure.update_timing_stat(
                     "diffusion_per_step_seconds",
                     round(diffusion_elapsed / steps_for_avg, 3))
+            # Report the first saved file as output_path for the preview;
+            # the gallery rescan will pick up all batch images automatically.
+            saved_path = actual_output_path if actual_output_path.exists() else output_path
+            batch_label = (f"{batch_count} images" if batch_count > 1
+                           else output_name)
             result.update(
-                success=True, output_path=str(output_path),
-                message=f"Saved {output_name} ({int(round(elapsed))}s)",
+                success=True, output_path=str(saved_path),
+                message=f"Saved {batch_label} ({int(round(elapsed))}s)",
                 seed_used=seed,
                 elapsed_seconds=round(elapsed, 2),
             )
             if progress_callback:
-                progress_callback(f"Done: {output_name}", 1.0,
+                progress_callback(f"Done: {batch_label}", 1.0,
                                   {"phase": "done", "phase_elapsed": diffusion_elapsed})
         else:
             # Full subprocess output -> terminal (Windows console) only.
