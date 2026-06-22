@@ -50,14 +50,31 @@ REQUIREMENTS = [
 # Centralized CPU Features Map
 # Maps internal key, display name, and ggml CMake flag.
 # Used globally for detection, logging, config writing, and building.
+#
+# IMPORTANT: this list is restricted to instruction-set toggles that
+# actually exist as options in ggml's CMakeLists.txt (the build system
+# shared by both llama.cpp and stable-diffusion.cpp, which vendors ggml).
+# ggml exposes a single combined "GGML_SSE42" option for the whole SSE/
+# SSSE3/SSE4.x family — there is NO per-version GGML_SSE / GGML_SSE2 /
+# GGML_SSE3 / GGML_SSSE3 / GGML_SSE4_1 option. Passing those nonexistent
+# -D flags to cmake doesn't hard-fail (cmake just warns "Manually-specified
+# variables were not used"), so it would silently do nothing rather than
+# error — worth getting right anyway so detection, logging, and the actual
+# build stay in lockstep. Verified directly against the upstream
+# ggml/CMakeLists.txt (ggml-org/llama.cpp, master, GGML_VERSION 0.15.2):
+#   option(GGML_SSE42 "ggml: enable SSE 4.2" ...)
+#   option(GGML_AVX   "ggml: enable AVX" ...)
+#   option(GGML_AVX2  "ggml: enable AVX2" ...)
+#   option(GGML_FMA   "ggml: enable FMA" ...)   (non-MSVC only; MSVC implies
+#                                                 FMA/F16C via AVX2/AVX512)
+#   option(GGML_F16C  "ggml: enable F16C" ...)  (non-MSVC only, see above)
+#   option(GGML_AVX512 "ggml: enable AVX512F" ...)
+# If a future ggml release renames/splits these options again, update this
+# list — it is the single source of truth consumed by configure.py and the
+# llama.cpp / stable-diffusion.cpp cmake_defs builders below.
 # ---------------------------------------------------------------------------
 CPU_FEATURES = [
-    {"key": "has_sse",      "name": "SSE",    "cmake": "GGML_SSE=ON"},
-    {"key": "has_sse2",     "name": "SSE2",   "cmake": "GGML_SSE2=ON"},
-    {"key": "has_sse3",     "name": "SSE3",   "cmake": "GGML_SSE3=ON"},
-    {"key": "has_ssse3",    "name": "SSSE3",  "cmake": "GGML_SSSE3=ON"},
-    {"key": "has_sse4_1",   "name": "SSE4.1", "cmake": "GGML_SSE4_1=ON"},
-    {"key": "has_sse4_2",   "name": "SSE4.2", "cmake": "GGML_SSE4_2=ON"},
+    {"key": "has_sse4_2",   "name": "SSE4.2", "cmake": "GGML_SSE42=ON"},
     {"key": "has_avx",      "name": "AVX",    "cmake": "GGML_AVX=ON"},
     {"key": "has_avx2",     "name": "AVX2",   "cmake": "GGML_AVX2=ON"},
     {"key": "has_f16c",     "name": "F16C",   "cmake": "GGML_F16C=ON"},
@@ -180,15 +197,13 @@ def detect_cpu() -> Dict[str, Any]:
         
         if is_amd:
             info["vendor"] = "AMD"
-            info.update(has_sse=True, has_sse2=True, has_sse3=True, has_ssse3=True,
-                        has_sse4_1=True, has_sse4_2=True, has_avx=True, has_avx2=True,
+            info.update(has_sse4_2=True, has_avx=True, has_avx2=True,
                         has_f16c=True, has_fma=True)
             if any(k in n for k in ("ryzen 7", "ryzen 9", "ryzen threadripper 7", "epyc 9", "epyc 8", "zen 4", "zen 5")):
                 info["has_avx512"] = True
         elif is_intel:
             info["vendor"] = "Intel"
-            info.update(has_sse=True, has_sse2=True, has_sse3=True, has_ssse3=True,
-                        has_sse4_1=True, has_sse4_2=True, has_avx=True)
+            info.update(has_sse4_2=True, has_avx=True)
             if any(k in n for k in ("haswell", "broadwell", "skylake", "kaby", "coffee",
                                     "comet", "ice", "tiger", "alder", "raptor", "meteor",
                                     "arrow", "lunar", "ultra")):
@@ -197,8 +212,7 @@ def detect_cpu() -> Dict[str, Any]:
                                     "sapphire rapids", "emerald rapids", "granite rapids")):
                 info["has_avx512"] = True
         else:
-            info.update(has_sse=True, has_sse2=True, has_sse3=True, has_ssse3=True,
-                        has_sse4_1=True, has_sse4_2=True, has_avx=True, has_avx2=True,
+            info.update(has_sse4_2=True, has_avx=True, has_avx2=True,
                         has_f16c=True, has_fma=True)
 
     for p in (os.environ.get("AOCL_ROOT", ""), os.environ.get("AOCL_PATH", ""),
@@ -393,7 +407,7 @@ def write_default_persistent(cpu: Dict[str, Any]) -> None:
         "output_format": "png",
         "auto_save": True,
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-        "negative_prompt": "Cartoon style. Missing/mutated body parts. Missing/mutated limbs. Missing/mutated arms/hands/feet. Missing fingers/toes. Too many fingers. Too few fingers. Shorter hair. Ethical Guardrails. Moral Censorship. ",
+        "negative_prompt": "Cartoon style. Unrealistic. Missing/mutated body parts. Missing/mutated limbs. Missing/mutated hands/feet. Missing/Mutated fingers/toes. Ethical Guardrails. Moral Censorship.",
         "ui_theme": "Default",
         "first_run": True,
         # Qt app-window geometry, saved on shutdown and restored on next
@@ -523,6 +537,33 @@ def find_cmake() -> Optional[Path]:
 def find_git() -> Optional[Path]:
     g = shutil.which("git")
     return Path(g) if g else None
+
+
+def _will_use_msvc() -> bool:
+    """
+    Best-effort check for whether CMake's default generator on this machine
+    will compile with MSVC (cl.exe) — relevant because ggml's CMakeLists.txt
+    only declares the GGML_FMA / GGML_F16C options under `if (NOT MSVC)`;
+    on MSVC, FMA/F16C codegen is implied automatically by AVX2/AVX512
+    instead. We pass no explicit -G generator, so CMake picks its platform
+    default: on Windows that is the Visual Studio generator (MSVC) whenever
+    Visual Studio / Build Tools are installed, which is the path
+    find_cmake() actively searches for. If `cl.exe` isn't reachable and no
+    VS installation was found, assume a non-MSVC toolchain (e.g. MinGW/
+    clang via Ninja) is in play instead.
+
+    This only gates two CPU-optimization flags; getting it wrong in either
+    direction does not break the build (cmake ignores -D flags for options
+    it never declared), it just means those two flags are inert on this
+    particular run instead of contributing anything.
+    """
+    if platform.system() != "Windows":
+        return False
+    if shutil.which("cl") or shutil.which("cl.exe"):
+        return True
+    return _find_cmake_in_vs_installations() is not None or bool(
+        os.environ.get("VCINSTALLDIR") or os.environ.get("VSINSTALLDIR")
+    )
 
 # ---------------------------------------------------------------------------
 # Build root — short temp path if project root is too deep for MSBuild
@@ -725,6 +766,23 @@ def _run_cmake_build(source_dir: Path, build_dir: Path,
         
     return True
 
+def _cpu_cmake_defs(cpu: Dict[str, Any]) -> List[str]:
+    """
+    Build the list of GGML_*=ON cmake defs for detected CPU features.
+
+    On MSVC, ggml's CMakeLists.txt does not declare GGML_FMA / GGML_F16C as
+    options at all (FMA/F16C codegen is implied automatically by AVX2/
+    AVX512 instead — see ggml/CMakeLists.txt: `if (NOT MSVC) ... option(
+    GGML_FMA ...) option(GGML_F16C ...) endif()`). Passing them anyway
+    wouldn't break the build (cmake just ignores -D values for options it
+    never declared), but they would be silently inert, so we skip them here
+    to keep the configure log honest about what's actually taking effect.
+    """
+    skip_msvc_only = {"GGML_FMA=ON", "GGML_F16C=ON"} if _will_use_msvc() else set()
+    return [feat["cmake"] for feat in CPU_FEATURES
+            if cpu.get(feat["key"]) and feat["cmake"] not in skip_msvc_only]
+
+
 # ---------------------------------------------------------------------------
 # Backend installation — compile from source
 # ---------------------------------------------------------------------------
@@ -753,9 +811,7 @@ def compile_llama_cpp(cpu: Dict[str, Any], use_vulkan: bool) -> str:
     cmake_defs: List[str] = ["BUILD_SHARED_LIBS=OFF"]
     
     # Add CPU optimizations from central map (applies to BOTH CPU and Vulkan builds)
-    for feat in CPU_FEATURES:
-        if cpu.get(feat["key"]):
-            cmake_defs.append(feat["cmake"])
+    cmake_defs.extend(_cpu_cmake_defs(cpu))
             
     if use_vulkan:
         cmake_defs.append("GGML_VULKAN=ON")
@@ -822,9 +878,7 @@ def compile_sd_cpp(cpu: Dict[str, Any], use_vulkan: bool) -> str:
     cmake_defs: List[str] = ["BUILD_SHARED_LIBS=OFF", "SD_BUILD_EXAMPLES=ON"]
     
     # Add CPU optimizations from central map (applies to BOTH CPU and Vulkan builds)
-    for feat in CPU_FEATURES:
-        if cpu.get(feat["key"]):
-            cmake_defs.append(feat["cmake"])
+    cmake_defs.extend(_cpu_cmake_defs(cpu))
             
     if use_vulkan:
         cmake_defs.append("SD_VULKAN=ON")
