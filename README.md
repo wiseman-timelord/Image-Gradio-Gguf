@@ -2,7 +2,7 @@
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
 - [v1.07](https://github.com/wiseman-timelord/Image-Gradio-Gguf/releases/tag/v1.07) has installer that will likely work for AMD, may be liited on newest AMD, but the program was working well enough.
-- v1.08+ will have improved processor support for Intel chips, but cannot confirm updates including/after v1.08 will install correctly, as I significantly altered the building processes and have limited internet due to funding. Its likely to work because Claude did it, but cant guarantee.
+- v1.08+ will have improved processor support for Intel chips, but cannot confirm updates including/after v1.08 will install correctly, as I significantly altered the building processes and have limited internet due to funding. Its likely to work because Claude did it.
 
 ### Description
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. This is a simple image generation project, covering what is possible currently to be most compitent through GGUF models, through but eventually cover several encoders and image generation models. While this program work great for what it does, it is also example scripts for AI on how to do image inference with such libraries/models, and useful in the production of other progreams that require such things. As you can see it generates OK images, they can look pretty real, but has the typical issues one would exoect under such restrictions and with AI image generation in general, but for simple images I think it will be effective in generating your result in a few iterations, so long as the request is not too barmy.   
@@ -77,7 +77,7 @@ Currently...
 
 ### Development:
 Development is somewhat stopped for now due to, v1 done (working + nice) and funding issues, in the mean time you could check out my donation/sponsorship links on profile page, but there are still some improvements possible/planned...
-- Done all noted improvements, though possibly will still notice a few things that can be improved, see recent releases.
+- Done all noted improvements, though possibly will still noticinmg things that can be improved, see recent releases.
 - Add AI edit image feature, ie outpaint, etc. Requires Flux-Klein support because Z-image-turbo only supports generation and not editing. The UI woudl also require a rethink, ie what are the options and how am I going to fit them in. It would also need a Qwen 3 Flux Klein Encoder. If you would like to see the project reach "add image editing via SD Klein and Qwen3 for SD", then please support via sponsor/donate via kofi/patreon, otherwise development may grind to a halt here at some unexpected point.
 
 
