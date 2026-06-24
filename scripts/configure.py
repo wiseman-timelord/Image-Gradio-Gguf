@@ -442,6 +442,7 @@ def _default_persistent() -> Dict[str, Any]:
         "imagegen_sampling": "euler_a",
         "imagegen_batch_count": 1,
         "imagegen_clip_skip": 2,
+        "imagegen_quality_preset": "Fast (Turbo)",
         "vulkan_device": 0,
         "output_format": "png",
         "auto_save": True,
@@ -575,7 +576,7 @@ def get_generation_presets() -> Dict[str, Dict[str, Any]]:
         "Fast (Turbo)": {
             "imagegen_steps": 4, "imagegen_cfg_scale": 1.0,
             "imagegen_sampling": "euler_a",
-            "imagegen_width": 512, "imagegen_height": 512,
+            "imagegen_width": 256, "imagegen_height": 256,
         },
         "Balanced": {
             "imagegen_steps": 8, "imagegen_cfg_scale": 1.5,
@@ -597,4 +598,5 @@ def get_generation_presets() -> Dict[str, Dict[str, Any]]:
             "imagegen_sampling": "euler_a",
             "imagegen_width": 1024, "imagegen_height": 512,
         },
+        "Custom": {},
     }

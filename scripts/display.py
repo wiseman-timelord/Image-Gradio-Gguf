@@ -253,7 +253,8 @@ def _build_generate_tab_inner() -> None:
             )
             with gr.Row():
                 _gen["preset_dd"] = gr.Dropdown(
-                    label="Quality Preset", choices=list(presets.keys()), value="Fast (Turbo)",
+                    label="Quality Preset", choices=list(presets.keys()),
+                    value=cfg.get("imagegen_quality_preset", "Fast (Turbo)"),
                 )
                 _gen["sampler_dd"] = gr.Dropdown(
                     label="Sampler Type", choices=list(configure.SAMPLER_MAP.keys()),
@@ -348,6 +349,9 @@ def _build_generate_tab_inner() -> None:
     presets_map = presets
 
     def apply_preset(name: str):
+        # Custom preset carries no values — leave all widgets unchanged.
+        if name == "Custom":
+            return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
         p = presets_map.get(name, {})
         return (p.get("imagegen_width", 512), p.get("imagegen_height", 512),
                 p.get("imagegen_steps", 4), p.get("imagegen_sampling", "euler_a"),
@@ -358,6 +362,20 @@ def _build_generate_tab_inner() -> None:
         outputs=[_gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
                  _gen["sampler_dd"], _gen["cfg_scale_sld"]],
     )
+
+    # When the user manually changes any individual setting widget, the
+    # Quality Preset automatically switches to "Custom" — signalling that
+    # settings are user-defined rather than tied to a named preset.
+    def _set_custom(_ignored):
+        return gr.update(value="Custom")
+
+    for _widget_key in ("width_dd", "height_dd", "steps_dd", "sampler_dd",
+                        "cfg_scale_sld", "batch_dd", "output_fmt_dd", "seed_num"):
+        _gen[_widget_key].change(
+            _set_custom,
+            inputs=_gen[_widget_key],
+            outputs=_gen["preset_dd"],
+        )
 
 
 def _wire_generate_events(status_box: gr.Textbox) -> None:
@@ -382,7 +400,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             _timeout_timer["handle"] = None
 
     def do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format):
+    cfg_scale, seed, batch, output_format, quality_preset):
         """
         Generator: yields (preview_img, gallery, status, btn_update) tuples
         so the preview box can switch between program_encoding.jpg /
@@ -576,39 +594,50 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                    f"| Time: {int(round(result['elapsed_seconds']))}s")
             new_gallery = _get_recent_images()
             yield str(out_path), new_gallery, msg, _btn_generate
-            # Auto-save the settings that just successfully produced an
-            # image (fix #3 — replaces the old manual "Save as Default"
-            # button). Only on success, so a failed/cancelled run never
-            # overwrites the last known-good settings.
-            configure.update_persistent({
-                "imagegen_width": int(width), "imagegen_height": int(height),
-                "imagegen_steps": int(steps), "imagegen_sampling": sampler,
-                "imagegen_cfg_scale": float(cfg_scale),
-                "imagegen_seed": int(seed), "imagegen_batch_count": int(batch),
-                "negative_prompt": negative,
-                "output_format": output_format,
-            })
+            # Auto-save settings only when the Quality Preset is "Custom".
+            # Named presets (Fast, Balanced, Quality, etc.) are fixed — no
+            # need to persist them since they are always reconstructed from
+            # configure.get_generation_presets(). Custom captures any
+            # user-modified combination that deviates from the named presets,
+            # and must be saved so it survives the next launch.
+            if quality_preset == "Custom":
+                configure.update_persistent({
+                    "imagegen_quality_preset": "Custom",
+                    "imagegen_width": int(width), "imagegen_height": int(height),
+                    "imagegen_steps": int(steps), "imagegen_sampling": sampler,
+                    "imagegen_cfg_scale": float(cfg_scale),
+                    "imagegen_seed": int(seed), "imagegen_batch_count": int(batch),
+                    "negative_prompt": negative,
+                    "output_format": output_format,
+                })
+            else:
+                # Still persist the currently-active named preset so that
+                # it is restored correctly on next launch.
+                configure.update_persistent({
+                    "imagegen_quality_preset": quality_preset,
+                })
         else:
             new_gallery = _get_recent_images()
             yield _idle_preview_image(), new_gallery, result.get("message", "Unknown error"), _btn_generate
 
 
     def on_generate_click(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format):
+    cfg_scale, seed, batch, output_format, quality_preset):
         """Dispatch a click on the single dynamic button. The button reads
         "Generate" when idle and starts a run (delegating to the do_generate
         generator, which yields its own button-state updates). While a run
         is in progress the button is disabled and shows "..Please Wait..",
         preventing concurrent runs."""
         yield from do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format)
+    cfg_scale, seed, batch, output_format, quality_preset)
 
     _gen["generate_btn"].click(
         on_generate_click,
         inputs=[_gen["prompt_tb"], _gen["negative_tb"],
         _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
         _gen["sampler_dd"], _gen["cfg_scale_sld"],
-        _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"]],
+        _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"],
+        _gen["preset_dd"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
     )
