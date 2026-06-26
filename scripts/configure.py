@@ -69,11 +69,11 @@ SAMPLER_MAP: Dict[str, str] = {
 IMAGE_SIZES       = [256, 512, 768, 1024]
 
 # Z-Image-Turbo is a distilled few-step model; step counts are conventionally
-# chosen as doubling powers of two (1/2/4/8/16/...) to match the distillation
+# chosen as doubling powers of two (2/4/6/8/10/12) to match the distillation
 # schedule the turbo checkpoint was trained against. Restricting the choices
 # here keeps the UI from offering values that don't correspond to a step the
 # turbo schedule was actually trained on.
-STEP_CHOICES      = [1, 2, 4, 8, 16]
+STEP_CHOICES      = [2, 4, 6, 8, 10, 12]
 BATCH_SIZE_CHOICES = [128, 256, 512, 1024, 2048]
 
 # Context size maxes out at the model's trained context length (40960)
@@ -447,7 +447,7 @@ def _default_persistent() -> Dict[str, Any]:
         "output_format": "png",
         "auto_save": True,
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-        "negative_prompt": "",
+        "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
         "ui_theme": "Default",
         "first_run": True,
         # Qt app-window geometry, saved on shutdown and restored on next

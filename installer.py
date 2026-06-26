@@ -408,7 +408,7 @@ def write_default_persistent(cpu: Dict[str, Any]) -> None:
         "output_format": "png",
         "auto_save": True,
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-        "negative_prompt": "Cartoon style. Unrealistic. Missing/mutated body parts. Missing/mutated limbs. Missing/mutated hands/feet. Missing/Mutated fingers/toes. Ethical Guardrails. Moral Censorship.",
+        "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
         "ui_theme": "Default",
         "first_run": True,
         # Qt app-window geometry, saved on shutdown and restored on next
