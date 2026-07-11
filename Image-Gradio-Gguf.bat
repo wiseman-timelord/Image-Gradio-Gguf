@@ -121,7 +121,7 @@ REM still ensuring all venv packages are available.
 if not exist "%VENVPY%" goto :no_venv
 timeout /t 1 >nul
 
-cls  ::rem this line for debug
+cls
 echo ================================================================================
 echo       Image-Gradio-Gguf: Starting Program...
 echo ================================================================================
