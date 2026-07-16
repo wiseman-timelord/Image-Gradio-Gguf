@@ -1,7 +1,7 @@
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
-- v1.17  cleanup/checkover for correct/complete/refine by opus, and a solid final version, and a backup before lots work. This version pointed out some issues, for which I would call previous versions obsolete, without going into detail.
+- v1.17 - cleanup/checkover for correct/complete/refine by opus, and a solid final version, and a backup before lots work. This version pointed out some issues, for which I would call previous versions obsolete, without going into detail.
 
 ### Description
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. This is a simple image generation project, covering what is possible currently to be most compitent through GGUF models, through but eventually cover several encoders and image generation models. While this program work great for what it does, it is also example scripts for AI on how to do image inference with such libraries/models, and useful in the production of other progreams that require such things. As you can see it generates OK images, they can look pretty real, but has the typical issues one would exoect under such restrictions and with AI image generation in general, but for simple images I think it will be effective in generating your result in a few iterations, so long as the request is not too barmy.   
@@ -76,11 +76,11 @@ Currently...
 
 ### Development:
 Development is somewhat stopped for now due to, v1 done (working + nice) and funding issues, in the mean time you could check out my donation/sponsorship links on profile page, but there are still some improvements possible/planned...
+- New Models Options for Z-Image-Turbo - https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection
 - Moved from notation.
 ```
 more models supported for Flux Klein integration will be attempted after that, though this will be highly experimental, because I think it needs comfy UI, so will attempt to integrate it, but advanced features will possibly be limited, it may be generation only, or I may be able to have dynamic interface depending upon if using flux or z-image. We will see. I just want to get it working here, before I integrate it into my Agentic framework project, as a cheat sheet. Possibly I can just use the encoders here "Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF", for both, I have that encoder anyhow, downloading the Flux model "https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF" now. Start tomorrow. What I am hoping for, AI image editing and possibly better image generation, however Flux are models with guardrails, so both have their purposes. Oh, also I will test/fix the installer, hoping it works currently. 
 ```
-- New Models Options for Z-Image-Turbo.
 - Attempting Flux Klein with flux encoder, this involves new panel for flux, but also hardcoding of common values to known good settings for most in order to decomplicate what would otherwise be the Comfy-UI, hence with reduced inputs we would have a functional image generation and editing, where the user may associate an image with their prompt, and then for example use the flux image to text encoder with the flux model and a prompt from the user to create filtered image, ie "Change the background to beaches, keep pose and central character, but put light brown shorts and t-shirt on the character".
 - Done all noted improvements, though possibly will still noticinmg things that can be improved, see recent releases.
 - Add AI edit image feature, ie outpaint, etc. Requires Flux-Klein support because Z-image-turbo only supports generation and not editing. The UI woudl also require a rethink, ie what are the options and how am I going to fit them in. It would also need a Qwen 3 Flux Klein Encoder. If you would like to see the project reach "add image editing via SD Klein and Qwen3 for SD", then please support via sponsor/donate via kofi/patreon, otherwise development may grind to a halt here at some unexpected point.
