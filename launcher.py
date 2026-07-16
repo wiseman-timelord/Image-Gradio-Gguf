@@ -64,7 +64,7 @@ def _print_banner() -> None:
     cpu = configure.get_cpu_info()
     vk  = configure.get_vulkan_info()
     bs  = utilities.get_build_status()
-    cfg = configure.load_persistent()
+    cfg = configure.load_configuration()
 
     print(f"  Versioning: Python {platform.python_version()}; Gradio {gr.__version__}")
     print(f"\n  CPU     : {cpu['brand']}")
