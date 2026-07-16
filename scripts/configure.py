@@ -56,6 +56,143 @@ DIFFUSER_PLACEMENT_CHOICES: List[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Model family identification
+# ---------------------------------------------------------------------------
+# Single source of truth for "what kind of model is this file?". Consumed by
+# inference.categorize_models() and inference.is_sd_classic_model(); nothing
+# else in the program should keep its own private keyword list.
+#
+# TWO oracles, used in priority order by inference.py:
+#
+#   1. GGUF metadata `general.architecture` (already read by _probe_gguf).
+#      Authoritative, and independent of whatever the quantizer felt like
+#      naming the file. Every Z-Image-Turbo diffusion gguf reports `lumina2`
+#      -- the stock Tongyi-MAI z_image_turbo-Q#.gguf and equally every
+#      community finetune of it (BigDannyPt/Z-Image-Turbo-GGUF-Collection:
+#      DarkBeast, EventHorizon, PerfecZion, SmoothMix Ultimate, ZiT Anime,
+#      ZiT NSFW Photorealistic; 6B params, Q3_K_M ~4.1GB .. Q8_0 ~7.2GB).
+#      Those finetunes are the same S3-DiT weights with different training,
+#      so they need exactly the same handling as the stock checkpoint:
+#      --diffusion-model + --llm <qwen3 encoder> + --vae ae.safetensors,
+#      and NO --clip-skip.
+#
+#   2. Filename patterns, for files whose metadata could not be read and for
+#      safetensors (which carry no architecture field at all). The containing
+#      folder names are matched too, because the collection ships nested --
+#      e.g. DarkBeast/DBZiT9-DIMRClaw/darkBeastMar2126Latest_dbzit9DIMRclaw-Q8_0.gguf
+#      -- so the folder often names the family more clearly than the file does.
+#
+# All *_NAME_PATTERNS entries are REGEX, applied with re.search() against the
+# lowercased name. Short/ambiguous tokens are \b-anchored so `vl` matches
+# "qwen2-vl-7b" but not "swivl-mix". The Z-Image entries have to survive every
+# separator style in the wild (z_image_turbo, Z-Image-Turbo, zImageTurboAnime)
+# plus the "ZiT" abbreviation the finetunes use instead of the full name
+# (dbzit8, dbzit9, zitV10) -- without those, half the collection matched
+# nothing and fell through to "unknown".
+# ---------------------------------------------------------------------------
+
+# Exact-match (not substring) against general.architecture, lowercased.
+# Exact, because "qwen_image" is a DIFFUSION arch while "qwen3" is an ENCODER
+# arch -- a substring test for "qwen" would put the diffuser in the wrong bin.
+ENCODER_ARCHITECTURES: List[str] = [
+    "qwen3", "qwen3moe", "qwen2", "qwen2vl", "llama", "gemma3",
+    "mistral", "phi3", "t5", "t5encoder", "umt5", "clip",
+]
+
+DIFFUSION_ARCHITECTURES: List[str] = [
+    "lumina2",      # Z-Image / Z-Image-Turbo and all its finetunes
+    "flux", "chroma", "sd1", "sd2", "sd3", "sdxl",
+    "qwen_image", "wan", "ltxv", "hunyuan_video",
+]
+
+VAE_ARCHITECTURES: List[str] = ["vae", "autoencoder"]
+
+# Checked BEFORE the diffusion patterns: the encoder gguf is itself named
+# after the diffuser it serves ("Qwen3-4b-Z-Image-Turbo-AbliteratedV1"), so a
+# diffusion-first order would misfile the encoder as a diffuser.
+ENCODER_NAME_PATTERNS: List[str] = [
+    r"qwen(?!.{0,3}image)",   # qwen3-4b-... but not qwen_image / qwen-image
+    r"engineer",
+    r"encoder",
+    r"\bllava\b",
+    r"\bvision\b",
+    r"\bvl\b",
+    r"\bu?mt5(?:xxl)?\b",
+    r"\bclip[-_]?[lg]\b",
+]
+
+DIFFUSION_NAME_PATTERNS: List[str] = [
+    r"z[-_. ]?image",         # z_image_turbo, Z-Image-Turbo, zImageTurboAnime
+    r"zit[-_. ]?v?\d",        # dbzit8, dbzit9DIMRclaw, zitV10
+    r"dark[-_. ]?beast",      # BigDannyPt collection, family names
+    r"event[-_. ]?horizon",
+    r"perfeczion",
+    r"smooth[-_. ]?mix",
+    r"turbo",
+    r"diffusion",
+    r"\bunet\b",
+    r"\bdit\b",
+    r"sd[-_. ]?xl",
+    r"flux",
+    r"chroma",
+    r"illustrious",
+    r"\bsd3\b",
+    r"\bwan[-_. ]?\d",
+    r"\bltx",
+]
+
+VAE_NAME_PATTERNS: List[str] = [
+    r"\bae\b",                # ae.safetensors — the Z-Image VAE
+    r"vae",
+    r"autoencoder",
+]
+
+# --clip-skip is meaningful ONLY for checkpoints with a CLIP text encoder
+# (SD1.x / SD2.x / SDXL and its derivatives). Z-Image conditions through the
+# Qwen3 LLM instead and has no CLIP at all, so passing --clip-skip to it is at
+# best ignored and at worst a hard error.
+#
+# This is a POSITIVE allow-list on purpose. The old test was the inverse --
+# "SD-classic unless the name contains flux/z_image/sd3/wan/ltx" -- which is
+# wrong by default for anything unrecognised, and did not even catch the
+# models this program actually ships against: "zImageTurboAnime_v10-Q4_K_M"
+# has no underscore in "z_image", so it was treated as SD-classic and had
+# --clip-skip 2 bolted onto its command line. Unknown now means "no CLIP",
+# which is the safe direction for a Z-Image-first program.
+SD_CLASSIC_NAME_PATTERNS: List[str] = [
+    r"\bsd[-_. ]?1[-_. ]?[45]\b",
+    r"\bsd[-_. ]?15\b",
+    r"\bv1[-_. ]?5[-_. ]?pruned",
+    r"\bsd[-_. ]?2[-_. ]?[01]\b",
+    r"\bsd[-_. ]?21\b",
+    r"sd[-_. ]?xl",
+    r"illustrious",
+    r"\bpony\b",
+    r"noobai",
+]
+
+SD_CLASSIC_ARCHITECTURES: List[str] = ["sd1", "sd2", "sdxl"]
+
+# Quantization tokens recognised in filenames by
+# inference.get_quantization_label(), longest-first at match time so that
+# "q4_k_m" wins over "q4_k". BF16 is listed ahead of F16 for the same reason:
+# the collection's source-precision names ("perfeczion_10BF16-Q4_K_M") contain
+# both, and a bare "f16" substring test used to label BF16-sourced files F16.
+QUANT_TOKENS: List[str] = [
+    "iq1_s", "iq1_m",
+    "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
+    "iq3_xxs", "iq3_xs", "iq3_s", "iq3_m",
+    "iq4_xs", "iq4_nl",
+    "q2_k_s", "q2_k",
+    "q3_k_s", "q3_k_m", "q3_k_l", "q3_k",
+    "q4_0", "q4_1", "q4_k_s", "q4_k_m", "q4_k",
+    "q5_0", "q5_1", "q5_k_s", "q5_k_m", "q5_k",
+    "q6_k", "q8_0", "q8_k",
+    "tq1_0", "tq2_0",
+    "bf16", "fp16", "f16", "fp32", "f32", "f64",
+]
+
+# ---------------------------------------------------------------------------
 # Shared constants / maps / lists
 # ---------------------------------------------------------------------------
 SAMPLER_MAP: Dict[str, str] = {

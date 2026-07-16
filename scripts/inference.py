@@ -127,14 +127,115 @@ def find_model_by_name(substring: str, search_dirs: List[str]) -> Optional[str]:
 
 
 def get_quantization_label(filename: str) -> str:
+    """
+    Read the quantization out of a filename.
+
+    Matched with separator boundaries rather than a bare substring test, and
+    longest-token-first, because real filenames carry decoy digits+letters:
+      perfeczion_10BF16-Q4_K_M.gguf     -> Q4_K_M   (not F16, from "10BF16")
+      zImageTurboNSFW_60BF16Diffusion-Q6_K.gguf -> Q6_K
+      darkBeastMar2126Latest_dbzit9DIMRclaw-Q8_0.gguf -> Q8_0
+    A leading/trailing alphanumeric disqualifies a match, which is also what
+    stops "q4_0" being found inside "iq4_0" and "q4_k" inside "q4_k_m".
+    """
     n = filename.lower()
-    for q in ("q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_0", "q4_1",
-              "q4_k_s", "q4_k_m", "q5_0", "q5_1", "q5_k_s", "q5_k_m",
-              "q6_k", "q8_0", "f16", "f32", "iq2_xxs", "iq2_xs",
-              "iq3_xxs", "iq3_s", "iq4_xs", "iq4_nl"):
-        if q in n:
-            return q.upper()
+    for tok in sorted(configure.QUANT_TOKENS, key=len, reverse=True):
+        if re.search(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9_])", n):
+            return tok.upper()
     return "Unknown"
+
+
+def _name_haystacks(meta: Dict[str, Any]) -> List[str]:
+    """Filename plus up to two containing folder names, lowercased.
+
+    The folders matter: BigDannyPt's collection nests as
+    DarkBeast/DBZiT9-DIMRClaw/darkBeastMar2126Latest_...gguf, and users keep
+    that layout when they download, so the parent folders frequently identify
+    the family better than the file itself does.
+    """
+    out: List[str] = [str(meta.get("filename", "")).lower()]
+    fp = str(meta.get("file", ""))
+    if fp:
+        try:
+            for parent in Path(fp).parents[:2]:
+                out.append(parent.name.lower())
+        except Exception:
+            pass
+    return [h for h in out if h]
+
+
+def _matches_any(patterns: List[str], haystacks: List[str]) -> bool:
+    for pat in patterns:
+        for h in haystacks:
+            if re.search(pat, h):
+                return True
+    return False
+
+
+def _arch_of(meta: Dict[str, Any]) -> str:
+    """general.architecture from GGUF metadata, lowercased ('' if absent)."""
+    return str(meta.get("architecture", "")).strip().lower()
+
+
+def classify_model(meta: Dict[str, Any]) -> str:
+    """
+    Return "encoder", "diffusion", "vae" or "unknown" for one probed model.
+
+    Architecture metadata wins when present — every Z-Image-Turbo diffusion
+    gguf reports `lumina2`, whether it is the stock z_image_turbo-Q#.gguf or
+    one of the community finetunes (DarkBeast / EventHorizon / PerfecZion /
+    SmoothMix Ultimate / ZiT Anime / ZiT NSFW), so they all land in
+    "diffusion" regardless of how creatively they are named. Filename and
+    folder patterns are the fallback for unreadable metadata and safetensors.
+    See configure.py's "Model family identification" block for the lists.
+    """
+    arch = _arch_of(meta)
+    if arch:
+        if arch in configure.ENCODER_ARCHITECTURES:
+            return "encoder"
+        if arch in configure.DIFFUSION_ARCHITECTURES:
+            return "diffusion"
+        if arch in configure.VAE_ARCHITECTURES:
+            return "vae"
+
+    hay = _name_haystacks(meta)
+    fmt = str(meta.get("format", ""))
+
+    if fmt.startswith("Safetensors"):
+        # ae.safetensors is the only safetensors this program consumes.
+        return "vae" if _matches_any(configure.VAE_NAME_PATTERNS, hay) else "unknown"
+
+    # Encoder before diffusion: the encoder gguf is named after the diffuser
+    # it serves ("Qwen3-4b-Z-Image-Turbo-AbliteratedV1"), so testing the
+    # diffusion patterns first would misfile it.
+    if _matches_any(configure.ENCODER_NAME_PATTERNS, hay):
+        return "encoder"
+    if _matches_any(configure.DIFFUSION_NAME_PATTERNS, hay):
+        return "diffusion"
+    if _matches_any(configure.VAE_NAME_PATTERNS, hay):
+        return "vae"
+    return "unknown"
+
+
+def is_sd_classic_model(file_path: str, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    True only if the checkpoint positively looks like an SD1.x / SD2.x / SDXL
+    class model, i.e. one with a CLIP text encoder that --clip-skip applies to.
+
+    Unknown means False. Z-Image conditions through the Qwen3 LLM and has no
+    CLIP, so "no clip-skip" is the correct default for everything this program
+    is built to run.
+    """
+    if meta is None:
+        meta = probe_model(file_path) or {}
+    arch = _arch_of(meta)
+    if arch:
+        if arch in configure.SD_CLASSIC_ARCHITECTURES:
+            return True
+        if arch in configure.DIFFUSION_ARCHITECTURES:
+            return False  # known diffuser, known not to be CLIP-conditioned
+    hay = _name_haystacks(meta) or [Path(str(file_path)).name.lower()]
+    return _matches_any(configure.SD_CLASSIC_NAME_PATTERNS, hay)
 
 
 def categorize_models(models: List[Dict[str, Any]]
@@ -143,21 +244,7 @@ def categorize_models(models: List[Dict[str, Any]]
         "encoder": [], "diffusion": [], "vae": [], "unknown": [],
     }
     for m in models:
-        name = m.get("filename", "").lower()
-        fmt = m.get("format", "")
-        if fmt.startswith("Safetensors"):
-            if any(k in name for k in ("ae.", "vae", "autoencoder")):
-                cats["vae"].append(m)
-            else:
-                cats["unknown"].append(m)
-        elif any(k in name for k in
-                 ("qwen", "engineer", "encoder", "vision", "vl", "llava")):
-            cats["encoder"].append(m)
-        elif any(k in name for k in
-                 ("turbo", "diffusion", "unet", "sdxl", "flux", "z_image")):
-            cats["diffusion"].append(m)
-        else:
-            cats["unknown"].append(m)
+        cats[classify_model(m)].append(m)
     return cats
 
 
@@ -678,11 +765,18 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     if batch > 1:
         args.extend(["-b", str(batch)])
 
-    # --clip-skip is only valid for SD1.x / SD2.x architectures.
-    # Flux-based models (z_image_turbo) do not use CLIP skip — omit it.
-    diff_name = Path(str(diff_path)).name.lower()
-    is_sd_classic = not any(k in diff_name for k in
-                            ("flux", "z_image", "sd3", "wan", "ltx"))
+    # --clip-skip is only valid for checkpoints that HAVE a CLIP text encoder
+    # (SD1.x / SD2.x / SDXL). Z-Image-Turbo and its finetunes condition through
+    # the Qwen3 LLM passed via --llm and have no CLIP, so the flag is omitted.
+    #
+    # The test is now a positive one (see inference.is_sd_classic_model and
+    # configure.SD_CLASSIC_*). The previous inverse test — SD-classic unless
+    # the name contained "flux/z_image/sd3/wan/ltx" — silently failed for every
+    # model this program targets whose name does not spell z_image with an
+    # underscore: "zImageTurboAnime_v10", "smoothmixUltimate_zimageTurboV10",
+    # "eventHorizon_zitV10", "perfeczion_10BF16" and both darkBeast files all
+    # got --clip-skip 2 appended to a model that has no CLIP.
+    is_sd_classic = is_sd_classic_model(str(diff_path))
     clip_skip = int(cfg.get("imagegen_clip_skip", 2))
     if clip_skip > 1 and is_sd_classic:
         args.extend(["--clip-skip", str(clip_skip)])

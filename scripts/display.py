@@ -129,20 +129,60 @@ def _thread_choices() -> List[int]:
 
 
 def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
-    """
-    Given a diffusion model path, look for ae.safetensors in the same directory.
-    Returns (vae_full_path, vae_stem) or ("", "") if not found.
+    r"""
+    Given a diffusion model path, locate ae.safetensors and return
+    (vae_full_path, vae_stem), or ("", "") if not found.
+
+    Search order: the model's own folder first, then each folder above it up
+    to and including .\models, then a full sweep of .\models.
+
+    The walk-up matters. Z-Image-Turbo finetunes ship nested — BigDannyPt's
+    collection lays out as DarkBeast\DBZiT9-DIMRClaw\darkBeastMar2126Latest_
+    dbzit9DIMRclaw-Q8_0.gguf, two folders deep — and none of those repos
+    include a VAE, so the single ae.safetensors from the stock Z-Image-Turbo
+    repo lives at the .\models root and is shared by every diffusion model.
+    Looking only in the model's own folder found it for a flat .\models and
+    for nothing else.
     """
     if not diff_path_str:
         return "", ""
     p = Path(diff_path_str).expanduser()
     if not p.exists():
         return "", ""
-    parent = p.parent
-    # Search for ae.safetensors (case-insensitive)
-    for f in parent.iterdir():
-        if f.is_file() and f.name.lower() == "ae.safetensors":
-            return str(f), f.stem
+
+    def _scan(folder: Path) -> Optional[Path]:
+        try:
+            for f in folder.iterdir():
+                if f.is_file() and f.name.lower() == "ae.safetensors":
+                    return f
+        except OSError:
+            pass
+        return None
+
+    models_dir = configure.get_models_dir().resolve()
+
+    # The model's folder, then upwards. Bounded: stop once we pass the models
+    # dir, and never climb more than 4 levels, so a model parked somewhere odd
+    # cannot send us walking up to C:\.
+    current = p.parent.resolve()
+    for _ in range(5):
+        hit = _scan(current)
+        if hit:
+            return str(hit), hit.stem
+        if current == models_dir or current == current.parent:
+            break
+        current = current.parent
+
+    # Models root, then anywhere beneath it.
+    hit = _scan(models_dir)
+    if hit:
+        return str(hit), hit.stem
+    try:
+        for f in models_dir.rglob("*.safetensors"):
+            if f.is_file() and f.name.lower() == "ae.safetensors":
+                return str(f), f.stem
+    except OSError:
+        pass
     return "", ""
 
 
