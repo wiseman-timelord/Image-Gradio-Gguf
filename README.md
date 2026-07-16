@@ -1,7 +1,7 @@
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
-- v1.18 - Ensured that people whom dont have compile related install tools can still run via a non-compile download, without flagging required compile tools missing. This is all in addition to the awesome Overhaul that happened in v1.19.
+- v1.18 - Ensured that people whom dont have compile related install tools can still run via a non-compile download, without flagging required compile tools missing. This is all in addition to the awesome Overhaul that happened in v1.17.
 - v1.20 - Image Generation Model support expanded to addditionally include [Z-Image-Turbo-GGUF-Collection](https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection) in v1.19, this was then completed/corrected for v1.20 to include individual path setting for "ae.safetensors".
 
 ### Description
