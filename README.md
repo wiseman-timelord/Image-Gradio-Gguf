@@ -70,6 +70,7 @@ Currently...
 - If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, I cant remember the exact prompt, but you can compare it to my picture of a Woodchuck standing next to a pile of wood and juggling small logs of wood.
 
 ### Notation:
+- Something to consider is how much memory the Image model takes, I was able to load Q5 model to passive 8GB GPU, if Diffuser Placement is set to Split, owtherwise it will not load in Full. 
 - If you have older hardware, then I strongly advise generating 256x256 images unless you need them larger, as optimally 256x256 will take little time compared to 512x512 images. This is not such a problem if you have newer/expensive hardware. 
 - As shown in the images on the readme.md, I was not able to load Z-Image-Turbo in Q4_KM completely to a 8GB GPU without using the option to put the ae.safetensors on the CPU, but I would not use less than a Q4_KM z-image-turbo. The Qwen3 4b Encoder model fits safely within 8GB, Encoding is a small task compared to diffusion.
 - The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3 is the only encoder, but not that old that its naff. 
