@@ -51,7 +51,7 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 - Libraries - Required libraries is handled by the installer script, but they include both, Llama.Cpp and Stable Diffusion.
 - Building - VS 2022 C++, specifically the Desktop Build Tools including CMake. Additionally the Vulkan 1.4 SDK. Additionally Windows 10/11 SDK relevant to your os version.
 
-### Models...
+### Models:
 I put Q# because it should support any quantization, the model variety will be expanded upon later....
 - intended Encoding model, "Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf" and "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf". Such as for example [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF) or [Qwen3-4b-Z-Image-Turbo-AbliteratedV1-GGUF](https://huggingface.co/mradermacher/Qwen3-4b-Z-Image-Turbo-AbliteratedV1-GGUF)
 - intended Image generation model "z_image_turbo-Q#.gguf". Such as for example, [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) or [Reinforced Z-Image-Turbo-GGUF](https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection/tree/main).
