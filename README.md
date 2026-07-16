@@ -67,7 +67,7 @@ Currently...
 ```
 
 ### Examples:
-- If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, I cant remember the exact prompt, but you can compare it to my picture of a Woodchuck standing next to a pile of wood and juggling small logs of wood.
+- If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, I cant remember the exact prompt, but you can compare it to my picture of a Woodch uck standing next to a pile of wood and juggling small logs of wood.
 
 ### Notation:
 - Something to consider is how much memory the Image model takes, I was able to load Q5 model to passive 8GB GPU, if Diffuser Placement is set to Split, owtherwise it will not load in Full. 
