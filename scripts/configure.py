@@ -8,6 +8,7 @@ import configparser
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -30,17 +31,19 @@ ENCODER_VOCAB_SIZE = 151936
 DIFFUSER_MAX_LAYERS = 30
 
 # ---------------------------------------------------------------------------
-# IMPORTANT — sd.cpp has NO per-layer GPU offload for the diffusion model.
-# Unlike llama.cpp (-ngl <N>), stable-diffusion.cpp only supports whole-
-# component device placement via --clip-on-cpu, --vae-on-cpu and
-# --offload-to-cpu/--diffusion-fa. There is no "-ngl" equivalent for the
-# diffuser, so we do NOT expose a numeric diffuser GPU-layers control —
-# doing so would be cosmetic only and silently do nothing. (This is exactly
-# what the old "--llm-to-cpu" flag did: it does not exist in sd.cpp, so
-# selecting CPU for the encoder had zero effect on actual VRAM use.)
+# sd.cpp has NO per-layer GPU offload for the diffusion model. Unlike llama.cpp
+# (-ngl <N>), placement is whole-module only. Modern sd.cpp expresses this with
+# two assignments -- --backend (where graphs execute) and --params-backend
+# (where weights live) -- addressing modules named `diffusion`, `te` and `vae`.
+# So we expose a 3-way placement choice rather than a meaningless layer count.
+# See parse_diffuser_placement() below and inference.generate_image().
 #
-# Instead we expose a 3-way placement choice that maps to real sd.cpp flags.
-# See parse_diffuser_placement() below for the mapping.
+# History worth keeping: the older whole-component flags (--clip-on-cpu,
+# --vae-on-cpu) are still accepted by sd.cpp but are IGNORED whenever --backend
+# is set. Passing both -- which this program used to do -- meant the Split
+# option silently behaved as Full GPU, so the Qwen3 conditioner loaded onto VRAM
+# beside the diffusion model and 8GB cards OOM'd. CPU-only runs set no --backend
+# and so kept working, which is why the failure looked GPU-specific.
 # ---------------------------------------------------------------------------
 DIFFUSER_PLACEMENT_FULL_GPU = "Full GPU"
 DIFFUSER_PLACEMENT_SPLIT    = "Split (Diffusion GPU, Encoder/VAE CPU)"
@@ -220,25 +223,18 @@ def ensure_data_dirs() -> None:
 # Hardware constants — read from constants.ini (written by installer)
 # ---------------------------------------------------------------------------
 #
-# CPU_FEATURES mirrors installer.py's CPU_FEATURES list (the canonical,
-# compile-time-verified source of truth — installer.py is intentionally
-# self-contained and cannot import scripts.*, so this is a deliberate,
-# documented mirror rather than a shared import). Keep the two in sync.
-#
-# Restricted to instruction-set toggles that actually exist as options in
-# ggml's CMakeLists.txt (shared build system for both llama.cpp and
-# stable-diffusion.cpp, which vendors ggml). ggml exposes one combined
-# "GGML_SSE42" option for the whole SSE/SSSE3/SSE4.x family — there is no
-# per-version GGML_SSE / GGML_SSE2 / GGML_SSE3 / GGML_SSSE3 / GGML_SSE4_1
-# option, so those are deliberately not tracked here. See installer.py's
-# CPU_FEATURES docstring for the verified upstream option list.
+# CPU_FEATURES mirrors installer.py's list. Both are REPORTING ONLY: the build
+# uses GGML_NATIVE=ON, so ggml probes the build machine itself and ignores any
+# -DGGML_*=ON we might pass. That is what makes the binaries optimal on any AMD
+# or Intel CPU without a lookup table -- and it is why nothing here steers the
+# build. These keys exist so the UI can tell the user what their CPU has.
 CPU_FEATURES: List[Dict[str, str]] = [
-    {"key": "has_sse4_2",   "name": "SSE4.2", "cmake": "GGML_SSE42=ON"},
-    {"key": "has_avx",      "name": "AVX",    "cmake": "GGML_AVX=ON"},
-    {"key": "has_avx2",     "name": "AVX2",   "cmake": "GGML_AVX2=ON"},
-    {"key": "has_f16c",     "name": "F16C",   "cmake": "GGML_F16C=ON"},
-    {"key": "has_fma",      "name": "FMA",    "cmake": "GGML_FMA=ON"},
-    {"key": "has_avx512",   "name": "AVX512", "cmake": "GGML_AVX512=ON"},
+    {"key": "has_sse4_2", "name": "SSE4.2"},
+    {"key": "has_avx",    "name": "AVX"},
+    {"key": "has_avx2",   "name": "AVX2"},
+    {"key": "has_f16c",   "name": "F16C"},
+    {"key": "has_fma",    "name": "FMA"},
+    {"key": "has_avx512", "name": "AVX512"},
 ]
 
 
@@ -264,15 +260,19 @@ def get_cpu_info() -> Dict[str, Any]:
     cfg = _read_constants()
     sec = cfg["cpu"] if cfg.has_section("cpu") else {}
     cores = int(sec.get("cores_logical", str(os.cpu_count() or 4)))
+    phys  = int(sec.get("cores_physical", str(max(1, cores // 2))))
     dt    = int(sec.get("default_threads", str(max(1, math.ceil(cores * 0.85)))))
     info: Dict[str, Any] = {
-        "brand":          sec.get("brand", "unknown"),
-        "vendor":         sec.get("vendor", "unknown"),
-        "arch":           sec.get("arch", "x86_64"),
-        "cores_logical":  cores,
+        "brand":           sec.get("brand", "unknown"),
+        "vendor":          sec.get("vendor", "unknown"),
+        "arch":            sec.get("arch", "x86_64"),
+        "cores_logical":   cores,
+        "cores_physical":  phys,
         "default_threads": dt,
-        "has_aocl":       sec.get("has_aocl", "False") == "True",
-        "cmake_flags":    sec.get("cmake_flags", "").split(),
+        "build_jobs":      int(sec.get("build_jobs", str(dt))),
+        "has_aocl":        sec.get("has_aocl", "False") == "True",
+        "cmake_flags":     sec.get("cmake_flags", "").split(),
+        "arch_selection":  sec.get("arch_selection", "unknown"),
     }
     for feat in CPU_FEATURES:
         info[feat["key"]] = sec.get(feat["key"], "False") == "True"
@@ -280,32 +280,46 @@ def get_cpu_info() -> Dict[str, Any]:
 
 
 def get_vulkan_info() -> Dict[str, Any]:
-    """Return Vulkan/GPU details sourced from constants.ini."""
+    """Return the GPU list ggml itself reported at install time.
+
+    Devices are read from the per-device gpu<N>_* keys written by the installer
+    after it ran `llama-completion --list-devices`. Those indices are exactly
+    what `-dev Vulkan<N>` and `--backend vulkan<N>` expect -- they are ggml's
+    own enumeration, which filters to supported discrete/integrated GPUs and
+    deduplicates multi-driver duplicates, and therefore does NOT match a
+    vulkaninfo ordering.
+
+    gpu_numbers is the index list; gpu_names is a legacy convenience mirror and
+    is deliberately not parsed for names (a GPU name may contain a comma).
+    """
     cfg = _read_constants()
     sec = cfg["vulkan"] if cfg.has_section("vulkan") else {}
 
     available   = sec.get("available", "False") == "True"
     gpu_numbers = sec.get("gpu_numbers", "")      # e.g. "0,1"
-    gpu_names   = sec.get("gpu_names", "")        # e.g. "RX 580,RX 470"
 
-    indices = [int(x.strip()) for x in gpu_numbers.split(",") if x.strip().lstrip("-").isdigit()]
-    names   = [x.strip() for x in gpu_names.split(",") if x.strip()]
+    indices = [int(x.strip()) for x in gpu_numbers.split(",")
+               if x.strip().lstrip("-").isdigit()]
 
-    devices = []
-    for i, idx in enumerate(indices):
+    devices: List[Dict[str, Any]] = []
+    for idx in indices:
         devices.append({
-            "index": idx,
-            "name":  names[i] if i < len(names) else f"GPU{idx}",
+            "index":         idx,
+            "name":          sec.get(f"gpu{idx}_name", f"GPU{idx}"),
+            "backend":       sec.get(f"gpu{idx}_backend", "Vulkan"),
+            "vram_total_mb": int(sec.get(f"gpu{idx}_vram_mb", "0") or 0),
+            "vram_free_mb":  int(sec.get(f"gpu{idx}_free_mb", "0") or 0),
         })
 
     return {
-        "available":    available,
-        "version":      sec.get("version", "unknown"),
-        "sdk":          sec.get("sdk", ""),
-        "gpu_count":    int(sec.get("gpu_count", "0")),
-        "gpu_numbers":  gpu_numbers,
-        "gpu_names":    gpu_names,
-        "devices":      devices,
+        "available":     available,
+        "version":       sec.get("version", "unknown"),
+        "sdk":           sec.get("sdk", ""),
+        "gpu_count":     len(devices),
+        "gpu_numbers":   gpu_numbers,
+        "gpu_names":     sec.get("gpu_names", ""),
+        "enumerated_by": sec.get("enumerated_by", "not probed"),
+        "devices":       devices,
     }
 
 
@@ -324,13 +338,15 @@ def get_install_type() -> str:
 
 def get_backend_choices() -> Dict[str, List[str]]:
     """
-    Build the dropdown choices for encoder/imagegen backends.
+    Build the encoder/imagegen backend dropdown choices for THIS machine.
 
-    Returns {"cpu_choices": [...], "gpu_choices": [...], "all_choices": [...]}
-    where each choice is a string the UI shows and inference.py uses.
+    Entirely driven by what ggml enumerated at install time -- no assumption
+    about how many GPUs exist or which one is "the" inference card. A laptop
+    with one iGPU, a desktop with a monitor card plus a passive compute card,
+    and a CPU-only box all produce a correct list.
 
-    CPU entry  : "<CPU brand name>"  (e.g. "AMD Ryzen 9 3900X 12-Core Processor")
-    GPU entries: "Vulkan GPU 0 — RX 580", "Vulkan GPU 1 — RX 470", ...
+    CPU entry  : "<CPU brand>"
+    GPU entries: "Vulkan GPU 1 - Radeon RX 470 (8192 MiB)"
     GPU entries are omitted entirely for a cpu_only install.
     """
     cpu_info = get_cpu_info()
@@ -340,25 +356,37 @@ def get_backend_choices() -> Dict[str, List[str]]:
 
     if get_install_type() != "cpu_only":
         vk = get_vulkan_info()
-        if vk["available"]:
-            for d in vk["devices"]:
-                label = f"Vulkan GPU {d['index']} — {d['name']}"
-                gpu_choices.append(label)
+        for d in vk["devices"]:
+            vram = f" ({d['vram_total_mb']} MiB)" if d.get("vram_total_mb") else ""
+            gpu_choices.append(f"Vulkan GPU {d['index']} - {d['name']}{vram}")
 
-    all_choices = cpu_choices + gpu_choices
     return {
         "cpu_choices": cpu_choices,
         "gpu_choices": gpu_choices,
-        "all_choices": all_choices,
+        "all_choices": cpu_choices + gpu_choices,
     }
 
 
 def get_thread_choices() -> List[int]:
-    """Thread count dropdown choices anchored to the detected default."""
+    """Thread choices for this machine, capped at its actual logical cores.
+
+    Always includes:
+      * default_threads (85% of logical) - the installed default
+      * cores_physical  - usually the fastest option for ggml compute, since
+                          two threads sharing one core's FPU contend rather
+                          than help. Offered so it can be A/B tested.
+      * cores_logical   - the ceiling
+    The old fixed list offered 48 and 64 on a 12-thread machine.
+    """
+    info = get_cpu_info()
+    logical  = max(1, int(info.get("cores_logical", 4)))
+    physical = max(1, int(info.get("cores_physical", max(1, logical // 2))))
     dt = get_default_threads()
-    base = [4, 8, 12, 16, 20, 24, 28, 32, 48, 64]
-    choices = sorted(set(base + [dt]))
-    return choices
+
+    base = [1, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32, 48, 64]
+    choices = {c for c in base if c <= logical}
+    choices.update({physical, dt, logical})
+    return sorted(c for c in choices if 1 <= c <= logical)
 
 
 def parse_backend_choice(choice: str) -> Dict[str, Any]:
@@ -369,52 +397,75 @@ def parse_backend_choice(choice: str) -> Dict[str, Any]:
     e.g. "Vulkan GPU 1 — RX 470" → {"use_vulkan": True, "vulkan_device": 1}
          "AMD Ryzen 9 3900X ..."  → {"use_vulkan": False, "vulkan_device": -1}
     """
-    if choice.startswith("Vulkan GPU"):
-        # "Vulkan GPU 1 — name"
-        parts = choice.split()
-        try:
-            idx = int(parts[2])
-        except (IndexError, ValueError):
-            idx = 0
-        return {"use_vulkan": True, "vulkan_device": idx}
+    m = re.match(r"^\s*Vulkan GPU\s+(\d+)\b", choice or "")
+    if m:
+        return {"use_vulkan": True, "vulkan_device": int(m.group(1))}
     return {"use_vulkan": False, "vulkan_device": -1}
 
 
 def parse_diffuser_placement(placement: str) -> Dict[str, Any]:
     """
-    Convert a DIFFUSER_PLACEMENT_* label into the real sd.cpp flags/behavior
-    needed by inference.generate_image().
+    Convert a DIFFUSER_PLACEMENT_* label into what inference.generate_image()
+    needs to build sd.cpp's --backend / --params-backend assignments.
 
     Returns:
         {
-            "use_vulkan_backend": bool,  # whether to pass --backend vulkanN at all
-            "clip_on_cpu":        bool,  # --clip-on-cpu (keeps the Qwen3/LLM
-                                          # text encoder off VRAM — this is the
-                                          # REAL flag; the old "--llm-to-cpu"
-                                          # does not exist in sd.cpp)
-            "vae_on_cpu":         bool,  # --vae-on-cpu
+            "use_vulkan_backend": bool,  # target a GPU at all
+            "split_to_cpu":       bool,  # pin te (Qwen3 conditioner) + vae to CPU
+                                         # while diffusion stays on the GPU
         }
 
-    sd.cpp has no per-layer GPU offload for the diffusion model, so these
-    three booleans are the entire space of placement control available.
+    sd.cpp has no per-layer offload for the diffuser (no -ngl equivalent), so
+    whole-module placement is the entire space of control -- but it applies to
+    BOTH execution (--backend) and weight allocation (--params-backend), and
+    the second is what governs VRAM. See inference.generate_image().
+
+    The legacy booleans this used to return (clip_on_cpu / vae_on_cpu) mapped to
+    --clip-on-cpu / --vae-on-cpu, which upstream ignores whenever --backend is
+    set. They are gone rather than fixed: module assignments express the same
+    intent and actually take effect.
     """
     if placement == DIFFUSER_PLACEMENT_FULL_GPU:
-        return {"use_vulkan_backend": True,  "clip_on_cpu": False, "vae_on_cpu": False}
+        return {"use_vulkan_backend": True,  "split_to_cpu": False}
     if placement == DIFFUSER_PLACEMENT_SPLIT:
-        return {"use_vulkan_backend": True,  "clip_on_cpu": True,  "vae_on_cpu": True}
-    # DIFFUSER_PLACEMENT_FULL_CPU (or unrecognized) — never pass --backend
-    # vulkanN, so sd.cpp never attempts a Vulkan device allocation at all.
-    return {"use_vulkan_backend": False, "clip_on_cpu": True, "vae_on_cpu": True}
+        return {"use_vulkan_backend": True,  "split_to_cpu": True}
+    if placement != DIFFUSER_PLACEMENT_FULL_CPU:
+        # Loud, not silent. These labels are matched exactly, so a reworded
+        # constant would otherwise downgrade Full GPU / Split to CPU with no
+        # error -- the user just sees "it got slow" and has nothing to go on.
+        print(f"WARNING: unknown diffuser placement {placement!r}; "
+              f"falling back to {DIFFUSER_PLACEMENT_FULL_CPU!r}. "
+              f"Expected one of: {DIFFUSER_PLACEMENT_CHOICES}")
+    return {"use_vulkan_backend": False, "split_to_cpu": True}
 
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 
+def _default_gpu_index() -> int:
+    """Starting GPU for this machine: most free VRAM, or -1 if there are none.
+    Mirrors installer.py's _default_gpu_index(); both are only a starting point
+    that the Configuration page overrides."""
+    if get_install_type() == "cpu_only":
+        return -1
+    devices = get_vulkan_info().get("devices") or []
+    if not devices:
+        return -1
+    best = max(devices, key=lambda d: (d.get("vram_free_mb", 0),
+                                       d.get("vram_total_mb", 0)))
+    return int(best["index"])
+
+
 def _default_persistent() -> Dict[str, Any]:
+    """Defaults synthesised from constants.ini, for when persistent.json is
+    absent or is missing keys added by a newer version. Kept in step with
+    installer.py's write_default_persistent(); that one seeds the file at
+    install time, this one backfills gaps at load time."""
     dt = get_default_threads()
     cpu_label = get_cpu_info().get("brand", "CPU") or "CPU"
     is_cpu_only = get_install_type() == "cpu_only"
+    gpu = _default_gpu_index()
     return {
         "encoder_model_path":  "",  "encoder_model_name":  "",
         "imagegen_model_path": "",  "imagegen_model_name": "",
@@ -427,15 +478,21 @@ def _default_persistent() -> Dict[str, Any]:
         "encoder_ctx_size": 4096,
         "encoder_flash_attn": True,
         "encoder_gpu_layers": -1,
+        # Per-side device indices, read by inference.py. The encoder and the
+        # diffuser may sit on different devices, or one may be on CPU, so a
+        # single shared key cannot express the configuration.
+        "encoder_vulkan_device": gpu,
+        "imagegen_vulkan_device": gpu,
         # imagegen_placement controls component-level GPU/CPU split for the
         # diffuser (see DIFFUSER_PLACEMENT * / parse_diffuser_placement()).
         # sd.cpp has no per-layer offload, so this — not a layer count — is
         # the real equivalent of encoder_gpu_layers for the diffuser side.
-        "imagegen_placement": (DIFFUSER_PLACEMENT_FULL_CPU if is_cpu_only
+        "imagegen_placement": (DIFFUSER_PLACEMENT_FULL_CPU
+                               if (is_cpu_only or gpu < 0)
                                else DIFFUSER_PLACEMENT_FULL_GPU),
         "imagegen_threads": dt,
-        "imagegen_width": 512,
-        "imagegen_height": 512,
+        "imagegen_width": 256,
+        "imagegen_height": 256,
         "imagegen_steps": 4,
         "imagegen_cfg_scale": 1.0,
         "imagegen_seed": -1,
@@ -443,7 +500,6 @@ def _default_persistent() -> Dict[str, Any]:
         "imagegen_batch_count": 1,
         "imagegen_clip_skip": 2,
         "imagegen_quality_preset": "Fast (Turbo)",
-        "vulkan_device": 0,
         "output_format": "png",
         "auto_save": True,
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",

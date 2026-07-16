@@ -58,22 +58,29 @@ def find_sd_cpp() -> Optional[Path]:
     return None
 
 
-def find_llama_cli() -> Optional[Path]:
+def find_llama_completion() -> Optional[Path]:
     """
-    Find llama-cli.exe.  Search order:
-      1. ./data/llama_cpp_binaries/llama-cli.exe  (compiled by installer)
+    Find llama-completion.exe -- the one-shot completion binary.
+
+    Deliberately NOT llama-cli: upstream reorganised its tools, tools/main/ is
+    gone, and `llama-cli` is now an interactive chat REPL built on the server
+    stack (it prints an ASCII logo and /exit, /regen, /clear commands, then
+    waits on stdin). Feeding it -p and reading stdout cannot work. The
+    successor to the old one-shot main.cpp is tools/completion/ ->
+    llama-completion. Legacy names are kept only as a fallback for an old
+    install directory.
+
+    Search order:
+      1. ./data/llama_cpp_binaries/llama-completion.exe  (compiled by installer)
       2. PATH
     """
     bin_dir = configure.get_llama_bin_dir()
-    for name in ("llama-cli.exe", "llama-cli", "main.exe", "main"):
+    for name in ("llama-completion.exe", "llama-completion"):
         p = bin_dir / name
         if p.exists():
             return p
-    for name in ("llama-cli", "main"):
-        found = shutil.which(name)
-        if found:
-            return Path(found)
-    return None
+    found = shutil.which("llama-completion")
+    return Path(found) if found else None
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +368,7 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
     model_path = cfg.get("encoder_model_path", "")
     if not model_path or not Path(model_path).exists():
         return prompt
-    cli = find_llama_cli()
+    cli = find_llama_completion()
     if not cli:
         return prompt
 
@@ -375,25 +382,53 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
     full_prompt = template.replace(
         "{prompt}", f"{system_msg}\n\nUser request: {prompt}")
 
+    # ------------------------------------------------------------------
+    # argv notes -- each of these was independently fatal before:
+    #
+    # -no-cnv          llama.cpp auto-enables conversation mode when the model
+    #                  ships a chat template ("default: auto enabled if chat
+    #                  template is available"). Qwen3 does. Without this the
+    #                  process goes interactive and waits on stdin until our
+    #                  120s timeout kills it.
+    # --flash-attn on  -fa takes a VALUE ([on|off|auto]). The parser consumes
+    #                  the next argv unconditionally, so a bare --flash-attn
+    #                  swallowed the following "-ngl" and threw
+    #                  "unknown value for --flash-attn: '-ngl'".
+    # no --log-disable it pauses common_log_main(), which is exactly where the
+    #                  generated tokens are written (LOG("%s", token_str)), so
+    #                  it silenced the output we are here to read.
+    # --no-display-prompt
+    #                  stops the prompt being echoed back into the text we parse.
+    # -dev VulkanN     the real device selector. GGML_VULKAN_DEVICE does not
+    #                  exist in ggml (the only device env var is
+    #                  GGML_VK_VISIBLE_DEVICES, a CUDA_VISIBLE_DEVICES-style
+    #                  filter that RENUMBERS devices, which is a different and
+    #                  more confusing thing). Setting a nonexistent variable
+    #                  silently left the encoder on ggml's default device.
+    # ------------------------------------------------------------------
     base_args = [
         str(cli), "-m", model_path, "-p", full_prompt,
         "-c", str(cfg.get("encoder_ctx_size", 4096)),
         "-t", str(cfg.get("encoder_threads", configure.get_default_threads())),
         "-b", str(cfg.get("encoder_batch_size", 512)),
-        "-n", "256", "--temp", "0.7", "--log-disable",
+        "-n", "256", "--temp", "0.7",
+        "-no-cnv",
+        "--no-display-prompt",
+        "--flash-attn", "on" if cfg.get("encoder_flash_attn", True) else "off",
     ]
-    if cfg.get("encoder_flash_attn", True):
-        base_args.append("--flash-attn")
 
     backend = cfg.get("backend_encoder", "CPU")
     use_vulkan = "Vulkan" in backend
     env = os.environ.copy()
 
     if use_vulkan:
-        env["GGML_VULKAN_DEVICE"] = str(cfg.get("vulkan_device", 1))
+        dev = int(cfg.get("encoder_vulkan_device", -1))
+        if dev >= 0:
+            base_args.extend(["-dev", f"Vulkan{dev}"])
         raw_ngl = int(cfg.get("encoder_gpu_layers", -1))
         current_ngl = _resolve_gpu_layers(raw_ngl, model_path)
     else:
+        base_args.extend(["-dev", "none"])
         current_ngl = 0
 
     # Retry dampening: reductions applied cumulatively each attempt.
@@ -599,47 +634,45 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     # ------------------------------------------------------------------
     # Device / component placement.
     #
-    # sd.cpp has NO per-layer GPU offload for the diffusion model (unlike
-    # llama.cpp's -ngl). Placement is whole-component only, controlled by
-    # three real flags: --backend vulkanN (use the GPU device at all),
-    # --clip-on-cpu (keep the text encoder — including the Qwen3 --llm
-    # encoder used here — off VRAM), and --vae-on-cpu (keep the VAE off
-    # VRAM). imagegen_placement selects between Full GPU / Split / Full CPU
-    # via parse_diffuser_placement(), which returns exactly these booleans.
+    # sd.cpp has TWO backend assignments and you need both:
+    #   --backend         where graphs EXECUTE
+    #   --params-backend  where model WEIGHTS are ALLOCATED
+    # VRAM pressure is weights, so --params-backend is the one that decides
+    # whether Z-Image fits on an 8GB card. It was never passed before.
     #
-    # Previously this only checked "Vulkan" in backend_imagegen and, when
-    # true, always passed --backend vulkanN AND tried to keep the encoder
-    # off VRAM with "--llm-to-cpu" — a flag that does not exist in sd.cpp.
-    # That flag was silently ignored, so the encoder always loaded onto
-    # VRAM alongside the diffusion model, which is what caused the
-    # ErrorOutOfDeviceMemory crash. It also meant selecting "CPU" for the
-    # ImageGen backend never actually stopped sd.cpp from using Vulkan,
-    # since nothing forced --backend off.
+    # The old code passed `--backend vulkanN` together with --clip-on-cpu /
+    # --vae-on-cpu. Upstream docs/backend.md is explicit that those legacy
+    # flags "affect runtime backend assignment ONLY when --backend is not set".
+    # So they were discarded, everything landed on the GPU, and Vulkan runs
+    # OOM'd or thrashed -- while CPU-only runs (which set no --backend, so the
+    # legacy flags DID apply) kept working. That asymmetry is exactly the
+    # "Vulkan broken, CPU fine" behaviour.
+    #
+    # Module names come from docs/backend.md: `diffusion` (the DiT), `te` (text
+    # encoders / conditioners, which is where the Qwen3 --llm goes), `vae`.
     # ------------------------------------------------------------------
     placement_label = cfg.get("imagegen_placement", configure.DIFFUSER_PLACEMENT_FULL_GPU)
     placement = configure.parse_diffuser_placement(placement_label)
 
     env = os.environ.copy()
-    if placement["use_vulkan_backend"]:
-        vk_dev = cfg.get("vulkan_device", 1)
-        # --backend replaces --vulkan in current sd.cpp builds.
-        # Format: --backend vulkan{N}  (e.g. --backend vulkan1)
-        args.extend(["--backend", f"vulkan{vk_dev}"])
-        sdk = utilities.detect_vulkan().get("vulkan_sdk", "")
+    vk_dev = int(cfg.get("imagegen_vulkan_device", -1))
+
+    if placement["use_vulkan_backend"] and vk_dev >= 0:
+        dev = f"vulkan{vk_dev}"
+        if placement["split_to_cpu"]:
+            # Diffusion on the GPU; Qwen3 conditioner (~3.6GB) and VAE stay in
+            # system RAM, both for execution and for weight allocation.
+            assign = f"diffusion={dev},te=cpu,vae=cpu"
+        else:
+            assign = dev
+        args.extend(["--backend", assign, "--params-backend", assign])
+        sdk = configure.get_vulkan_info().get("sdk", "") or os.environ.get("VULKAN_SDK", "")
         if sdk:
             env["PATH"] = str(Path(sdk) / "Bin") + ";" + env.get("PATH", "")
-    # else: deliberately omit --backend entirely so sd.cpp never attempts
-    # a Vulkan device allocation — this is the actual CPU-only code path.
-
-    if placement["clip_on_cpu"] and enc_path and Path(enc_path).exists():
-        # Real sd.cpp flag (the text-encoder equivalent of llama.cpp's
-        # --llm-to-cpu, which does not exist). Keeps the Qwen3 conditioner
-        # weights (~3.6GB) off VRAM so only the diffusion model + VAE
-        # (~4.6GB) occupy the GPU, fitting in an 8GB card.
-        args.append("--clip-on-cpu")
-
-    if placement["vae_on_cpu"]:
-        args.append("--vae-on-cpu")
+    else:
+        # Explicit, rather than omitting --backend: says what we mean, and
+        # stops ggml's default "prefer GPU" preference picking a card.
+        args.extend(["--backend", "cpu", "--params-backend", "cpu"])
 
     batch = int(cfg.get("imagegen_batch_count", 1))
     if batch > 1:

@@ -1,8 +1,12 @@
-#!/usr/env python3
+#!/usr/bin/env python3
 """
-display.py - Gradio 5 UI for Image-Gradio-Gguf.
+display.py - Gradio 6 UI for Image-Gradio-Gguf.
 Three tabs: Generate | Configuration | Debug / Info
 Build/install functionality lives in installer.py only.
+
+Backend dropdowns are populated from configure.get_backend_choices(), which
+reflects whatever GPUs ggml actually enumerated on THIS machine at install
+time. Nothing here assumes a GPU count or a particular device index.
 """
 
 from __future__ import annotations
@@ -938,9 +942,13 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "vae_model_path":      vp,  "vae_model_name":      vn,
             "backend_encoder":     enc_back,
             "backend_imagegen":    img_back,
+            # Per-side, and READ per-side by inference.py. The old code also
+            # wrote a shared "vulkan_device" from the ImageGen dropdown only,
+            # while enhance_prompt() read that same key for the ENCODER -- so
+            # picking "CPU" for ImageGen silently set the encoder's device to
+            # -1. The two keys below were already being written and never read.
             "encoder_vulkan_device": enc_parsed["vulkan_device"],
             "imagegen_vulkan_device": img_parsed["vulkan_device"],
-            "vulkan_device":         img_parsed["vulkan_device"],
             "encoder_threads":     int(threads),
             "imagegen_threads":    int(threads),
             "encoder_batch_size":  int(eb),
@@ -973,18 +981,103 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
 
 def _collect_debug() -> str:
     """
-    Show the raw contents of data/constants.ini so the user
-    can see exactly what was detected and written during installation.
+    Hardware and build report, plus the raw constants.ini.
+
+    This exists so hardware problems are visible instead of inferred. It is
+    also the home for utilities.get_memory_info / check_prerequisites /
+    get_relevant_env / get_build_status, which previously had no caller at all
+    -- a diagnostics toolkit with nothing to diagnose. The GPU section is the
+    important one: it shows the exact device indices the program will pass to
+    `-dev Vulkan<N>` and `--backend vulkan<N>`, as reported by ggml itself.
     """
     try:
-        width = 48
+        import scripts.utilities as utilities
+        W = 60
         L: List[str] = []
-        
-        # --- constants.ini ---
-        L.append("=" * width)
-        L.append("  CONSTANTS.INI")
-        L.append("=" * width)
+
+        def rule(title: str) -> None:
+            L.append("=" * W)
+            L.append(f"  {title}")
+            L.append("=" * W)
+
+        # --- CPU ---
+        cpu = configure.get_cpu_info()
+        rule("CPU")
+        L.append(f"  Brand        : {cpu.get('brand')}")
+        L.append(f"  Vendor       : {cpu.get('vendor')}")
+        L.append(f"  Cores        : {cpu.get('cores_logical')} logical / "
+                 f"{cpu.get('cores_physical')} physical")
+        L.append(f"  Threads      : {cpu.get('default_threads')} default (85% of logical)")
+        feats = [f["name"] for f in configure.CPU_FEATURES if cpu.get(f["key"])]
+        L.append(f"  Features     : {', '.join(feats) if feats else 'none reported'}")
+        L.append(f"  Build arch   : {cpu.get('arch_selection')}")
+        L.append(f"  AOCL present : {cpu.get('has_aocl')}  (detected only; not wired into the build)")
         L.append("")
+
+        # --- Memory ---
+        mem = utilities.get_memory_info()
+        if mem:
+            rule("MEMORY")
+            L.append(f"  RAM          : {mem.get('ram_used_mb')} / "
+                     f"{mem.get('ram_total_mb')} MB used ({mem.get('ram_percent')}%)")
+            L.append("")
+
+        # --- GPU ---
+        vk = configure.get_vulkan_info()
+        rule("GPU / VULKAN")
+        L.append(f"  Install type : {configure.get_install_type()}")
+        L.append(f"  Vulkan       : {vk.get('available')}  (version {vk.get('version')})")
+        L.append(f"  SDK          : {vk.get('sdk') or 'not set'}")
+        L.append(f"  Enumerated by: {vk.get('enumerated_by')}")
+        if vk["devices"]:
+            L.append("  Devices ggml will accept:")
+            for d in vk["devices"]:
+                L.append(f"    {d['backend']}{d['index']}: {d['name']}")
+                L.append(f"        {d['vram_total_mb']} MiB total, "
+                         f"{d['vram_free_mb']} MiB free at install time")
+            L.append("")
+            L.append("  The index above is what is passed to -dev Vulkan<N>")
+            L.append("  and --backend vulkan<N>. It is ggml's own numbering.")
+        else:
+            L.append("  Devices      : none")
+            L.append("  (CPU-only install, or ggml found no usable GPU.)")
+        L.append("")
+
+        # --- Backends / build tools ---
+        bs = utilities.get_build_status()
+        rule("BACKEND BINARIES")
+        L.append(f"  llama-completion : {bs['llama_path'] or 'NOT BUILT'}")
+        L.append(f"  sd-cli           : {bs['sd_path'] or 'NOT BUILT'}")
+        pre = utilities.check_prerequisites()
+        L.append(f"  cmake            : {pre['cmake_path'] or 'not found'}")
+        L.append(f"  git              : {pre['git_path'] or 'not found'}")
+        L.append("")
+
+        # --- Models ---
+        c = configure.load_persistent()
+        rule("MODELS")
+        for label, key in (("Encoder  ", "encoder_model_path"),
+                           ("Diffusion", "imagegen_model_path"),
+                           ("VAE      ", "vae_model_path")):
+            p = c.get(key, "")
+            state = "OK" if p and Path(p).exists() else "NOT SET / MISSING"
+            L.append(f"  {label}: {state}")
+            if p:
+                L.append(f"             {p}")
+        L.append("")
+
+        # --- Env ---
+        rule("RELEVANT ENVIRONMENT")
+        env = utilities.get_relevant_env()
+        if env:
+            for k, v in env.items():
+                L.append(f"  {k} = {v}")
+        else:
+            L.append("  (none set)")
+        L.append("")
+
+        # --- constants.ini verbatim ---
+        rule("CONSTANTS.INI")
         constants_path = configure.get_constants_path()
         if constants_path.exists():
             try:
@@ -994,7 +1087,7 @@ def _collect_debug() -> str:
                 L.append(f"  (error reading constants.ini: {_e})")
         else:
             L.append(f"  (constants.ini not found at: {constants_path})")
-        L.append("=" * width)
+        L.append("=" * W)
         return "\n".join(L)
     except Exception:
         return f"Error collecting debug info:\n{traceback.format_exc()}"

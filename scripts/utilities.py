@@ -9,10 +9,8 @@ import ctypes
 import os
 import platform
 import shutil
-import subprocess
-import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import scripts.configure as configure
 
@@ -56,93 +54,25 @@ def quick_hash(file_path: str, nbytes: int = 8192) -> str:
 # constants.ini).
 
 # ---------------------------------------------------------------------------
-# Vulkan detection
+# Vulkan detection  --  intentionally NOT here
 # ---------------------------------------------------------------------------
-
-def detect_vulkan() -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "vulkan_available": False, "vulkan_version": "unknown",
-        "devices": [], "vulkan_sdk": os.environ.get("VULKAN_SDK", ""),
-        "loader_path": "", "error": "",
-    }
-    vi = shutil.which("vulkaninfo")
-    if vi:
-        try:
-            proc = subprocess.run([vi, "--summary"], capture_output=True,
-                                  text=True, timeout=30)
-            if proc.returncode == 0:
-                result["vulkan_available"] = True
-                result["vulkan_version"] = _parse_vk_version(proc.stdout)
-                result["devices"] = _parse_vk_devices(proc.stdout)
-        except Exception as e:
-            result["error"] = str(e)
-
-    if not result["vulkan_available"] and platform.system() == "Windows":
-        try:
-            ctypes.windll.LoadLibrary("vulkan-1.dll")
-            result["vulkan_available"] = True
-            if result["vulkan_version"] == "unknown":
-                result["vulkan_version"] = "1.x"
-        except Exception as e:
-            result["error"] = str(e)
-
-    if not result["vulkan_available"] and platform.system() == "Windows":
-        for p in (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "vulkan-1.dll",
-                  Path(os.environ.get("VULKAN_SDK", "")) / "Bin" / "vulkan-1.dll"):
-            if p.exists():
-                result["vulkan_available"] = True
-                result["loader_path"] = str(p)
-                if result["vulkan_version"] == "unknown":
-                    result["vulkan_version"] = "1.x"
-                break
-    return result
-
-
-def _parse_vk_version(stdout: str) -> str:
-    for line in stdout.splitlines():
-        for p in line.split():
-            if p.startswith("1.") and len(p) >= 3:
-                return p
-    return "detected"
-
-
-def _parse_vk_devices(stdout: str) -> List[Dict[str, Any]]:
-    devices: List[Dict[str, Any]] = []
-    current: Dict[str, Any] = {}
-    for line in stdout.splitlines():
-        s = line.strip()
-        if s.startswith("GPU") and "=" in s:
-            if current:
-                devices.append(current)
-            idx_str = s.split("=")[0].replace("GPU", "").strip()
-            try:
-                idx = int(idx_str)
-            except ValueError:
-                idx = len(devices)
-            current = {"index": idx, "name": s.split("=", 1)[1].strip()}
-        elif current:
-            sl = s.lower().replace(" ", "")
-            if sl.startswith("apiversion"):
-                current["api_version"] = s.split("=", 1)[-1].strip()
-            elif sl.startswith("devicetype"):
-                current["type"] = s.split("=", 1)[-1].strip()
-            elif "heap" in sl and "size" in sl:
-                current["heap_size"] = s.split("=", 1)[-1].strip()
-    if current:
-        devices.append(current)
-    return devices
-
-
-def get_preferred_device() -> int:
-    vk = detect_vulkan()
-    if not vk.get("vulkan_available"):
-        return -1
-    cfg = configure.load_persistent()
-    configured = cfg.get("vulkan_device", 1)
-    if configured < len(vk.get("devices", [])):
-        return configured
-    return 0
-
+# There used to be a second Vulkan detector in this file that shelled out to
+# `vulkaninfo --summary` and parsed it. It is gone, for three reasons:
+#
+#   1. It could never work. It looked for lines starting with "GPU" containing
+#      "=", but --summary prints "GPU0:" on its own line with "deviceName = ..."
+#      indented beneath, so it always returned zero devices.
+#   2. Even correct, vulkaninfo is the wrong oracle. ggml keeps only supported
+#      discrete/integrated GPUs and deduplicates multi-driver duplicates, then
+#      numbers the survivors -- so a vulkaninfo index is not a ggml index, and
+#      `-dev VulkanN` / `--backend vulkanN` want the ggml one.
+#   3. vulkaninfo ships with the Vulkan SDK, not the driver, so depending on it
+#      broke machines that had working Vulkan but no SDK.
+#
+# The installer now asks the compiled binary (`llama-completion --list-devices`)
+# and records the result in constants.ini. At runtime, read it back with
+# configure.get_vulkan_info(). One source of truth, and it is ggml's own.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Memory info
@@ -179,7 +109,7 @@ def get_memory_info() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # The installer compiles llama.cpp and stable-diffusion.cpp from source and
 # places the executables in:
-#   ./data/llama_cpp_binaries/llama-cli.exe
+#   ./data/llama_cpp_binaries/llama-completion.exe
 #   ./data/stable_diffusion_binaries/sd-cli.exe  (sd-server.exe also copied)
 #
 # get_build_status() checks those locations first, then falls back to PATH.
@@ -199,12 +129,12 @@ def get_build_status() -> Dict[str, Any]:
     Check whether the compiled C++ backend executables are present.
 
     Looks in:
-      1. ./data/llama_cpp_binaries/       for llama-cli.exe
+      1. ./data/llama_cpp_binaries/       for llama-completion.exe
       2. ./data/stable_diffusion_binaries/ for sd-cli.exe (or legacy sd.exe)
       3. PATH (shutil.which) as fallback
 
     Returns a dict compatible with launcher.py and display.py:
-        llama_built  : bool  - llama-cli.exe found
+        llama_built  : bool  - llama-completion.exe found
         llama_path   : str   - path string or ""
         sd_built     : bool  - sd-cli.exe (or sd.exe) found
         sd_path      : str   - path string or ""
@@ -212,10 +142,11 @@ def get_build_status() -> Dict[str, Any]:
     llama_bin_dir = configure.get_llama_bin_dir()
     sd_bin_dir    = configure.get_sd_bin_dir()
 
-    # llama-cli
-    llama_exe = _find_exe_in_dir(llama_bin_dir, ["llama-cli.exe", "llama-cli"])
+    # llama-completion (NOT llama-cli, which is now an interactive chat REPL)
+    llama_exe = _find_exe_in_dir(llama_bin_dir,
+                                 ["llama-completion.exe", "llama-completion"])
     if not llama_exe:
-        found = shutil.which("llama-cli") or shutil.which("main")
+        found = shutil.which("llama-completion")
         llama_exe = Path(found) if found else None
 
     # sd-cli.exe is the current output name; sd.exe kept as legacy fallback
@@ -229,9 +160,6 @@ def get_build_status() -> Dict[str, Any]:
         "llama_path":   str(llama_exe) if llama_exe else "",
         "sd_built":     sd_exe is not None,
         "sd_path":      str(sd_exe) if sd_exe else "",
-        # Legacy keys kept for any code that still references them
-        "llama_source_exists": llama_exe is not None,
-        "sd_source_exists":    sd_exe is not None,
     }
 
 
@@ -277,7 +205,7 @@ def check_prerequisites() -> Dict[str, Any]:
 
 def get_relevant_env() -> Dict[str, str]:
     keys = ["VULKAN_SDK", "VK_INSTANCE_LAYERS", "VK_LAYER_PATH",
-            "CUDA_PATH", "HIP_PATH", "GGML_VULKAN_DEVICE",
+            "CUDA_PATH", "HIP_PATH", "GGML_VK_VISIBLE_DEVICES",
             "AOCL_ROOT", "AOCL_PATH", "NUMBER_OF_PROCESSORS",
             "PROCESSOR_ARCHITECTURE", "PATH"]
     result: Dict[str, str] = {}
