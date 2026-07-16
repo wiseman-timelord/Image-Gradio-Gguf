@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
 display.py - Gradio 6 UI for Image-Gradio-Gguf.
-Three tabs: Generate | Configuration | Debug / Info
+Four tabs: Generate | Configuration | Preferences | Debug / Info
 Build/install functionality lives in installer.py only.
+
+Two settings files, one per page, and no key appears in both:
+  data/configuration.json - Configuration page (models, backends, threads),
+                            plus the Generate page's auto-saved generation
+                            settings and the Qt window geometry.
+  data/preferences.json   - Preferences page (prompt template, max thumbnails).
 
 Backend dropdowns are populated from configure.get_backend_choices(), which
 reflects whatever GPUs ggml actually enumerated on THIS machine at install
@@ -58,8 +64,19 @@ def _handle_exit_click() -> None:
 # ---------------------------------------------------------------------------
 
 def _cfg() -> Dict[str, Any]:
-    """Fresh load from persistent.json."""
-    return configure.load_persistent()
+    """Fresh load of data/configuration.json — the Configuration page's file."""
+    return configure.load_configuration()
+
+
+def _prefs() -> Dict[str, Any]:
+    """Fresh load of data/preferences.json — the Preferences page's file.
+
+    Kept separate from _cfg() on purpose: the two pages own two files, and
+    nothing should be able to write a preference through a configuration save
+    or vice versa. inference.py still receives a single merged dict (see
+    do_generate), because a generation needs values from both.
+    """
+    return configure.load_preferences()
 
 
 _FILETYPES_MODEL = [
@@ -87,7 +104,7 @@ def _browse_file(file_types: Optional[List[Tuple[str, str]]] = None) -> str:
         root.attributes("-topmost", True)
         
         # Determine the initial directory for the file dialog
-        cfg = configure.load_persistent()
+        cfg = configure.load_configuration()
         last_dir = cfg.get("last_model_browse_dir", "")
         initial_dir = str(configure.get_models_dir())
         
@@ -108,7 +125,7 @@ def _browse_file(file_types: Optional[List[Tuple[str, str]]] = None) -> str:
         # If a file was selected, save its directory for next time
         if path:
             selected_dir = str(Path(path).parent)
-            configure.update_persistent({"last_model_browse_dir": selected_dir})
+            configure.update_configuration({"last_model_browse_dir": selected_dir})
             return path
             
         return ""
@@ -232,11 +249,20 @@ _gallery_cache: Dict[str, Any] = {
     "mtime": 0.0,
 }
 
-def _get_recent_images(max_images: int = 50) -> List[str]:
+def _get_recent_images(max_images: Optional[int] = None) -> List[str]:
     """Return paths of images in the output folder, newest first.
        Caches the full list of images and slices it according to max_images.
        Prints a concise start/end summary only when a rescan occurs.
+
+       max_images=None means "however many the Preferences page says"
+       (Max Thumbnails Displayed). The cache holds the unsliced list, so
+       changing that preference re-slices what is already in memory rather
+       than forcing another disk sweep. Callers that want a specific count
+       — _idle_preview_image() only needs the single newest file — still
+       pass one explicitly.
     """
+    if max_images is None:
+        max_images = configure.get_max_thumbnails()
     out_dir = configure.get_output_dir()
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
     try:
@@ -295,6 +321,28 @@ def _idle_preview_image() -> Optional[str]:
 _gen: Dict[str, Any] = {}
 
 
+def _model_path_ok(value: Any) -> bool:
+    """True when a saved model-path value points at a file that is on disk now.
+
+    Deliberately the SAME test inference.py makes before it runs (a plain
+    Path(...).exists() on the raw saved string — no expanduser, no
+    resolve_model_path fallback). If this were the more forgiving of the two,
+    the Generate button would appear for a path inference then refuses to load,
+    and the run would fail with nothing on screen to explain why. Equal tests
+    mean the button is visible exactly when a generation can actually start.
+
+    A non-string (a null from a hand-edited configuration.json) and an
+    unopenable path (embedded null, bad drive letter — OSError, not False)
+    both count as not-ok rather than raising out of a UI refresh.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        return Path(value).exists()
+    except OSError:
+        return False
+
+
 def _missing_models() -> List[str]:
     """Labels of the model files that are not set, or set but gone from disk.
 
@@ -303,18 +351,47 @@ def _missing_models() -> List[str]:
     reach pixels without the VAE (--vae). Checked as one group so the user is
     told everything that is missing at once, rather than fixing the diffusion
     model only to be sent back for the VAE.
+
+    Read from configuration.json, NOT from the Configuration page's textboxes:
+    a path typed but not saved is not yet a path this program will run with.
     """
-    c = configure.load_persistent()
+    c = configure.load_configuration()
     labels = [("encoder_model_path", "Encoder"),
               ("imagegen_model_path", "Diffusion"),
               ("vae_model_path", "VAE")]
-    return [label for key, label in labels
-            if not c.get(key) or not Path(c[key]).exists()]
+    return [label for key, label in labels if not _model_path_ok(c.get(key))]
 
 
 def _models_configured() -> bool:
     """Return True if all three model paths are set and exist on disk."""
     return not _missing_models()
+
+
+# The Generate button lives in a Row whose visibility is this gate. The gate is
+# re-evaluated from disk, never remembered: the widgets are built ONCE per
+# launch, so a `configured` value captured at build time is a snapshot of how
+# things looked before the user had configured anything, and it is wrong the
+# moment they save a model path. Every event that can change the answer calls
+# _generate_gate_updates() and pushes the result at the same three widgets.
+_PROMPT_PH_READY   = "Describe the image you want to generate..."
+_PROMPT_PH_NOMODEL = "Set locations of models on Configuration page first..."
+_NEG_PH_READY      = "Things to exclude..."
+_NEG_PH_NOMODEL    = _PROMPT_PH_NOMODEL
+
+
+def _generate_gate_updates() -> Tuple[Any, Any, Any]:
+    """(generate_row, prompt_tb, negative_tb) updates for the current state.
+
+    Returned in the order the outputs= lists below expect. Placeholders move
+    with the button: if the row is hidden there has to be something on screen
+    saying why, and the prompt box is where the user is looking.
+    """
+    configured = _models_configured()
+    return (
+        gr.update(visible=configured),
+        gr.update(placeholder=_PROMPT_PH_READY if configured else _PROMPT_PH_NOMODEL),
+        gr.update(placeholder=_NEG_PH_READY if configured else _NEG_PH_NOMODEL),
+    )
 
 
 def _build_generate_tab_inner() -> None:
@@ -323,10 +400,8 @@ def _build_generate_tab_inner() -> None:
     presets = configure.get_generation_presets()
     configured = _models_configured()
 
-    prompt_ph  = ("Describe the image you want to generate..."
-                  if configured else "Set locations of models on Configuration page first...")
-    neg_ph     = ("Things to exclude..."
-                  if configured else "Set locations of models on Configuration page first...")
+    prompt_ph  = _PROMPT_PH_READY if configured else _PROMPT_PH_NOMODEL
+    neg_ph     = _NEG_PH_READY    if configured else _NEG_PH_NOMODEL
 
     with gr.Row():
         # ── Left column: settings ────────────────────────────────────────────
@@ -526,7 +601,14 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # Cancel any pending unload while we are generating
         _cancel_inactivity_timer()
 
+        # inference.py takes ONE dict and reads keys from both files out of it
+        # — enhance_prompt() wants prompt_template, which now lives in
+        # preferences.json, while everything else comes from configuration.json.
+        # Merged here, at the one place a generation is launched, so neither
+        # inference.py nor the save handlers need to know about the split.
         gen_cfg = dict(c)
+        gen_cfg["prompt_template"] = _prefs().get(
+            "prompt_template", configure.DEFAULT_PROMPT_TEMPLATE)
         gen_cfg.update(
             imagegen_width=int(width), imagegen_height=int(height),
             imagegen_steps=int(steps), imagegen_sampling=sampler,
@@ -694,7 +776,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             # user-modified combination that deviates from the named presets,
             # and must be saved so it survives the next launch.
             if quality_preset == "Custom":
-                configure.update_persistent({
+                configure.update_configuration({
                     "imagegen_quality_preset": "Custom",
                     "imagegen_width": int(width), "imagegen_height": int(height),
                     "imagegen_steps": int(steps), "imagegen_sampling": sampler,
@@ -706,7 +788,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             else:
                 # Still persist the currently-active named preset so that
                 # it is restored correctly on next launch.
-                configure.update_persistent({
+                configure.update_configuration({
                     "imagegen_quality_preset": quality_preset,
                 })
         else:
@@ -751,22 +833,29 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         outputs=_gen["preview_img"],
     )
 
-    # ── Refresh generate_row visibility when prompt changes ──
-    def _refresh_generate_row(prompt_val):
-        configured = _models_configured()
-        prompt_ph = ("Describe the image you want to generate..."
-                     if configured else "Set locations of models on Configuration page first...")
-        neg_ph    = ("Things to exclude..."
-                     if configured else "Set locations of models on Configuration page first...")
-        return (
-            gr.update(visible=configured),
-            gr.update(placeholder=prompt_ph),
-            gr.update(placeholder=neg_ph),
-        )
+    # ── Re-check the gate whenever the user arrives at, or interacts with,
+    # the Generate page. Three triggers, because each covers a hole in the
+    # others:
+    #   * tab select — the normal path. Configure models, save, click Generate:
+    #     the button is there. This is the one that was missing, which is why
+    #     the button stayed hidden for the whole session in which the models
+    #     were first set up (it was only ever built once, at launch, when
+    #     nothing was configured yet).
+    #   * prompt focus — covers a model file appearing/vanishing on disk while
+    #     the user sits on the Generate page, without a tab switch.
+    #   * (see _wire_config_events) saving on the Configuration page pushes the
+    #     same updates, so the gate is already correct before the tab is even
+    #     clicked.
+    # All three call the same _generate_gate_updates(), so they cannot drift.
+    _gen["generate_tab"].select(
+        _generate_gate_updates,
+        inputs=None,
+        outputs=[_gen["generate_row"], _gen["prompt_tb"], _gen["negative_tb"]],
+    )
 
     _gen["prompt_tb"].focus(
-        _refresh_generate_row,
-        inputs=_gen["prompt_tb"],
+        _generate_gate_updates,
+        inputs=None,
         outputs=[_gen["generate_row"], _gen["prompt_tb"], _gen["negative_tb"]],
     )
 
@@ -785,6 +874,45 @@ def _build_config_tab_inner() -> None:
     choices = _backend_choices()
     threads = _thread_choices()
     dt      = configure.get_default_threads()
+
+    # ── Backend selection + CPU threads (consolidated) ──
+    # First on the page: which device each side runs on decides what several
+    # of the controls below are even allowed to say (GPU Layers, Diffuser
+    # Placement), so it reads top-down in the order the choices actually
+    # depend on each other.
+    #
+    # The install type ("Vulkan install" / "Cpu-only install") is deliberately
+    # NOT printed here. It is a property of the install, not a setting, and it
+    # is already reported on the Debug / Info page (see _collect_debug's
+    # "GPU / VULKAN" section, "Install type" line). It still governs this
+    # section's behaviour — a cpu_only install has no GPU entries in `choices`
+    # and locks both dropdowns — it just does not announce itself.
+    is_cpu_only = configure.get_install_type() == "cpu_only"
+
+    gr.Markdown("### Backend Selection")
+    with gr.Row():
+        with gr.Column(scale=2):
+            _cfg_w["enc_backend_dd"] = gr.Dropdown(
+                label="Encoder Backend",
+                choices=choices,
+                value=_default_backend_value("backend_encoder"),
+                interactive=not is_cpu_only,
+            )
+
+        with gr.Column(scale=1):
+            _cfg_w["threads_dd"] = gr.Dropdown(
+                label="CPU Threads",
+                choices=threads,
+                value=cfg.get("encoder_threads", dt),
+            )
+
+        with gr.Column(scale=2):
+            _cfg_w["img_backend_dd"] = gr.Dropdown(
+                label="ImageGen Backend",
+                choices=choices,
+                value=_default_backend_value("backend_imagegen"),
+                interactive=not is_cpu_only,
+            )
 
     # ── Model paths ──
     # Left column: encoder. Right column: the image-generation pair —
@@ -834,42 +962,6 @@ def _build_config_tab_inner() -> None:
                     scale=8,
                 )
                 _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
-
-    # ── Backend selection + CPU threads (consolidated) ──
-    is_cpu_only = configure.get_install_type() == "cpu_only"
-
-    gr.Markdown("### Backend Selection")
-    if is_cpu_only:
-        gr.Markdown(
-            "(Cpu-only install). "
-        )
-    else:
-        gr.Markdown(
-            "(Vulkan install). "
-        )
-    with gr.Row():
-        with gr.Column(scale=2):
-            _cfg_w["enc_backend_dd"] = gr.Dropdown(
-                label="Encoder Backend",
-                choices=choices,
-                value=_default_backend_value("backend_encoder"),
-                interactive=not is_cpu_only,
-            )
-
-        with gr.Column(scale=1):
-            _cfg_w["threads_dd"] = gr.Dropdown(
-                label="CPU Threads",
-                choices=threads,
-                value=cfg.get("encoder_threads", dt),
-            )
-
-        with gr.Column(scale=2):
-            _cfg_w["img_backend_dd"] = gr.Dropdown(
-                label="ImageGen Backend",
-                choices=choices,
-                value=_default_backend_value("backend_imagegen"),
-                interactive=not is_cpu_only,
-            )
 
     # Initial interactive/value state for the two GPU-dependent controls
     # below is driven by the ACTUAL selected backend, not just install type.
@@ -932,14 +1024,10 @@ def _build_config_tab_inner() -> None:
                     interactive=img_is_vulkan,
                 )
 
-    # ── Prompt template ──
-    gr.Markdown("### Advanced")
-    _cfg_w["prompt_template_tb"] = gr.Textbox(
-        label="Prompt Template",
-        value=cfg.get("prompt_template",
-                      "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"),
-        lines=2,
-    )
+    # NOTE: Prompt Template used to sit here under an "Advanced" heading. It
+    # is now on the Preferences page (_build_preferences_tab_inner) and is
+    # stored in data/preferences.json, not data/configuration.json — so the
+    # Save All Configuration button below neither reads nor writes it.
 
     # ── Save ──
     with gr.Row():
@@ -1051,10 +1139,10 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
     def save_all(ep, en, dp, dn, vp, vn,
                  enc_back, img_back, threads,
                  eb, ec, engl, ef,
-                 ic, img_placement, pt):
+                 ic, img_placement):
         enc_parsed = configure.parse_backend_choice(enc_back)
         img_parsed = configure.parse_backend_choice(img_back)
-        configure.update_persistent({
+        configure.update_configuration({
             "encoder_model_path":  ep,  "encoder_model_name":  en,
             "imagegen_model_path": dp,  "imagegen_model_name": dn,
             "vae_model_path":      vp,  "vae_model_name":      vn,
@@ -1075,10 +1163,21 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "encoder_flash_attn":  bool(ef),
             "imagegen_clip_skip":  int(ic),
             "imagegen_placement":  img_placement,
-            "prompt_template":     pt,
             "first_run":           False,
         })
-        return "All settings saved!"
+        # Saving is the moment the model paths become real (the Generate page
+        # reads configuration.json, not these textboxes), so refresh that
+        # page's gate right here rather than leaving it stale until the user
+        # goes looking for a button that is not there. Same helper the tab
+        # select and prompt focus use.
+        row_u, prompt_u, neg_u = _generate_gate_updates()
+        missing = _missing_models()
+        if missing:
+            msg = ("Configuration saved — but Generate stays hidden until every "
+                   f"model is set and on disk (missing: {', '.join(missing)}).")
+        else:
+            msg = "All configuration saved! Generate page is ready."
+        return msg, row_u, prompt_u, neg_u
 
     w["save_all_btn"].click(
         save_all,
@@ -1088,13 +1187,85 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
             w["enc_batch_dd"], w["enc_ctx_dd"],
             w["enc_ngl_dd"], w["enc_flash_chk"],
-            w["img_clip_dd"], w["img_placement_dd"], w["prompt_template_tb"],
+            w["img_clip_dd"], w["img_placement_dd"],
         ],
-        outputs=status_box,
+        outputs=[status_box, _gen["generate_row"], _gen["prompt_tb"],
+                 _gen["negative_tb"]],
     )
 
 # ---------------------------------------------------------------------------
-# Tab 3 — Debug / Info
+# Tab 3 — Preferences  (UI widgets + event wiring split for shared status)
+# ---------------------------------------------------------------------------
+# Everything here is written to data/preferences.json and NOTHING here is
+# written to data/configuration.json. The split is by page, one file each:
+# Configuration owns this machine's model/backend wiring (and is reseeded by
+# the installer on a clean install), Preferences owns the user's standing
+# taste, which survives that.
+# ---------------------------------------------------------------------------
+
+_prf: Dict[str, Any] = {}  # preferences tab widget refs
+
+
+def _build_preferences_tab_inner() -> None:
+    """Build Preferences tab widgets; store refs in _prf for later wiring."""
+    prefs = _prefs()
+
+    gr.Markdown("### Preferences")
+    _prf["prompt_template_tb"] = gr.Textbox(
+        label="Prompt Template",
+        value=prefs.get("prompt_template", configure.DEFAULT_PROMPT_TEMPLATE),
+        info="{prompt} is replaced with the request sent to the encoder.",
+        lines=2,
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            _prf["max_thumbs_dd"] = gr.Dropdown(
+                label="Max Thumbnails Displayed",
+                choices=configure.MAX_THUMBNAIL_CHOICES,
+                value=configure.get_max_thumbnails(),
+                info="How many images the Thumbnails Gallery shows, newest first.",
+            )
+        # Empty spacer column so the dropdown keeps a sane width instead of
+        # stretching across the whole page on its own row.
+        with gr.Column(scale=2):
+            pass
+
+    with gr.Row():
+        _prf["save_prefs_btn"] = gr.Button("Save All Preferences",
+                                           variant="primary", size="lg")
+
+
+def _wire_preferences_events(status_box: gr.Textbox) -> None:
+    """Register the Preferences save event.
+
+    Saving also re-slices the Generate page's gallery, so a new Max Thumbnails
+    value takes effect immediately rather than at the next launch. The cached
+    output listing is unsliced (see _get_recent_images), so this costs a
+    re-render, not a rescan.
+    """
+    def save_prefs(prompt_template, max_thumbs):
+        try:
+            thumbs = int(max_thumbs)
+        except (TypeError, ValueError):
+            thumbs = configure.DEFAULT_MAX_THUMBNAILS
+        if thumbs not in configure.MAX_THUMBNAIL_CHOICES:
+            thumbs = configure.DEFAULT_MAX_THUMBNAILS
+        configure.update_preferences({
+            "prompt_template": prompt_template,
+            "max_thumbnails":  thumbs,
+        })
+        return "All preferences saved!", _get_recent_images(thumbs)
+
+    _prf["save_prefs_btn"].click(
+        save_prefs,
+        inputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"]],
+        outputs=[status_box, _gen["output_gallery"]],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 — Debug / Info
 # ---------------------------------------------------------------------------
 
 def _collect_debug() -> str:
@@ -1129,7 +1300,12 @@ def _collect_debug() -> str:
         feats = [f["name"] for f in configure.CPU_FEATURES if cpu.get(f["key"])]
         L.append(f"  Features     : {', '.join(feats) if feats else 'none reported'}")
         L.append(f"  Build arch   : {cpu.get('arch_selection')}")
-        L.append(f"  AOCL present : {cpu.get('has_aocl')}  (detected only; not wired into the build)")
+        # AOCL is AMD's own math library — there is no such thing as AOCL on an
+        # Intel or other non-AMD part, so reporting "AOCL present : False" there
+        # states a tautology and invites the user to go looking for something
+        # that could never apply to their machine. Shown for AMD only.
+        if configure.is_amd_cpu():
+            L.append(f"  AOCL present : {cpu.get('has_aocl')}  (detected only; not wired into the build)")
         L.append("")
 
         # --- Memory ---
@@ -1172,7 +1348,7 @@ def _collect_debug() -> str:
         L.append("")
 
         # --- Models ---
-        c = configure.load_persistent()
+        c = configure.load_configuration()
         rule("MODELS")
         for label, key in (("Encoder  ", "encoder_model_path"),
                            ("Diffusion", "imagegen_model_path"),
@@ -1374,11 +1550,14 @@ overflow-x:scroll would always show the track regardless of content width. ─�
 
         # ── Tabs ──────────────────────────────────────────────────────────────
         with gr.Tabs():
-            with gr.TabItem("Generate"):
+            with gr.TabItem("Generate") as _gen["generate_tab"]:
                 _build_generate_tab_inner()
 
             with gr.TabItem("Configuration"):
                 _build_config_tab_inner()
+
+            with gr.TabItem("Preferences"):
+                _build_preferences_tab_inner()
 
             with gr.TabItem("Debug / Info"):
                 info_text = _build_debug_tab_inner()
@@ -1408,6 +1587,7 @@ overflow-x:scroll would always show the track regardless of content width. ─�
         # Wire all per-tab events to the shared status box.
         _wire_generate_events(shared_status)
         _wire_config_events(shared_status)
+        _wire_preferences_events(shared_status)
         _wire_debug_events(shared_status)
 
     return app, _css

@@ -235,6 +235,30 @@ CLIP_SKIP_CHOICES = [1, 2, 3]
 BATCH_COUNT_CHOICES = [1, 2, 3, 4]
 OUTPUT_FORMATS    = ["png", "jpg", "bmp"]
 
+# ---------------------------------------------------------------------------
+# Preferences (data/preferences.json — the Preferences page)
+# ---------------------------------------------------------------------------
+# Settings that are the user's standing taste rather than this machine's
+# hardware/model wiring. They live in their own file so that wiping or
+# regenerating the Configuration page's file (data/configuration.json, which
+# the installer reseeds on a clean install) never takes the user's Prompt
+# Template with it.
+#
+# DEFAULT_PROMPT_TEMPLATE is the Qwen3 ChatML frame the encoder expects;
+# {prompt} is substituted by inference.enhance_prompt(). Single source of
+# truth — installer.py's write_default_preferences() seeds the same literal,
+# and _default_preferences() below backfills it.
+DEFAULT_PROMPT_TEMPLATE: str = (
+    "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+)
+
+# How many thumbnails the Generate page's Thumbnails Gallery shows. The
+# gallery caches the FULL output-folder listing and only slices it (see
+# display._get_recent_images), so this is a display cap, not a scan cap —
+# raising it costs render time, not another disk sweep.
+MAX_THUMBNAIL_CHOICES: List[int] = [50, 100, 200]
+DEFAULT_MAX_THUMBNAILS: int = 50
+
 # Key used by the unified bottom status bar shared across all pages.
 STATUS_BAR_KEY: str = "status"
 
@@ -314,8 +338,38 @@ def get_constants_path() -> Path:
     return _get_project_root() / "data" / "constants.ini"
 
 
-def get_persistent_path() -> Path:
+def get_configuration_path() -> Path:
+    """data/configuration.json — everything set on the Configuration page,
+    plus the Generate page's auto-saved generation settings and the Qt window
+    geometry. Formerly data/persistent.json; see _migrate_legacy_persistent()."""
+    return _get_project_root() / "data" / "configuration.json"
+
+
+def get_preferences_path() -> Path:
+    """data/preferences.json — everything set on the Preferences page."""
+    return _get_project_root() / "data" / "preferences.json"
+
+
+def _legacy_persistent_path() -> Path:
+    """The pre-split filename. Only ever read, never written."""
     return _get_project_root() / "data" / "persistent.json"
+
+
+def _migrate_legacy_persistent() -> None:
+    """Rename data/persistent.json -> data/configuration.json, once.
+
+    Only fires when the old file exists and the new one does not, so it can
+    never clobber a real configuration.json, and re-running it is a no-op.
+    A failed rename is not fatal: the caller falls through to defaults, which
+    is the same outcome as a first run.
+    """
+    old = _legacy_persistent_path()
+    new = get_configuration_path()
+    if old.exists() and not new.exists():
+        try:
+            old.replace(new)
+        except OSError:
+            pass
 
 
 def get_output_dir() -> Path:
@@ -414,6 +468,28 @@ def get_cpu_info() -> Dict[str, Any]:
     for feat in CPU_FEATURES:
         info[feat["key"]] = sec.get(feat["key"], "False") == "True"
     return info
+
+
+def is_amd_cpu() -> bool:
+    """True when this machine's CPU is AMD.
+
+    installer.py's _cpu_vendor() writes exactly "AMD", "Intel" or "unknown"
+    into constants.ini, so the vendor test is a plain equality. The brand
+    fallback covers the "unknown" case -- a constants.ini written on a machine
+    where the registry read failed still has a brand string like
+    "AMD Ryzen 9 3900X 12-Core Processor" to go on.
+
+    Used to decide whether AMD-only facts (e.g. AOCL presence) are worth
+    reporting at all; on an Intel box they are noise, not information.
+    """
+    info = get_cpu_info()
+    vendor = str(info.get("vendor", "")).strip().lower()
+    if vendor == "amd":
+        return True
+    if vendor == "intel":
+        return False
+    brand = str(info.get("brand", "")).lower()
+    return any(k in brand for k in ("amd", "ryzen", "epyc", "threadripper"))
 
 
 def get_vulkan_info() -> Dict[str, Any]:
@@ -594,11 +670,15 @@ def _default_gpu_index() -> int:
     return int(best["index"])
 
 
-def _default_persistent() -> Dict[str, Any]:
-    """Defaults synthesised from constants.ini, for when persistent.json is
+def _default_configuration() -> Dict[str, Any]:
+    """Defaults synthesised from constants.ini, for when configuration.json is
     absent or is missing keys added by a newer version. Kept in step with
-    installer.py's write_default_persistent(); that one seeds the file at
-    install time, this one backfills gaps at load time."""
+    installer.py's write_default_configuration(); that one seeds the file at
+    install time, this one backfills gaps at load time.
+
+    Prompt Template is deliberately NOT here — it moved to preferences.json
+    (see _default_preferences()). Anything listed in both files would be
+    written by whichever page saved last."""
     dt = get_default_threads()
     cpu_label = get_cpu_info().get("brand", "CPU") or "CPU"
     is_cpu_only = get_install_type() == "cpu_only"
@@ -639,7 +719,6 @@ def _default_persistent() -> Dict[str, Any]:
         "imagegen_quality_preset": "Fast (Turbo)",
         "output_format": "png",
         "auto_save": True,
-        "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
         "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
         "ui_theme": "Default",
         "first_run": True,
@@ -669,27 +748,27 @@ def save_constants(config: configparser.ConfigParser) -> None:
         config.write(f)
 
 
-def load_persistent() -> Dict[str, Any]:
-    """Load persistent.json, backfilling any keys that are missing because
-    the file was written by an older version of the program (e.g. before
-    the window-geometry keys existed). Saved values always win; defaults
-    only fill genuine gaps, so this never overwrites real user data."""
-    path = get_persistent_path()
+def _load_json_with_defaults(path: Path, defaults: Dict[str, Any]) -> Dict[str, Any]:
+    """Read a JSON dict, backfilling any keys missing because the file was
+    written by an older version of the program (e.g. before the window-geometry
+    keys existed). Saved values always win; defaults only fill genuine gaps, so
+    this never overwrites real user data. Unreadable/corrupt -> defaults."""
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    merged = _default_persistent()
+                    merged = dict(defaults)
                     merged.update(data)
                     return merged
         except (json.JSONDecodeError, IOError):
             pass
-    return _default_persistent()
+    return dict(defaults)
 
 
-def save_persistent(data: Dict[str, Any]) -> None:
-    path = get_persistent_path()
+def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Write via a .tmp sibling then rename, so an interrupted write cannot
+    leave a half-written config behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -697,11 +776,90 @@ def save_persistent(data: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def update_persistent(updates: Dict[str, Any]) -> Dict[str, Any]:
-    data = load_persistent()
+# ── configuration.json (Configuration page) ────────────────────────────────
+
+def load_configuration() -> Dict[str, Any]:
+    """Load data/configuration.json, migrating a pre-split persistent.json
+    into place first if that is all that exists."""
+    _migrate_legacy_persistent()
+    return _load_json_with_defaults(get_configuration_path(), _default_configuration())
+
+
+def save_configuration(data: Dict[str, Any]) -> None:
+    _save_json_atomic(get_configuration_path(), data)
+
+
+def update_configuration(updates: Dict[str, Any]) -> Dict[str, Any]:
+    data = load_configuration()
     data.update(updates)
-    save_persistent(data)
+    save_configuration(data)
     return data
+
+
+# ── preferences.json (Preferences page) ────────────────────────────────────
+
+def _default_preferences() -> Dict[str, Any]:
+    """Defaults for preferences.json. Kept in step with installer.py's
+    write_default_preferences(); that one seeds the file at install time,
+    this one backfills gaps at load time."""
+    return {
+        "prompt_template": DEFAULT_PROMPT_TEMPLATE,
+        "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
+    }
+
+
+def load_preferences() -> Dict[str, Any]:
+    """Load data/preferences.json.
+
+    On the first load after the config split, the file does not exist yet but
+    the user may have had a customised Prompt Template in the old
+    persistent.json / configuration.json. Rather than silently resetting it to
+    the default, that value is carried across here (and dropped from the
+    configuration file, so exactly one file owns the key from then on).
+    """
+    path = get_preferences_path()
+    if not path.exists():
+        migrated = _default_preferences()
+        _migrate_legacy_persistent()
+        cfg_path = get_configuration_path()
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    old_cfg = json.load(f)
+                if isinstance(old_cfg, dict) and "prompt_template" in old_cfg:
+                    template = old_cfg.pop("prompt_template")
+                    if isinstance(template, str) and template.strip():
+                        migrated["prompt_template"] = template
+                    _save_json_atomic(cfg_path, old_cfg)
+            except (json.JSONDecodeError, IOError, OSError):
+                pass
+        try:
+            _save_json_atomic(path, migrated)
+        except OSError:
+            pass
+        return migrated
+    return _load_json_with_defaults(path, _default_preferences())
+
+
+def save_preferences(data: Dict[str, Any]) -> None:
+    _save_json_atomic(get_preferences_path(), data)
+
+
+def update_preferences(updates: Dict[str, Any]) -> Dict[str, Any]:
+    data = load_preferences()
+    data.update(updates)
+    save_preferences(data)
+    return data
+
+
+def get_max_thumbnails() -> int:
+    """Thumbnail display cap from preferences, clamped to a listed choice so a
+    hand-edited preferences.json cannot ask the gallery for 100000 images."""
+    try:
+        value = int(load_preferences().get("max_thumbnails", DEFAULT_MAX_THUMBNAILS))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_THUMBNAILS
+    return value if value in MAX_THUMBNAIL_CHOICES else DEFAULT_MAX_THUMBNAILS
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +872,7 @@ def get_window_geometry() -> Dict[str, Any]:
     x/y are WINDOW_GEOMETRY_UNSET (-1) if no position has been saved yet —
     callers should treat that as "let the OS/Qt choose a default position"
     rather than literally moving the window to (-1, -1)."""
-    cfg = load_persistent()
+    cfg = load_configuration()
 
     def _int(key: str, default: int) -> int:
         try:
@@ -735,7 +893,7 @@ def save_window_geometry(x: int, y: int, width: int, height: int,
                           maximized: bool) -> None:
     """Persist Qt window geometry. Called from launcher.py's shutdown
     sequence so the window reopens where/how the user left it."""
-    update_persistent({
+    update_configuration({
         "window_x": int(x),
         "window_y": int(y),
         "window_width": int(width),
