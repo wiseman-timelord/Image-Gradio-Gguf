@@ -62,7 +62,22 @@ def _cfg() -> Dict[str, Any]:
     return configure.load_persistent()
 
 
-def _browse_file() -> str:
+_FILETYPES_MODEL = [
+    ("Model files", "*.gguf *.safetensors"),
+    ("GGUF",        "*.gguf"),
+    ("Safetensors", "*.safetensors"),
+    ("All files",   "*.*"),
+]
+
+# The VAE is always a safetensors (ae.safetensors, ~335MB), never a gguf, so
+# its picker leads with that rather than making the user wade past .gguf files.
+_FILETYPES_VAE = [
+    ("Safetensors", "*.safetensors"),
+    ("All files",   "*.*"),
+]
+
+
+def _browse_file(file_types: Optional[List[Tuple[str, str]]] = None) -> str:
     """Open a native file dialog and return the chosen path."""
     try:
         import tkinter as tk
@@ -86,12 +101,7 @@ def _browse_file() -> str:
                 
         path = filedialog.askopenfilename(
             initialdir=initial_dir,
-            filetypes=[
-                ("Model files", "*.gguf *.safetensors"),
-                ("GGUF",        "*.gguf"),
-                ("Safetensors", "*.safetensors"),
-                ("All files",   "*.*"),
-            ],
+            filetypes=file_types or _FILETYPES_MODEL,
         )
         root.destroy()
         
@@ -186,9 +196,35 @@ def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
     return "", ""
 
 
+def _resolve_vae(diff_path_str: str, current_vae_path: str,
+                 current_vae_name: str) -> Tuple[Any, Any]:
+    """
+    Decide what the VAE boxes should hold after the diffusion model changes.
+    Returns (path_update, name_update) for (vae_path_tb, vae_name_tb).
+
+    Three rules, in order:
+      1. ae.safetensors found for the new model  -> use it.
+      2. Not found, but the box already holds a VAE that still exists on disk
+         -> keep it. This is the normal case for the community finetunes: they
+         ship a DiT gguf and nothing else, so switching from vanilla to e.g.
+         zImageTurboNSFW must not throw away the ae.safetensors that is
+         already configured and still perfectly valid for it.
+      3. Not found and nothing usable held -> blank, and wait for the user.
+         A stale path to a deleted file is cleared rather than kept, so the
+         box never claims a VAE that generation would then fail on.
+    """
+    vae_path, vae_name = _detect_vae(diff_path_str)
+    if vae_path:
+        return vae_path, vae_name
+    if current_vae_path and Path(current_vae_path).expanduser().exists():
+        return gr.update(), gr.update()          # rule 2 — leave as-is
+    return "", ""
+
+
 # ---------------------------------------------------------------------------
 # Recent images helpers
 # ---------------------------------------------------------------------------
+
 
 # Module-level cache for recent images – stores the full list, not limited
 _gallery_cache: Dict[str, Any] = {
@@ -259,13 +295,26 @@ def _idle_preview_image() -> Optional[str]:
 _gen: Dict[str, Any] = {}
 
 
+def _missing_models() -> List[str]:
+    """Labels of the model files that are not set, or set but gone from disk.
+
+    All three are mandatory for every run — a Z-Image diffusion gguf is the
+    DiT alone, so it cannot condition without the Qwen3 encoder (--llm) nor
+    reach pixels without the VAE (--vae). Checked as one group so the user is
+    told everything that is missing at once, rather than fixing the diffusion
+    model only to be sent back for the VAE.
+    """
+    c = configure.load_persistent()
+    labels = [("encoder_model_path", "Encoder"),
+              ("imagegen_model_path", "Diffusion"),
+              ("vae_model_path", "VAE")]
+    return [label for key, label in labels
+            if not c.get(key) or not Path(c[key]).exists()]
+
+
 def _models_configured() -> bool:
     """Return True if all three model paths are set and exist on disk."""
-    c = configure.load_persistent()
-    return all(
-        c.get(k) and Path(c[k]).exists()
-        for k in ("encoder_model_path", "imagegen_model_path", "vae_model_path")
-    )
+    return not _missing_models()
 
 
 def _build_generate_tab_inner() -> None:
@@ -466,13 +515,13 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         if not prompt or not prompt.strip():
             yield preview_now, gallery_now, "Please enter a prompt.", _btn_generate
             return
+        missing = _missing_models()
+        if missing:
+            yield (preview_now, gallery_now,
+                   "Complete model details on Configuration page first! "
+                   f"(missing: {', '.join(missing)})", _btn_generate)
+            return
         c = _cfg()
-        if not c.get("imagegen_model_path") or not Path(c["imagegen_model_path"]).exists():
-            yield preview_now, gallery_now, "Image generation model not configured. Go to Configuration tab.", _btn_generate
-            return
-        if not c.get("vae_model_path") or not Path(c["vae_model_path"]).exists():
-            yield preview_now, gallery_now, "VAE model not configured. Go to Configuration tab.", _btn_generate
-            return
 
         # Cancel any pending unload while we are generating
         _cancel_inactivity_timer()
@@ -737,10 +786,20 @@ def _build_config_tab_inner() -> None:
     threads = _thread_choices()
     dt      = configure.get_default_threads()
 
-    # ── Model paths (encoder + diffusion on one row) ──
+    # ── Model paths ──
+    # Left column: encoder. Right column: the image-generation pair —
+    # diffusion model on the first row, its VAE on the second, because the two
+    # are always chosen together. Every Z-Image diffusion gguf is the DiT
+    # component ONLY (no VAE tensors, no text encoder), so a run needs all
+    # three files and the VAE cannot stay an invisible auto-detected extra:
+    # the community finetunes ship no ae.safetensors at all, so detection
+    # legitimately misses and the user has to be able to point at the one they
+    # already have. Full paths live in the hidden *_path_tb boxes; the visible
+    # boxes carry display names only.
     gr.Markdown("### Model Paths")
     _cfg_w["enc_path_tb"]  = gr.Textbox(value=cfg.get("encoder_model_path", ""),  visible=False)
     _cfg_w["diff_path_tb"] = gr.Textbox(value=cfg.get("imagegen_model_path", ""), visible=False)
+    _cfg_w["vae_path_tb"]  = gr.Textbox(value=cfg.get("vae_model_path", ""),      visible=False)
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -765,11 +824,16 @@ def _build_config_tab_inner() -> None:
                 )
                 _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
 
-    # ── VAE path is auto-detected from diffusion model folder; stored hidden ──
-    _cfg_w["vae_path_tb"] = gr.Textbox(
-        value=cfg.get("vae_model_path", ""), visible=False)
-    _cfg_w["vae_name_tb"] = gr.Textbox(
-        value=cfg.get("vae_model_name", ""), visible=False)
+            with gr.Row():
+                _cfg_w["vae_name_tb"] = gr.Textbox(
+                    label="VAE Name",
+                    value=cfg.get("vae_model_name", ""),
+                    placeholder="ae.safetensors",
+                    info="Auto-filled when found next to the diffusion model.",
+                    interactive=True,
+                    scale=8,
+                )
+                _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
 
     # ── Backend selection + CPU threads (consolidated) ──
     is_cpu_only = configure.get_install_type() == "cpu_only"
@@ -887,13 +951,18 @@ def _build_config_tab_inner() -> None:
         p = _browse_file()
         return (p, Path(p).stem) if p else (gr.update(), gr.update())
 
-    def _browse_diffusion():
+    def _browse_diffusion(current_vae_path: str, current_vae_name: str):
         p = _browse_file()
-        if p:
-            stem = Path(p).stem
-            vae_path, vae_name = _detect_vae(p)
-            return p, stem, vae_path, vae_name
-        return gr.update(), gr.update(), gr.update(), gr.update()
+        if not p:
+            return gr.update(), gr.update(), gr.update(), gr.update()
+        vae_path, vae_name = _resolve_vae(p, current_vae_path, current_vae_name)
+        return p, Path(p).stem, vae_path, vae_name
+
+    def _browse_vae():
+        # No _resolve_vae here: an explicit pick by the user is final and is
+        # never second-guessed by auto-detection.
+        p = _browse_file(_FILETYPES_VAE)
+        return (p, Path(p).stem) if p else (gr.update(), gr.update())
 
     _cfg_w["enc_browse_btn"].click(
         _browse_encoder,
@@ -901,18 +970,27 @@ def _build_config_tab_inner() -> None:
     )
     _cfg_w["diff_browse_btn"].click(
         _browse_diffusion,
+        inputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]],
         outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"],
                  _cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
     )
+    _cfg_w["vae_browse_btn"].click(
+        _browse_vae,
+        outputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
+    )
 
-    # When diffusion path is changed manually, auto-detect VAE
-    def _on_diff_path_change(path: str):
-        vae_path, vae_name = _detect_vae(path)
-        return vae_path, vae_name
+    # When the diffusion path changes — by Browse, or by hand — re-resolve the
+    # VAE. Same _resolve_vae() as the browse handler, so whichever of the two
+    # fires (and .change fires for programmatic updates too, so both often do)
+    # the outcome is identical and re-running is harmless.
+    def _on_diff_path_change(path: str, current_vae_path: str,
+                             current_vae_name: str):
+        return _resolve_vae(path, current_vae_path, current_vae_name)
 
     _cfg_w["diff_path_tb"].change(
         _on_diff_path_change,
-        inputs=_cfg_w["diff_path_tb"],
+        inputs=[_cfg_w["diff_path_tb"], _cfg_w["vae_path_tb"],
+                _cfg_w["vae_name_tb"]],
         outputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
     )
 
