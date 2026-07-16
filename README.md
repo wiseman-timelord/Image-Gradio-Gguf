@@ -1,8 +1,8 @@
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
-- v1.18 - Ensured that people whom dont have compile related install tools can still run via a non-compile download, without flagging required compile tools missing.
-- v1.19 - Image Generation Model support expanded to include all of [Z-Image-Turbo-GGUF-Collection](https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection)
+- v1.18 - Ensured that people whom dont have compile related install tools can still run via a non-compile download, without flagging required compile tools missing. This is all in addition to the awesome Overhaul that happened in v1.19.
+- v1.20 - Image Generation Model support expanded to addditionally include [Z-Image-Turbo-GGUF-Collection](https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection) in v1.19, this was then completed/corrected for v1.20 to include individual path setting for "ae.safetensors".
 
 ### Description
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. This is a simple image generation project, covering what is possible currently to be most compitent through GGUF models, through but eventually cover several encoders and image generation models. While this program work great for what it does, it is also example scripts for AI on how to do image inference with such libraries/models, and useful in the production of other progreams that require such things. As you can see it generates OK images, they can look pretty real, but has the typical issues one would exoect under such restrictions and with AI image generation in general, but for simple images I think it will be effective in generating your result in a few iterations, so long as the request is not too barmy.   
