@@ -27,7 +27,8 @@ if %errorLevel% NEQ 0 (
     timeout /t 2 >nul
     echo Right Click, Run As Administrator.
     timeout /t 2 >nul
-    goto :end_of_script
+    pause
+    exit /b 1
 )
 echo Status: Administrator
 timeout /t 1 >nul
@@ -70,7 +71,7 @@ exit /b 1
 
 :found_python
 
-REM venv python path - used to run launcher directly (no activate needed)
+REM venv python path - used to run launcher directly, no activate needed
 set "VENVPY=venv\Scripts\python.exe"
 
 :menu
@@ -102,12 +103,12 @@ echo.
 echo.
 echo.
 echo ================================================================================
+set "CHOICE="
 set /p "CHOICE=   Selection; Menu Options = 1-2, Exit Batch = X: "
 
 if /i "%CHOICE%"=="1" goto :run_program
 if /i "%CHOICE%"=="2" goto :run_install
 if /i "%CHOICE%"=="x" goto :exit_batch
-if /i "%CHOICE%"=="X" goto :exit_batch
 
 REM Invalid input - loop back
 goto :menu
@@ -152,7 +153,6 @@ echo.
 echo.
 echo   Installer exited.
 timeout /t 2 >nul
-pause >nul
 goto :menu
 
 
@@ -162,8 +162,3 @@ echo.
 echo   Goodbye.
 echo.
 exit /b 0
-
-
-:end_of_script_console
-pause
-exit /b 1
