@@ -1,7 +1,7 @@
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
-- Current Phase v1.19-v1.21 - Image Generation Model support expanded to addditionally include [Z-Image-Turbo-GGUF-Collection](https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection) in v1.19, this was then completed/corrected for v1.20 to include individual path setting for "ae.safetensors", this was then corrected again in v1.21 to fix to the Generate Image button not appearing, after recent changes to `ae.safetensors` handling. v1.21 also sees a new a Preferences page, which makes the Configuration page a little cleaner and more focused. See pictures below.
+- Current Phase v1.19-v1.22 - Image Generation Model support expanded in v1.19, this was then completed/corrected for v1.20 to include individual path setting for "ae.safetensors", this was then corrected again in v1.21 to fix to the Generate Image button not appearing, after recent changes to `ae.safetensors` handling. v1.21 also sees a new a Preferences page, which makes the Configuration page a little cleaner and more focused, see pictures below. v1.22 saw comprihensive z-image-turbo model support, for both encoder and imagegen models.
 
 ### Description
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. This is a simple image generation project, covering what is possible currently to be most compitent through GGUF models, through but eventually cover several encoders and image generation models. While this program work great for what it does, it is also example scripts for AI on how to do image inference with such libraries/models, and useful in the production of other progreams that require such things. As you can see it generates OK images, they can look pretty real, but has the typical issues one would exoect under such restrictions and with AI image generation in general, but for simple images I think it will be effective in generating your result in a few iterations, so long as the request is not too barmy.   
@@ -53,11 +53,36 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 - Libraries - Required libraries is handled by the installer script, but they include both, Llama.Cpp and Stable Diffusion.
 - Building - VS 2022 C++, specifically the Desktop Build Tools including CMake. Additionally the Vulkan 1.4 SDK. Additionally Windows 10/11 SDK relevant to your os version.
 
-### Models:
+### Models (basic):
 I put Q# because it should support any quantization, the model variety will be expanded upon later....
-- intended Encoding model, "Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf" and "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf". Such as for example [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF) or [Qwen3-4b-Z-Image-Turbo-AbliteratedV1-GGUF](https://huggingface.co/mradermacher/Qwen3-4b-Z-Image-Turbo-AbliteratedV1-GGUF).
-- intended Image generation model "z_image_turbo-Q#.gguf". Such as for example, [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) or [Reinforced Z-Image-Turbo-GGUF](https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection/tree/main).
-- The "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, then the non-vanilla models that dont have it will work. 
+- First you need an encoding model, get "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf" from here [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF).
+- Second you need an image generation model, get "z_image_turbo-Q#.gguf" from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF)
+- Third the "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, use it with all z-image-turbo image generation model variants.
+
+### Models (advanced):
+- Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+```
+Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
+Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
+Qwen3-8b-erotic-heretic-Q#.gguf
+Qwen3-8B-Gemini-2.5-Flash-Uncensored-Q#.gguf
+```
+- Image Generation Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+```
+z_image_turbo-Q#.gguf
+darkBeastMar1526Latest_dbzit8SDAFOK-Q#.gguf
+darkBeastMar2126Latest_dbzit9DIMRclaw-Q#.gguf
+eventHorizon_zitV10-Q#.gguf
+perfeczion_10BF16-Q#.gguf
+smoothmixUltimate_zimageTurboV10-Q#.gguf
+zImageTurboAnime_v10-Q#.gguf
+zImageTurboNSFW_60BF16Diffusion-Q#.gguf
+zImageTurboNSFW_61BF16Diffusion-Q#.gguf
+```
+- ae.safetensors,  you still going to need that from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) 
+```
+ae.safetensors
+```
 
 ### Instructions:
 Currently...
