@@ -412,12 +412,14 @@ def _build_generate_tab_inner() -> None:
                 placeholder=prompt_ph,
                 lines=2, max_lines=10,
                 value=cfg.get("last_prompt", ""),
+                elem_id="positive-prompt-tb",
             )
             _gen["negative_tb"] = gr.Textbox(
                 label="Negative Prompt",
                 placeholder=neg_ph,
                 lines=2, max_lines=10,
                 value=cfg.get("negative_prompt", ""),
+                elem_id="negative-prompt-tb",
             )
             with gr.Row():
                 _gen["preset_dd"] = gr.Dropdown(
@@ -1539,13 +1541,134 @@ overflow-x:scroll would always show the track regardless of content width. ─�
     overflow-y: hidden !important;
     scrollbar-width: thin !important;      /* Firefox: thin bar when visible */
 }
+
+/* ── Positive/Negative Prompt boxes: predictable box model for the JS
+auto-sizer in _HEAD_JS below. Gradio already grows these textareas on the
+'input' event (typing), sized against `lines`/`max_lines`. The bug this
+fixes is different: when the window is narrower (e.g. snapped to half the
+screen), the *same* text wraps across more visual lines, but nothing the
+user typed fired, so Gradio never recomputes the height and the extra
+wrapped lines are cut off / scroll out of view. The JS below recalculates
+height from scrollHeight whenever the box's on-screen width actually
+changes (window resize, tab switch, snap-to-half-screen, etc.), not just
+on keystrokes. box-sizing:border-box here ensures the padding/border math
+the JS does (via getComputedStyle) lines up with the height it sets. ── */
+#positive-prompt-tb textarea,
+#negative-prompt-tb textarea {
+    box-sizing: border-box !important;
+    resize: none !important;
+}
 """
     # Substitute the preview-box height placeholder with the single shared
     # constant (configure.PREVIEW_IMAGE_HEIGHT) — same value used for the
     # gr.Image(height=...) kwarg, so the two can never drift apart again.
     _css = _css.replace("__PREVIEW_IMG_HEIGHT__", str(configure.PREVIEW_IMAGE_HEIGHT))
 
-    with gr.Blocks(title="Image-Gradio-Gguf") as app:
+    # ── Prompt-box reflow fix ──────────────────────────────────────────────
+    # See the CSS comment above #positive-prompt-tb/#negative-prompt-tb for
+    # the root cause. Short version: Gradio auto-grows a Textbox's height
+    # only in response to the 'input' event, keyed off *character* content,
+    # not off how many visual lines that content currently wraps to. Resize
+    # the browser (e.g. snap the window to half the screen) and the same
+    # text now wraps across more lines, but no 'input' event fires, so the
+    # box never regrows and the extra lines overflow out of view.
+    #
+    # This script recomputes each textarea's height from its scrollHeight
+    # any time its own on-screen box actually changes size (ResizeObserver),
+    # which fires on window resize, half-screen snapping, tab switches,
+    # etc. — not just on typing. It is capped at the same max_lines=10 used
+    # on the Python side, matching Gradio's own cap, so it never grows
+    # unbounded; past that it scrolls internally like Gradio's own textarea
+    # does.
+    _PROMPT_MAX_LINES = 10
+    _HEAD_JS = f"""
+<script>
+(function() {{
+  var PROMPT_IDS = ['positive-prompt-tb', 'negative-prompt-tb'];
+  var MAX_LINES = {_PROMPT_MAX_LINES};
+  // Last observed wrapper width per id. Setting the textarea's own height
+  // inside a ResizeObserver callback changes that same box's size again,
+  // which re-queues another notification in the SAME observation cycle --
+  // browsers detect this and log "ResizeObserver loop completed with
+  // undelivered notifications" (harmless, but noisy). We avoid ever
+  // re-triggering by (a) only reacting when WIDTH changed, since our own
+  // mutation only ever changes height, and (b) doing the actual style
+  // mutation on the next animation frame, after the observer's current
+  // notification cycle has already finished, rather than synchronously
+  // inside the callback.
+  var lastWidth = {{}};
+
+  function resize(ta) {{
+    if (!ta) return;
+    var cs = window.getComputedStyle(ta);
+    var lineHeight = parseFloat(cs.lineHeight);
+    if (!lineHeight || isNaN(lineHeight)) lineHeight = 20;
+    var extra = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)
+              + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+    var maxHeight = lineHeight * MAX_LINES + extra;
+
+    ta.style.height = 'auto';
+    var needed = ta.scrollHeight;
+    if (needed > maxHeight) {{
+      ta.style.height = maxHeight + 'px';
+      ta.style.overflowY = 'auto';
+    }} else {{
+      ta.style.height = needed + 'px';
+      ta.style.overflowY = 'hidden';
+    }}
+  }}
+
+  function findTextarea(id) {{
+    var wrap = document.getElementById(id);
+    return wrap ? wrap.querySelector('textarea') : null;
+  }}
+
+  function autoSizeAll() {{
+    PROMPT_IDS.forEach(function(id) {{ resize(findTextarea(id)); }});
+  }}
+
+  function attachObservers() {{
+    var observed = false;
+    PROMPT_IDS.forEach(function(id) {{
+      var wrap = document.getElementById(id);
+      if (!wrap) return;
+      var ro = new ResizeObserver(function(entries) {{
+        entries.forEach(function(entry) {{
+          var width = entry.contentRect.width;
+          if (lastWidth[id] === width) return;   // height-only change: skip
+          lastWidth[id] = width;
+          var ta = wrap.querySelector('textarea');
+          window.requestAnimationFrame(function() {{ resize(ta); }});
+        }});
+      }});
+      ro.observe(wrap);
+      observed = true;
+    }});
+    return observed;
+  }}
+
+  // Gradio mounts asynchronously; keep trying until the boxes exist, then
+  // do one initial sizing pass and attach the resize observers.
+  var tries = 0;
+  var interval = setInterval(function() {{
+    tries += 1;
+    if (attachObservers() || tries > 100) {{
+      clearInterval(interval);
+      autoSizeAll();
+    }}
+  }}, 200);
+
+  // Belt-and-suspenders: also catch plain window resizes directly.
+  var resizeTimer = null;
+  window.addEventListener('resize', function() {{
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(autoSizeAll, 80);
+  }});
+}})();
+</script>
+"""
+
+    with gr.Blocks(title="Image-Gradio-Gguf", head=_HEAD_JS) as app:
         gr.Markdown("# Image-Gradio-Gguf")
 
         # ── Tabs ──────────────────────────────────────────────────────────────
