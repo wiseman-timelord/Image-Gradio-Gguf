@@ -13,14 +13,104 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Encoder model constraints (Qwen3-4B)
-# Sourced from GGUF metadata to ensure UI sliders/dropdowns and logic 
+# Encoder model constraints (Qwen3 text-encoder family)
+# Sourced from GGUF metadata to ensure UI sliders/dropdowns and logic
 # respect the actual architecture limits.
 # ---------------------------------------------------------------------------
-ENCODER_MAX_LAYERS = 36
-ENCODER_MAX_CONTEXT = 40960
-ENCODER_EMBEDDING_LENGTH = 2560
-ENCODER_VOCAB_SIZE = 151936
+# TWO sizes are supported, and the difference between them is smaller than it
+# looks -- which is exactly why it bit us. Both Qwen3-4B and Qwen3-8B declare
+# num_hidden_layers = 36 and max_position_embeddings = 40960 and vocab 151936;
+# they differ only in hidden_size (2560 vs 4096) and intermediate_size. So
+# ENCODER_MAX_LAYERS, ENCODER_MAX_CONTEXT, CTX_SIZE_CHOICES and
+# GPU_LAYER_CHOICES are all correct for BOTH sizes as-is, and adding the 8B
+# encoders required no change to any of them.
+#
+# What it DID require: inference._resolve_gpu_layers() used to name-test for
+# "4b" and fall back to the 99 sentinel for everything else. 99 is fine as
+# "offload all layers", but the OOM retry ladder subtracts 1, then 2, then 4
+# from the PREVIOUS attempt -- 99 -> 98 -> 96 -> 92 are all still >= 36, i.e.
+# still "every layer", so all three retries were identical to the attempt that
+# just OOM'd. The ladder silently did nothing for any non-4B encoder. Hence
+# ENCODER_FAMILIES below and the resolver rewrite.
+#
+#   Qwen3-4B   hidden 2560, 36 layers, 40960 ctx
+#     Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
+#         mradermacher static quants of BennyDaBall's abliteration.
+#         Q2_K 1.67GB / Q4_K_M 2.5GB / Q6_K 3.31GB / Q8_0 4.28GB / F16 8.05GB,
+#         plus IQ4_XS. NOTE the separator: mradermacher writes the quant after
+#         a DOT ("...AbliteratedV1.Q4_K_M.gguf"), not the hyphen every other
+#         file in this program uses. get_quantization_label() already handles
+#         it -- its match is separator-boundaried, not hyphen-specific.
+#     Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q8_0.gguf   (LuffyTheFox, 4.28GB)
+#
+#   Qwen3-8B   hidden 4096, 36 layers, 40960 ctx
+#     Qwen3-8b-erotic-heretic-Q8_0.gguf                  (LuffyTheFox, 8.71GB)
+#     Qwen3-8B-Gemini-2.5-Flash-Uncensored-Q8_0.gguf     (LuffyTheFox, 8.71GB)
+#         Both are Heretic-abliterated Qwen3-8B derivatives republished as
+#         text encoders for Z-Image-Turbo and FLUX Klein. "heretic" is the
+#         abliteration TOOL (p-e-w/heretic), not a content descriptor.
+#
+# VRAM, the practical part: both 8B files exist upstream ONLY as Q8_0, 8.71GB.
+# That does not fit the 8GB RX 470 even alone, so a Vulkan encoder run with
+# either of them MUST use a partial offload (GPU Layers well below 36) or the
+# CPU backend -- which is also the configuration this program already prefers
+# when the diffuser is on the GPU. The 4B files (2.5GB at Q4_K_M, 4.28GB at
+# Q8_0) are the ones that fit comfortably beside a diffusion model.
+# ---------------------------------------------------------------------------
+ENCODER_MAX_LAYERS = 36        # num_hidden_layers: 36 for Qwen3-4B AND 8B
+ENCODER_MAX_CONTEXT = 40960    # max_position_embeddings: same for both
+ENCODER_VOCAB_SIZE = 151936    # same for both
+
+# Per-size facts, keyed by family id. `pattern` is re.search()ed against the
+# lowercased filename (and then folder names) by encoder_family(). Keep the
+# patterns mutually exclusive: first match wins, dict order decides.
+#
+# embedding_length is recorded for reporting/diagnostics only -- nothing in
+# the program conditions on it -- but it is the one field that actually
+# differs, so it is the field that tells you which family you are looking at
+# if you ever dump GGUF metadata by hand.
+ENCODER_FAMILIES: Dict[str, Dict[str, Any]] = {
+    "qwen3-8b": {
+        "label": "Qwen3-8B",
+        "pattern": r"qwen3[-_. ]?8[-_. ]?b(?![a-z0-9])",
+        "layers": 36,
+        "embedding_length": 4096,
+        "max_context": 40960,
+    },
+    "qwen3-4b": {
+        "label": "Qwen3-4B",
+        "pattern": r"qwen3[-_. ]?4[-_. ]?b(?![a-z0-9])",
+        "layers": 36,
+        "embedding_length": 2560,
+        "max_context": 40960,
+    },
+}
+
+# llama.cpp clamps any -ngl larger than the real block count to "all layers".
+# Used only when neither GGUF metadata nor the filename identifies a family;
+# see inference._resolve_gpu_layers() for why this is a last resort and not a
+# default.
+ENCODER_UNKNOWN_LAYERS = 99
+
+
+def encoder_family(name: str) -> Optional[str]:
+    """Return the ENCODER_FAMILIES key matching `name`, or None.
+
+    `name` is any filename or bare model name; matching is case-insensitive.
+    Used as the FALLBACK oracle only -- GGUF `*.block_count` metadata is
+    authoritative and inference.py consults it first.
+    """
+    low = str(name).lower()
+    for fam, spec in ENCODER_FAMILIES.items():
+        if re.search(spec["pattern"], low):
+            return fam
+    return None
+
+
+def get_encoder_family_spec(name: str) -> Optional[Dict[str, Any]]:
+    """The ENCODER_FAMILIES entry matching `name`, or None if unrecognised."""
+    fam = encoder_family(name)
+    return ENCODER_FAMILIES[fam] if fam else None
 
 # ---------------------------------------------------------------------------
 # Diffuser model constraints (Z-Image-Turbo / Lumina2-style DiT)

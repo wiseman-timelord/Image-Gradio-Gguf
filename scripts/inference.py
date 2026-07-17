@@ -27,6 +27,14 @@ import scripts.utilities as utilities
 # ---------------------------------------------------------------------------
 
 GGUF_MAGIC = b"GGUF"
+
+
+class _GGUFArraySkipped(Exception):
+    """Raised when a KV array is too large to parse and too expensive to skip.
+
+    The file cursor is left mid-array, so nothing after it can be read; the
+    parse must stop, not continue. See _read_gguf_value()'s ARRAY branch.
+    """
 GGUF_TYPES = {
     0: "UINT8", 1: "INT8", 2: "UINT16", 3: "INT16",
     4: "UINT32", 5: "INT32", 6: "FLOAT32", 7: "BOOL",
@@ -269,6 +277,18 @@ def _probe_gguf(p: Path) -> Optional[Dict[str, Any]]:
                 "quantization": get_quantization_label(p.name),
                 "hash_prefix": utilities.quick_hash(str(p)),
             }
+            # `*.block_count` is what _resolve_gpu_layers() wants: the real
+            # number of offloadable transformer blocks, straight from the file
+            # rather than guessed from its name. It is written as
+            # "<arch>.block_count" (qwen3.block_count), so the existing
+            # last-segment key trick picks it up unchanged.
+            #
+            # These all sit in the header ahead of the tokenizer arrays, which
+            # matters -- see the oversized-array note in _read_gguf_value():
+            # the parse cannot safely continue past one of those, so anything
+            # written after them is unreachable by design.
+            wanted = ("architecture", "name", "description",
+                      "block_count", "embedding_length", "context_length")
             for _ in range(min(kv_count, 128)):
                 try:
                     kv = _read_gguf_kv(f)
@@ -276,8 +296,12 @@ def _probe_gguf(p: Path) -> Optional[Dict[str, Any]]:
                         break
                     key, value = kv
                     short = key.split(".")[-1]
-                    if short in ("architecture", "name", "description"):
+                    if short in wanted:
                         meta[short] = value
+                    # Everything we care about is present: stop early rather
+                    # than parse tokenizer arrays we will never look at.
+                    if all(k in meta for k in wanted[:1] + wanted[3:]):
+                        break
                 except Exception:
                     break
             return meta
@@ -337,7 +361,23 @@ def _read_gguf_value(f, type_idx: int) -> Any:
         arr_type = struct.unpack("<I", f.read(4))[0]
         arr_len = struct.unpack("<Q", f.read(8))[0]
         if arr_len > 10000:
-            return []
+            # Bailing out here used to `return []` WITHOUT consuming the
+            # array's bytes, leaving the file cursor parked in the middle of
+            # it. Every KV read after that point was misaligned garbage, and
+            # since the caller records whatever it decodes, a junk key could
+            # land in meta. In practice the damage was capped only by luck:
+            # the one oversized array in a Qwen3 encoder is
+            # tokenizer.ggml.tokens (151936 entries), and everything this
+            # program reads is written before it.
+            #
+            # Raising instead makes the desync explicit: _read_gguf_kv()
+            # catches it, returns None, and _probe_gguf() stops parsing. We
+            # keep the metadata gathered so far and read nothing we cannot
+            # trust. Skipping the array properly is not worth it -- a
+            # variable-width STRING array can only be skipped by walking all
+            # 151936 length prefixes, and there is nothing after it we want.
+            raise _GGUFArraySkipped(
+                f"array of {arr_len} exceeds the 10000 parse cap")
         vals = []
         for _ in range(arr_len):
             vals.append(_read_gguf_value(f, arr_type))
@@ -385,10 +425,11 @@ def _probe_safetensors(p: Path) -> Optional[Dict[str, Any]]:
 # Prompt enhancement
 # ---------------------------------------------------------------------------
 
-# Used to resolve the -1 sentinel ("all layers") into a concrete count 
-# before retry dampening arithmetic. Sourced from configure.py to keep 
-# model constraints centralized.
-_QWEN3_4B_LAYERS: int = configure.ENCODER_MAX_LAYERS
+# Used to resolve the -1 sentinel ("all layers") into a concrete count
+# before retry dampening arithmetic. Sourced from configure.py to keep
+# model constraints centralized. Both supported encoder sizes (Qwen3-4B and
+# Qwen3-8B) have 36 blocks; see configure.ENCODER_FAMILIES.
+_ENCODER_LAYERS_FALLBACK: int = configure.ENCODER_MAX_LAYERS
 
 # OOM fingerprints that appear in llama-cli stdout/stderr output.
 _OOM_MARKERS: Tuple[str, ...] = (
@@ -419,18 +460,50 @@ def _resolve_gpu_layers(raw: int, model_path: str) -> int:
     """
     Resolve the -1 sentinel to a concrete layer count.
 
-    -1 means "offload all layers".  We use the known layer count for the
-    Qwen3-4B family; for any other model we fall back to 99 (llama.cpp treats
-    values larger than the actual layer count as "all layers").
+    -1 means "offload all layers". Resolving it to a REAL count matters more
+    than it looks: enhance_prompt()'s OOM ladder subtracts 1/2/4 from the
+    previous attempt, so if this returns an inflated sentinel every rung of
+    the ladder is still above the true block count and every retry re-runs the
+    identical failing command. That is exactly what the old implementation did
+    for anything that was not name-matched as Qwen3-4B -- including both of
+    the Qwen3-8B encoders, whose only published quant (Q8_0, 8.71GB) is the
+    one most likely to OOM on an 8GB card in the first place.
+
+    Three oracles, in order:
+      1. GGUF `*.block_count` metadata, cached by _probe_gguf(). Authoritative
+         and independent of filename, matching classify_model()'s policy of
+         trusting metadata over naming.
+      2. configure.ENCODER_FAMILIES, matched against the filename and then the
+         containing folder names -- for files whose metadata could not be read.
+      3. configure.ENCODER_MAX_LAYERS (36), correct for every Qwen3 encoder
+         this program supports, both 4B and 8B.
+
+    configure.ENCODER_UNKNOWN_LAYERS (99) is deliberately NOT the fallback:
+    overshooting is only "safe" for a single attempt, and it is precisely what
+    broke the retries.
     """
     if raw >= 0:
         return raw
-    # -1 sentinel: resolve to model-specific maximum
-    name = Path(model_path).name.lower()
-    if "qwen3" in name and ("4b" in name or "4-b" in name):
-        return _QWEN3_4B_LAYERS
-    # Unknown model: return a large number llama.cpp interprets as "all"
-    return 99
+
+    meta = probe_model(model_path) or {}
+
+    # 1. Metadata: qwen3.block_count / llama.block_count / etc.
+    blocks = meta.get("block_count")
+    try:
+        if blocks is not None and int(blocks) > 0:
+            return int(blocks)
+    except (TypeError, ValueError):
+        pass
+
+    # 2. Filename, then up to two containing folders (same haystack policy as
+    #    classify_model(); users keep the repo's folder layout on download).
+    for hay in _name_haystacks(meta) or [Path(str(model_path)).name.lower()]:
+        spec = configure.get_encoder_family_spec(hay)
+        if spec:
+            return int(spec["layers"])
+
+    # 3. Every supported encoder is 36 blocks.
+    return _ENCODER_LAYERS_FALLBACK
 
 
 def enhance_prompt(prompt: str, cfg: Dict[str, Any],
