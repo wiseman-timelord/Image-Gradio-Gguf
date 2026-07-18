@@ -9,6 +9,7 @@ Writes:
 ./data/constants.ini      - hardware constants, thread counts, GPU info
 ./data/configuration.json - default Configuration page settings (only if absent)
 ./data/preferences.json   - default Preferences page settings (only if absent)
+./data/prompt_cache.json  - default Positive/Negative Prompt (history) log (only if absent)
 No imports from scripts.* — this is self-contained.
 """
 from __future__ import annotations
@@ -50,6 +51,14 @@ _CONST_PATH  = _DATA_DIR / "constants.ini"
 _CONFIG_PATH  = _DATA_DIR / "configuration.json"
 _PREFS_PATH   = _DATA_DIR / "preferences.json"
 _LEGACY_PERSIST_PATH = _DATA_DIR / "persistent.json"
+# prompt_cache.json - "Positive/Negative Prompt (history)" rolling log (see
+# scripts/configure.py's POSITIVE_HISTORY_KEYS / NEGATIVE_HISTORY_KEYS for the
+# single source of truth these mirror). Seeded once, like preferences.json,
+# and never purged by a clean install or a config refresh.
+_PROMPT_CACHE_PATH = _DATA_DIR / "prompt_cache.json"
+_PROMPT_HISTORY_SLOTS = 5
+_POSITIVE_HISTORY_KEYS = [f"positive_history_{i}" for i in range(1, _PROMPT_HISTORY_SLOTS + 1)]
+_NEGATIVE_HISTORY_KEYS = [f"negative_history_{i}" for i in range(1, _PROMPT_HISTORY_SLOTS + 1)]
 _MODELS_DIR  = _ROOT / "models"
 _OUTPUT_DIR  = _ROOT / "output"
 
@@ -670,7 +679,7 @@ def write_default_configuration(cpu: Dict[str, Any],
         "imagegen_width": 256,
         "imagegen_height": 256,
         "imagegen_steps": 8,
-        "imagegen_cfg_scale": 1.0,
+        "imagegen_cfg_scale": 1.5,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
         "imagegen_batch_count": 2,
@@ -723,6 +732,36 @@ def write_default_preferences() -> None:
         json.dump(defaults, f, indent=4, ensure_ascii=False)
     tmp.replace(_PREFS_PATH)
     log(f"preferences.json written -> {_PREFS_PATH}")
+
+
+def write_default_prompt_cache() -> None:
+    """Seed prompt_cache.json with defaults, if it does not already exist.
+
+    10 flat keys — positive_history_1..5, negative_history_1..5, all empty —
+    one per history slot shown by the "Positive/Negative Prompt (history)"
+    popouts in display.py. Takes no arguments, same as write_default_
+    preferences(): nothing here depends on the machine, only on the user
+    actually generating something later.
+
+    Like preferences.json, this file is NOT purged by a clean install or a
+    config refresh (see _purge_for_clean_install and menu choice 3 in
+    main()) — it holds prompts the user typed, not install state, so a
+    reinstall has nothing to invalidate here.
+
+    Kept in step with scripts/configure.py's POSITIVE_HISTORY_KEYS /
+    NEGATIVE_HISTORY_KEYS / _default_prompt_cache(); that one backfills gaps
+    at load time, this one seeds the file at install time.
+    """
+    if _PROMPT_CACHE_PATH.exists():
+        log(f"prompt_cache.json already present -> {_PROMPT_CACHE_PATH} (kept)")
+        return
+
+    defaults: Dict[str, Any] = {k: "" for k in _POSITIVE_HISTORY_KEYS + _NEGATIVE_HISTORY_KEYS}
+    tmp = _PROMPT_CACHE_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(defaults, f, indent=4, ensure_ascii=False)
+    tmp.replace(_PROMPT_CACHE_PATH)
+    log(f"prompt_cache.json written -> {_PROMPT_CACHE_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -1795,9 +1834,9 @@ def _purge_for_clean_install() -> None:
     if _LEGACY_PERSIST_PATH.exists():
         _LEGACY_PERSIST_PATH.unlink()
         log("persistent.json removed (superseded by configuration.json).")
-    # preferences.json is deliberately NOT purged -- it holds the user's own
-    # standing choices (prompt template, max thumbnails), none of which a
-    # reinstall can invalidate.
+    # preferences.json and prompt_cache.json are deliberately NOT purged --
+    # they hold the user's own standing choices and typed prompt history,
+    # none of which a reinstall can invalidate.
     if _CONST_PATH.exists():
         _CONST_PATH.unlink()
         log("constants.ini removed (will be regenerated).")
@@ -2037,6 +2076,7 @@ def main() -> None:
         write_constants(cpu, vk)
         write_default_configuration(cpu, vk)
         write_default_preferences()
+        write_default_prompt_cache()
         log("Detection complete.")
         return
 
@@ -2045,6 +2085,7 @@ def main() -> None:
         write_constants(cpu, vk)
         write_default_configuration(cpu, vk)
         write_default_preferences()
+        write_default_prompt_cache()
         t0 = time.time()
         _run_deps(cpu)
         _run_summary(t0)
@@ -2086,6 +2127,7 @@ def main() -> None:
             # be anchored to a GPU that actually exists on this machine.
             write_default_configuration(cpu, vk)
             write_default_preferences()
+            write_default_prompt_cache()
             _run_summary(t0)
             return
         if choice == "2":
@@ -2099,6 +2141,7 @@ def main() -> None:
             write_constants(cpu, vk, use_vulkan=use_vulkan)
             write_default_configuration(cpu, vk)
             write_default_preferences()
+            write_default_prompt_cache()
             _run_summary(t0)
             return
         if choice == "3":
@@ -2119,6 +2162,7 @@ def main() -> None:
             # preferences.json survives a config refresh: nothing in it is
             # machine-derived, so there is nothing to refresh.
             write_default_preferences()
+            write_default_prompt_cache()
             _run_summary(t0)
             return
             
