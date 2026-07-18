@@ -135,3 +135,6 @@ Image-Gradio-Gguf/
 ├── models/                        # Default model directory
 └── output/                        # Generated images directory
 ```
+
+### Disclaimer:
+- While this program is designed to be able to create images without filtering, the idea being simpler less complex prompting in order to achieve intended result, for purposes such as for example illustrating a book, it may also generate images you dont intend, but you the Usee yourself are responsible for the contents/theme in the outputted images, by the action of the Editing of, the Positive Promt (which by default starts blank) and the modification of the Negative Prompt (which by default contains some helpful generic text segments not intended for image).
