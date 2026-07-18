@@ -432,20 +432,62 @@ def _build_generate_tab_inner() -> None:
             # engine with no CSS field-sizing support, since on the engine we
             # actually ship (Chromium 130, via PyQt6-WebEngine 6.9) the CSS
             # governs the height and the box grows to fit all of the text.
+            # ── Positive Prompt, with a "(history)" popout ──────────────────
+            # The label itself is the toggle: a gr.Button stripped of all
+            # button chrome by the #positive-history-toggle CSS rule in
+            # build_app(), so it reads as plain label text until clicked.
+            # Clicking it either opens the panel below (closed -> open,
+            # showing up to 5 recent prompts to choose from) or closes it
+            # again (open -> closed, leaving the edit box untouched) --
+            # both directions are the exact same click/handler, matching
+            # the requested "click to show, click again to hide" behaviour.
+            # Initial button values are pre-loaded from prompt_cache.json at
+            # build time so a fresh launch already has history available the
+            # first time the user opens the panel; they are re-fetched fresh
+            # on every toggle too, so a generation made just now is reflected
+            # immediately without needing a page reload.
+            _gen["positive_history_toggle"] = gr.Button(
+                "Positive Prompt (click for history)",
+                elem_id="positive-history-toggle",
+            )
             _gen["prompt_tb"] = gr.Textbox(
-                label="Positive Prompt",
+                show_label=False,
                 placeholder=prompt_ph,
                 lines=2, max_lines=10,
                 value=cfg.get("last_prompt", ""),
                 elem_id="prompt-positive",
             )
+            _positive_history = configure.get_prompt_history("positive")
+            with gr.Column(visible=False, elem_id="positive-history-panel") as _gen["positive_history_panel"]:
+                _gen["positive_history_btns"] = []
+                for _hist_text in _positive_history:
+                    _gen["positive_history_btns"].append(
+                        gr.Button(_hist_text, visible=False,
+                                 elem_classes=["prompt-history-item"])
+                    )
+            _gen["positive_history_state"] = gr.State(False)
+
+            # ── Negative Prompt, same "(history)" popout pattern ─────────────
+            _gen["negative_history_toggle"] = gr.Button(
+                "Negative Prompt (click for history)",
+                elem_id="negative-history-toggle",
+            )
             _gen["negative_tb"] = gr.Textbox(
-                label="Negative Prompt",
+                show_label=False,
                 placeholder=neg_ph,
                 lines=2, max_lines=10,
                 value=cfg.get("negative_prompt", ""),
                 elem_id="prompt-negative",
             )
+            _negative_history = configure.get_prompt_history("negative")
+            with gr.Column(visible=False, elem_id="negative-history-panel") as _gen["negative_history_panel"]:
+                _gen["negative_history_btns"] = []
+                for _hist_text in _negative_history:
+                    _gen["negative_history_btns"].append(
+                        gr.Button(_hist_text, visible=False,
+                                 elem_classes=["prompt-history-item"])
+                    )
+            _gen["negative_history_state"] = gr.State(False)
             with gr.Row():
                 _gen["preset_dd"] = gr.Dropdown(
                     label="Quality Preset", choices=list(presets.keys()),
@@ -532,7 +574,7 @@ def _build_generate_tab_inner() -> None:
     # CSS in build_app() (#thumbnails-gallery-link) strips all button chrome
     # so it still reads as a plain "### Thumbnails Gallery" heading.
     _gen["thumbnails_link"] = gr.Button(
-        "Thumbnails Gallery (open)",
+        "Thumbnails Gallery (click to open)",
         elem_id="thumbnails-gallery-link",
     )
     # One row, always, holding ALL of Max Thumbnails Displayed (>=50) images,
@@ -644,6 +686,16 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                    f"(missing: {', '.join(missing)})", _btn_generate)
             return
         c = _cfg()
+
+        # Record this submission into prompt_cache.json's "Positive/Negative
+        # Prompt (history)" log. Each field is recorded independently and is
+        # a no-op if it matches the most-recent saved entry for that field,
+        # so e.g. re-using the same negative prompt across several positive
+        # prompts adds no duplicate negative-history rows (see
+        # configure.record_prompt_history). Recorded on every submission,
+        # not only on success, since the user did type it either way.
+        configure.record_prompt_history("positive", prompt)
+        configure.record_prompt_history("negative", negative)
 
         # Cancel any pending unload while we are generating
         _cancel_inactivity_timer()
@@ -911,6 +963,66 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         inputs=None,
         outputs=[_gen["generate_row"], _gen["prompt_tb"], _gen["negative_tb"]],
     )
+
+    _wire_prompt_history_events()
+
+
+def _prompt_history_toggle_updates(kind: str, is_open: bool) -> Tuple[Any, ...]:
+    """(panel_visible, row1_update, ..., row5_update, new_state) for a click
+    on the "<Positive|Negative> Prompt (history)" label.
+
+    Toggles closed -> open (fetching the current 5 most-recent entries fresh
+    from prompt_cache.json and revealing whichever of them are non-empty) or
+    open -> closed (hides the panel again, main edit box untouched) --
+    whichever the current state calls for. A fresh fetch on every open means
+    a generation submitted moments ago already shows up without a page
+    reload.
+    """
+    new_open = not is_open
+    history = configure.get_prompt_history(kind)
+    updates: List[Any] = [gr.update(visible=new_open)]
+    for text in history:
+        updates.append(gr.update(value=text, visible=bool(new_open and text)))
+    updates.append(new_open)
+    return tuple(updates)
+
+
+def _select_prompt_history_entry(text: str) -> Tuple[Any, Any, bool]:
+    """Clicking one of the 5 history rows: load its text into the prompt box
+    and close the panel, returning focus to the single edit box (same as
+    clicking the label toggle a second time would)."""
+    return gr.update(value=text), gr.update(visible=False), False
+
+
+def _wire_prompt_history_events() -> None:
+    """Wire the Positive/Negative Prompt "(history)" toggles and their 5 row
+    buttons each. Split out from _wire_generate_events only for readability
+    -- both fields follow the exact same open/close/select pattern, just
+    against a different (kind, toggle, panel, buttons, state) tuple."""
+    for kind, toggle_key, panel_key, btns_key, state_key in (
+        ("positive", "positive_history_toggle", "positive_history_panel",
+         "positive_history_btns", "positive_history_state"),
+        ("negative", "negative_history_toggle", "negative_history_panel",
+         "negative_history_btns", "negative_history_state"),
+    ):
+        toggle_fn = (lambda is_open, _k=kind: _prompt_history_toggle_updates(_k, is_open))
+        _gen[toggle_key].click(
+            toggle_fn,
+            inputs=_gen[state_key],
+            outputs=[_gen[panel_key], *_gen[btns_key], _gen[state_key]],
+        )
+
+    target_tb = {"positive": _gen["prompt_tb"], "negative": _gen["negative_tb"]}
+    for kind, panel_key, btns_key, state_key in (
+        ("positive", "positive_history_panel", "positive_history_btns", "positive_history_state"),
+        ("negative", "negative_history_panel", "negative_history_btns", "negative_history_state"),
+    ):
+        for btn in _gen[btns_key]:
+            btn.click(
+                _select_prompt_history_entry,
+                inputs=btn,
+                outputs=[target_tb[kind], _gen[panel_key], _gen[state_key]],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1678,44 @@ max-height: __PREVIEW_IMG_HEIGHT__px !important;
 width: 100% !important;
 height: 100% !important;
 object-fit: contain !important;
+}
+
+/* ── Prompt history toggles: "Positive/Negative Prompt (history)" ────────
+Same trick as #thumbnails-gallery-link above: a gr.Button standing in for a
+plain field label, stripped back to inert-looking text so it reads as a
+label until the cursor says otherwise, but clickable to open/close the
+5-row history panel beneath the box (see _wire_prompt_history_events). Sized
+to match a normal Textbox label rather than the larger heading-style link,
+since this sits directly above a form field, not above a page section. ── */
+#positive-history-toggle,
+#negative-history-toggle {
+all: unset !important;
+display: inline-block !important;
+font-size: 0.875rem !important;
+font-weight: 600 !important;
+line-height: 1.4 !important;
+color: var(--body-text-color) !important;
+cursor: pointer !important;
+margin: 0 0 2px 0 !important;
+padding: 0 !important;
+}
+#positive-history-toggle:hover,
+#negative-history-toggle:hover { text-decoration: underline !important; }
+
+/* ── Prompt history rows: up to 5 recent prompts, one per button ─────────
+Plain-looking, left-aligned, single-line rows so a long saved prompt reads
+as a list entry rather than a normal centered button. Hidden rows (an empty
+history slot) are handled in Python via visible=False, not CSS, so no extra
+selector is needed here for that. ───────────────────────────────────────── */
+.prompt-history-item {
+display: block !important;
+width: 100% !important;
+text-align: left !important;
+justify-content: flex-start !important;
+white-space: nowrap !important;
+overflow: hidden !important;
+text-overflow: ellipsis !important;
+margin-bottom: 2px !important;
 }
 
 /* ── Prompt boxes: height follows the text, at ANY window width ──────────

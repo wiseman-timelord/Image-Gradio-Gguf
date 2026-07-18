@@ -966,6 +966,91 @@ def get_max_thumbnails() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Prompt history (data/prompt_cache.json — "Positive/Negative Prompt (history)")
+# ---------------------------------------------------------------------------
+# Five most-recent-first slots per field, exposed as flat keys (rather than a
+# JSON array) so each slot round-trips through _load_json_with_defaults' key
+# backfill exactly like every other settings file in this program, and so
+# the 10 keys the UI binds to (5 positive + 5 negative) are each individually
+# addressable. Index 0 in the in-memory list == *_history_1 == most recent.
+#
+# Kept in its own file, separate from both configuration.json and
+# preferences.json: it is neither machine-derived (configuration.json) nor a
+# single standing setting (preferences.json) — it is a small rolling log the
+# user builds up by using the program, and installer.py seeds it once and
+# never purges it, the same treatment preferences.json gets.
+PROMPT_HISTORY_SLOTS: int = 5
+POSITIVE_HISTORY_KEYS: List[str] = [f"positive_history_{i}" for i in range(1, PROMPT_HISTORY_SLOTS + 1)]
+NEGATIVE_HISTORY_KEYS: List[str] = [f"negative_history_{i}" for i in range(1, PROMPT_HISTORY_SLOTS + 1)]
+
+
+def get_prompt_cache_path() -> Path:
+    """data/prompt_cache.json — Positive/Negative Prompt (history) entries."""
+    return _get_project_root() / "data" / "prompt_cache.json"
+
+
+def _default_prompt_cache() -> Dict[str, Any]:
+    """All 10 history slots, empty. Kept in step with installer.py's
+    write_default_prompt_cache(); that one seeds the file at install time,
+    this one backfills gaps (e.g. a slot key added by a newer version) at
+    load time."""
+    data: Dict[str, Any] = {}
+    for k in POSITIVE_HISTORY_KEYS + NEGATIVE_HISTORY_KEYS:
+        data[k] = ""
+    return data
+
+
+def load_prompt_cache() -> Dict[str, Any]:
+    return _load_json_with_defaults(get_prompt_cache_path(), _default_prompt_cache())
+
+
+def save_prompt_cache(data: Dict[str, Any]) -> None:
+    _save_json_atomic(get_prompt_cache_path(), data)
+
+
+def get_prompt_history(kind: str) -> List[str]:
+    """Most-recent-first list of up to PROMPT_HISTORY_SLOTS saved prompts for
+    kind ("positive" or "negative"). Always returns exactly
+    PROMPT_HISTORY_SLOTS entries, in slot order (index 0 = most recent);
+    unused slots are empty strings. display.py treats an empty entry as "no
+    row to show" rather than a literal blank prompt."""
+    keys = POSITIVE_HISTORY_KEYS if kind == "positive" else NEGATIVE_HISTORY_KEYS
+    cache = load_prompt_cache()
+    return [str(cache.get(k, "") or "") for k in keys]
+
+
+def record_prompt_history(kind: str, text: str) -> bool:
+    """Push `text` onto the front of the positive/negative history — but ONLY
+    if it does not already match ANY of that field's currently-saved slots,
+    not just the most-recent one. This is what makes "negative prompt
+    unchanged across several generations gets no new entries, positive
+    prompt does" happen automatically: the two fields are recorded
+    independently and each is its own no-op when the exact text is already
+    sitting in one of its 5 slots, regardless of which slot.
+
+    Returns True if a new entry was written, False if it was already present
+    somewhere in the history / blank (blank prompts are never recorded,
+    since a blank starting prompt is the every-launch default, not a saved
+    choice).
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    keys = POSITIVE_HISTORY_KEYS if kind == "positive" else NEGATIVE_HISTORY_KEYS
+    cache = load_prompt_cache()
+    current = [str(cache.get(k, "") or "") for k in keys]
+    if text in current:
+        return False
+    updated = ([text] + current)[:PROMPT_HISTORY_SLOTS]
+    while len(updated) < PROMPT_HISTORY_SLOTS:
+        updated.append("")
+    for k, v in zip(keys, updated):
+        cache[k] = v
+    save_prompt_cache(cache)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Window geometry (Qt app window position/size — see launcher.py)
 # ---------------------------------------------------------------------------
 
