@@ -2,7 +2,7 @@
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
 - Current Phase v1.19-v1.25 - Z-Image-Turbo support expanded with individual handling of "ae.safetensors". A new a Preferences page. Some fixes/improvements.
-- v1.26 - 2 small improvments.
+- v1.26 - 2 small improvments. Confirmed some of the Collection models are working.
 - Next Phase v1.27+ - Two words "Flux Klein", enabling AI Image Editing.
 
 ### Description
