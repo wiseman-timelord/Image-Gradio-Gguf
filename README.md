@@ -2,8 +2,8 @@
 # Image-Gradio-Gguf
 Status: Beta (working but further development possible)
 - Current Phase v1.19-v1.25 - Z-Image-Turbo support expanded with individual handling of "ae.safetensors". A new a Preferences page. Some fixes/improvements.
-- v1.26 - 2 small improvments. Confirmed some of the Collection models are working.
-- Next Phase v1.27+ - Two words "Flux Klein", enabling AI Image Editing.
+- v1.26-1.27 - Small but significant improvments. Confirmed some of the Collection models are working.
+- Next Phase v1.28+ - Two words "Flux Klein", enabling AI Image Editing.
 
 ### Description
 A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. This is a simple image generation project, covering what is possible currently to be most compitent through GGUF models, through but eventually cover several encoders and image generation models. While this program work great for what it does, it is also example scripts for AI on how to do image inference with such libraries/models, and useful in the production of other progreams that require such things. As you can see it generates OK images, they can look pretty real, but has the typical issues one would exoect under such restrictions and with AI image generation in general, but for simple images I think it will be effective in generating your result in a few iterations, so long as the request is not too barmy.   
