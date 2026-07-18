@@ -407,19 +407,27 @@ def _build_generate_tab_inner() -> None:
         # ── Left column: settings ────────────────────────────────────────────
         with gr.Column(scale=3):
             gr.Markdown("### Settings")
+            # elem_id is what hooks the auto-height CSS in build_app() onto
+            # these two boxes and NOTHING else on the page — the Thumbnails
+            # Gallery has its own, separate rules and is not affected.
+            # lines=2 remains the MINIMUM height (build_app()'s min-height
+            # mirrors it); max_lines=10 is now only a fallback ceiling for an
+            # engine with no CSS field-sizing support, since on the engine we
+            # actually ship (Chromium 130, via PyQt6-WebEngine 6.9) the CSS
+            # governs the height and the box grows to fit all of the text.
             _gen["prompt_tb"] = gr.Textbox(
                 label="Positive Prompt",
                 placeholder=prompt_ph,
                 lines=2, max_lines=10,
                 value=cfg.get("last_prompt", ""),
-                elem_id="positive-prompt-tb",
+                elem_id="prompt-positive",
             )
             _gen["negative_tb"] = gr.Textbox(
                 label="Negative Prompt",
                 placeholder=neg_ph,
                 lines=2, max_lines=10,
                 value=cfg.get("negative_prompt", ""),
-                elem_id="negative-prompt-tb",
+                elem_id="prompt-negative",
             )
             with gr.Row():
                 _gen["preset_dd"] = gr.Dropdown(
@@ -502,11 +510,23 @@ def _build_generate_tab_inner() -> None:
     # list. Clicking a thumbnail here updates the preview box above — it does
     # not show generation progress, and it is not itself the preview.
     gr.Markdown("### Thumbnails Gallery")
+    # One row, always, holding ALL of Max Thumbnails Displayed (>=50) images,
+    # with a horizontal scrollbar to reach the ones past the window edge. The
+    # actual single-row / fixed-thumbnail-width / horizontal-overflow layout
+    # is enforced by the #output-gallery CSS in build_app() (grid-auto-flow:
+    # column), NOT by these columns/rows props — Gradio's native grid would
+    # otherwise reflow the images into multiple width-sharing rows that shrink
+    # with the window, which is exactly the bug this replaces. columns/rows
+    # here are left only as Gradio's own non-authoritative defaults; the CSS
+    # overrides them with !important, so their values are cosmetic. height is
+    # the one number that sizes the row and is shared with the CSS via
+    # configure.THUMBNAIL_GALLERY_HEIGHT so the two can never disagree; the
+    # per-thumbnail width is derived from it in the CSS, keeping cells square.
     _gen["output_gallery"] = gr.Gallery(
         label="Generated Images",
         value=_get_recent_images(),
         columns=16, rows=1,
-        height=123,
+        height=configure.THUMBNAIL_GALLERY_HEIGHT,
         object_fit="contain",
         allow_preview=False,
         show_label=False,
@@ -1496,6 +1516,55 @@ height: 100% !important;
 object-fit: contain !important;
 }
 
+/* ── Prompt boxes: height follows the text, at ANY window width ──────────
+Gradio's own textarea auto-grow (Textbox's resize(), which writes an inline
+`height: NNNpx` onto the textarea) is driven by the `input` event and nothing
+else — no window resize listener, no ResizeObserver. So the height is only
+ever correct for the layout width in force at the moment the last keystroke
+landed. Drag the app to half a display and the same text re-wraps onto more
+lines, but that stale inline pixel height stays exactly as it was: the box
+still shows 2 lines and the rest of the prompt is pushed out of view. Gradio
+also refuses to grow past its max_lines cap.
+
+The fix is to stop pinning a pixel height at all and let the engine size the
+box from its own content. `field-sizing: content` makes a textarea size to
+the text it holds, recomputed by the browser on EVERY reflow — including the
+reflow caused by the window changing width, which is precisely the event
+Gradio's JS misses. `height: auto !important` is what allows that: an
+!important rule in a stylesheet outranks the plain (non-important) inline
+height Gradio's resize() sets, so its pixel value never applies and there is
+no need to patch or fight Gradio's JS. Same reasoning for overflow-y, which
+Gradio also sets inline ("scroll") once it thinks the text has outgrown the
+box — with the box now always fitting the text, that scrollbar is never
+wanted.
+
+min-height restates the 2-line floor that gr.Textbox(lines=2) asks for,
+because field-sizing:content sizes from content and ignores the rows
+attribute the `lines` kwarg produces. 2lh is exactly two line boxes at
+whatever line-height ends up computed, plus the theme's own input padding and
+border width, so the arithmetic survives a theme change. There is deliberately
+NO max-height: fitting all of the text is the entire point.
+
+The whole block is wrapped in @supports so an engine without field-sizing
+(Chromium < 123) gets none of it and keeps Gradio's stock behavior instead of
+a broken half-fix. installer.py pins PyQt6-WebEngine 6.9, whose embedded
+Chromium is 130, so the supported path is the one that actually runs here.
+
+Scoped strictly to the two elem_ids set on the prompt boxes above: the
+Thumbnails Gallery below is untouched by these rules, keeps its own fixed
+123px height and one-row horizontal scroller, and its item count still comes
+only from Preferences -> Max Thumbnails Displayed. ─────────────────────── */
+@supports (field-sizing: content) {
+#prompt-positive textarea,
+#prompt-negative textarea {
+field-sizing: content;
+height: auto !important;
+min-height: calc(2lh + (var(--input-padding, 10px) * 2) + (var(--input-border-width, 0px) * 2)) !important;
+max-height: none !important;
+overflow-y: hidden !important;
+}
+}
+
 /* ── Gallery Thumbnails: force contain to prevent clipping ───────────────
 Gradio 6's grid gallery renders each cell as <div class="thumbnail-lg ...">
   <img> inside, with object-fit driven by a `--object-fit` CSS variable that
@@ -1531,144 +1600,77 @@ Gradio 6's grid gallery renders each cell as <div class="thumbnail-lg ...">
     background: var(--background-fill-secondary) !important;
 }
 
-/* ── Gallery: auto horizontal scrollbar, no vertical scroll ──────────────
-overflow-x:auto lets the browser decide — scrollbar appears only when the
-thumbnails actually overflow the container width, and disappears when they
-all fit. This avoids a dead non-interactive track when there are few images.
-overflow-x:scroll would always show the track regardless of content width. ── */
+/* ── Gallery: ALWAYS one row of ALL thumbnails, scrolling sideways ───────
+The requirement: the Thumbnails Gallery is exactly ONE row, it holds every
+image Max Thumbnails Displayed asks for (>=50), and when those are wider than
+the window a horizontal scrollbar appears at the bottom of the row to reach
+the rest. It must NOT reflow, shrink, or drop thumbnails to fit the window —
+its size is fixed and independent of the display size.
+
+Gradio's native grid works against all three points. Its .grid-container is
+`grid-template-columns: repeat(var(--grid-cols), minmax(100px,1fr))` with
+`grid-auto-rows: minmax(100px,1fr)`, driven by the columns=/rows= props. With
+columns=16 and 50 images that is 16 columns x 4 rows: the `1fr` makes every
+column share (and shrink with) the window width, and the surplus images wrap
+onto extra rows. Full-screen it happens to show ~16 in the top row so it
+passes for "one row of 16"; half-screen the same images re-share the smaller
+width, wrap differently, and the extra rows get clipped by overflow-y. That
+is the whole bug.
+
+The fix discards Gradio's column template entirely and rebuilds the grid as a
+single row that flows horizontally:
+  * grid-auto-flow: column      -> new items extend the row rightward, they
+                                   never start a second row.
+  * grid-template-columns: none -> throw away repeat(16, 1fr); no 1fr means
+                                   nothing shares/shrinks with window width.
+  * grid-template-rows: 1fr     -> exactly one explicit row track.
+  * grid-auto-columns: <fixed>  -> every thumbnail cell is a FIXED width, so
+                                   the row's total width = image_count * cell,
+                                   growing past the window when there are many
+                                   images and triggering the scrollbar below.
+The fixed cell width is derived from the row height (minus the .grid-wrap
+8px top+bottom padding, hence -16px) so cells stay roughly square, and it is
+the SAME configure.THUMBNAIL_GALLERY_HEIGHT interpolated for the height pin —
+one constant sizes the whole thing. No 1fr anywhere means window width no
+longer affects the row at all: fixed size, display-independent, as required.
+grid-auto-flow: column is CSS Grid Level 1 (every engine since Chrome 57), so
+unlike the prompt-box field-sizing rule this needs no @supports fallback.
+
+The horizontal scrollbar itself is the .grid-wrap rule: overflow-x:auto shows
+the bar only when the row actually overflows (many images) and hides it when
+everything fits (few images), avoiding a dead track; overflow-y:hidden means
+the row can never grow a second line or a vertical scroll. Pinning .grid-wrap
+height to the same constant keeps the row exactly one thumbnail tall.
+
+None of this reads or caps the image COUNT — that stays entirely with
+_get_recent_images()/get_max_thumbnails() (Max Thumbnails Displayed). However
+many paths that returns, they all land in this one scrolling row. ────────── */
+#output-gallery .grid-container {
+    display: grid !important;
+    grid-auto-flow: column !important;
+    grid-template-columns: none !important;
+    grid-template-rows: 1fr !important;
+    grid-auto-columns: calc(__THUMB_GALLERY_HEIGHT__px - 16px) !important;
+    height: 100% !important;
+}
 #output-gallery .grid-wrap {
+    height: __THUMB_GALLERY_HEIGHT__px !important;
     overflow-x: auto !important;
     overflow-y: hidden !important;
     scrollbar-width: thin !important;      /* Firefox: thin bar when visible */
-}
-
-/* ── Positive/Negative Prompt boxes: predictable box model for the JS
-auto-sizer in _HEAD_JS below. Gradio already grows these textareas on the
-'input' event (typing), sized against `lines`/`max_lines`. The bug this
-fixes is different: when the window is narrower (e.g. snapped to half the
-screen), the *same* text wraps across more visual lines, but nothing the
-user typed fired, so Gradio never recomputes the height and the extra
-wrapped lines are cut off / scroll out of view. The JS below recalculates
-height from scrollHeight whenever the box's on-screen width actually
-changes (window resize, tab switch, snap-to-half-screen, etc.), not just
-on keystrokes. box-sizing:border-box here ensures the padding/border math
-the JS does (via getComputedStyle) lines up with the height it sets. ── */
-#positive-prompt-tb textarea,
-#negative-prompt-tb textarea {
-    box-sizing: border-box !important;
-    resize: none !important;
 }
 """
     # Substitute the preview-box height placeholder with the single shared
     # constant (configure.PREVIEW_IMAGE_HEIGHT) — same value used for the
     # gr.Image(height=...) kwarg, so the two can never drift apart again.
     _css = _css.replace("__PREVIEW_IMG_HEIGHT__", str(configure.PREVIEW_IMAGE_HEIGHT))
+    # Same single-source pattern for the Thumbnails Gallery row height: this
+    # one constant feeds BOTH the gr.Gallery(height=...) kwarg above AND the
+    # #output-gallery height/thumbnail-width CSS here, so the row height and
+    # the derived square cell size can never drift apart.
+    _css = _css.replace("__THUMB_GALLERY_HEIGHT__", str(configure.THUMBNAIL_GALLERY_HEIGHT))
 
-    # ── Prompt-box reflow fix ──────────────────────────────────────────────
-    # See the CSS comment above #positive-prompt-tb/#negative-prompt-tb for
-    # the root cause. Short version: Gradio auto-grows a Textbox's height
-    # only in response to the 'input' event, keyed off *character* content,
-    # not off how many visual lines that content currently wraps to. Resize
-    # the browser (e.g. snap the window to half the screen) and the same
-    # text now wraps across more lines, but no 'input' event fires, so the
-    # box never regrows and the extra lines overflow out of view.
-    #
-    # This script recomputes each textarea's height from its scrollHeight
-    # any time its own on-screen box actually changes size (ResizeObserver),
-    # which fires on window resize, half-screen snapping, tab switches,
-    # etc. — not just on typing. It is capped at the same max_lines=10 used
-    # on the Python side, matching Gradio's own cap, so it never grows
-    # unbounded; past that it scrolls internally like Gradio's own textarea
-    # does.
-    _PROMPT_MAX_LINES = 10
-    _HEAD_JS = f"""
-<script>
-(function() {{
-  var PROMPT_IDS = ['positive-prompt-tb', 'negative-prompt-tb'];
-  var MAX_LINES = {_PROMPT_MAX_LINES};
-  // Last observed wrapper width per id. Setting the textarea's own height
-  // inside a ResizeObserver callback changes that same box's size again,
-  // which re-queues another notification in the SAME observation cycle --
-  // browsers detect this and log "ResizeObserver loop completed with
-  // undelivered notifications" (harmless, but noisy). We avoid ever
-  // re-triggering by (a) only reacting when WIDTH changed, since our own
-  // mutation only ever changes height, and (b) doing the actual style
-  // mutation on the next animation frame, after the observer's current
-  // notification cycle has already finished, rather than synchronously
-  // inside the callback.
-  var lastWidth = {{}};
-
-  function resize(ta) {{
-    if (!ta) return;
-    var cs = window.getComputedStyle(ta);
-    var lineHeight = parseFloat(cs.lineHeight);
-    if (!lineHeight || isNaN(lineHeight)) lineHeight = 20;
-    var extra = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)
-              + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
-    var maxHeight = lineHeight * MAX_LINES + extra;
-
-    ta.style.height = 'auto';
-    var needed = ta.scrollHeight;
-    if (needed > maxHeight) {{
-      ta.style.height = maxHeight + 'px';
-      ta.style.overflowY = 'auto';
-    }} else {{
-      ta.style.height = needed + 'px';
-      ta.style.overflowY = 'hidden';
-    }}
-  }}
-
-  function findTextarea(id) {{
-    var wrap = document.getElementById(id);
-    return wrap ? wrap.querySelector('textarea') : null;
-  }}
-
-  function autoSizeAll() {{
-    PROMPT_IDS.forEach(function(id) {{ resize(findTextarea(id)); }});
-  }}
-
-  function attachObservers() {{
-    var observed = false;
-    PROMPT_IDS.forEach(function(id) {{
-      var wrap = document.getElementById(id);
-      if (!wrap) return;
-      var ro = new ResizeObserver(function(entries) {{
-        entries.forEach(function(entry) {{
-          var width = entry.contentRect.width;
-          if (lastWidth[id] === width) return;   // height-only change: skip
-          lastWidth[id] = width;
-          var ta = wrap.querySelector('textarea');
-          window.requestAnimationFrame(function() {{ resize(ta); }});
-        }});
-      }});
-      ro.observe(wrap);
-      observed = true;
-    }});
-    return observed;
-  }}
-
-  // Gradio mounts asynchronously; keep trying until the boxes exist, then
-  // do one initial sizing pass and attach the resize observers.
-  var tries = 0;
-  var interval = setInterval(function() {{
-    tries += 1;
-    if (attachObservers() || tries > 100) {{
-      clearInterval(interval);
-      autoSizeAll();
-    }}
-  }}, 200);
-
-  // Belt-and-suspenders: also catch plain window resizes directly.
-  var resizeTimer = null;
-  window.addEventListener('resize', function() {{
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(autoSizeAll, 80);
-  }});
-}})();
-</script>
-"""
-
-    with gr.Blocks(title="Image-Gradio-Gguf", head=_HEAD_JS) as app:
+    with gr.Blocks(title="Image-Gradio-Gguf") as app:
         gr.Markdown("# Image-Gradio-Gguf")
 
         # ── Tabs ──────────────────────────────────────────────────────────────

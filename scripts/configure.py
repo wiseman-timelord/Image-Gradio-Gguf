@@ -361,6 +361,19 @@ STATUS_BAR_KEY: str = "status"
 # rather than hardcoding the pixel value a second time.
 PREVIEW_IMAGE_HEIGHT: int = 500
 
+# Thumbnails Gallery row height (pixels). Single source of truth, same
+# pattern as PREVIEW_IMAGE_HEIGHT above: used BOTH for the gr.Gallery(
+# height=...) kwarg in display.py AND interpolated into the #output-gallery
+# CSS in the same file (which carries !important and would otherwise silently
+# override the Python kwarg). The per-thumbnail cell WIDTH is derived from
+# this value in the CSS via calc(), so the gallery stays exactly one row of
+# roughly-square thumbnails and this one number is all that ever needs
+# changing to resize it. Note this is the row HEIGHT only — it does NOT cap
+# how many thumbnails appear; that is Max Thumbnails Displayed (see
+# MAX_THUMBNAIL_CHOICES / get_max_thumbnails above), and the row scrolls
+# horizontally to reach the ones past the window edge.
+THUMBNAIL_GALLERY_HEIGHT: int = 123
+
 # ---------------------------------------------------------------------------
 # Qt app-window geometry (persisted across sessions by launcher.py)
 # ---------------------------------------------------------------------------
