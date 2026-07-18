@@ -133,6 +133,23 @@ def _browse_file(file_types: Optional[List[Tuple[str, str]]] = None) -> str:
         return ""
 
 
+def _open_output_folder() -> str:
+    """Open a native Windows Explorer window on .\\output.
+
+    explorer.exe routinely exits with a non-zero code even on a fully
+    successful launch (e.g. if a window for that folder was already open),
+    so success/failure is judged by whether Popen could start the process
+    at all, not by its return code — checking the return code would flag
+    normal explorer behaviour as an error.
+    """
+    out_dir = configure.get_output_dir()
+    try:
+        subprocess.Popen(["explorer", str(out_dir)])
+        return f"Opened folder: {out_dir}"
+    except Exception as e:
+        return f"ERROR: could not open output folder: {e}"
+
+
 def _backend_choices() -> List[str]:
     return configure.get_backend_choices()["all_choices"]
 
@@ -509,7 +526,15 @@ def _build_generate_tab_inner() -> None:
     # solely via full rescans (_get_recent_images), never a per-call image
     # list. Clicking a thumbnail here updates the preview box above — it does
     # not show generation progress, and it is not itself the preview.
-    gr.Markdown("### Thumbnails Gallery")
+    # Styled as a gr.Button rather than gr.Markdown so it is clickable: a
+    # click opens a native Windows Explorer window on .\output (see
+    # _open_output_folder / the click wiring in _wire_generate_events).
+    # CSS in build_app() (#thumbnails-gallery-link) strips all button chrome
+    # so it still reads as a plain "### Thumbnails Gallery" heading.
+    _gen["thumbnails_link"] = gr.Button(
+        "Thumbnails Gallery (open)",
+        elem_id="thumbnails-gallery-link",
+    )
     # One row, always, holding ALL of Max Thumbnails Displayed (>=50) images,
     # with a horizontal scrollbar to reach the ones past the window edge. The
     # actual single-row / fixed-thumbnail-width / horizontal-overflow layout
@@ -837,6 +862,12 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         _gen["preset_dd"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
+    )
+
+    _gen["thumbnails_link"].click(
+        _open_output_folder,
+        inputs=[],
+        outputs=status_box,
     )
 
     def on_gallery_select(evt: gr.SelectData):
@@ -1482,6 +1513,27 @@ font-weight: 700 !important;
 font-size: 1rem !important;
 }
 #exit-btn:hover { background: #c0392b !important; }
+
+/* ── Thumbnails Gallery heading, made clickable ───────────────────────────
+This is a gr.Button standing in for what used to be a plain
+gr.Markdown("### Thumbnails Gallery") heading, so it can open an Explorer
+window on .\\output when clicked (see _open_output_folder / the click
+wiring in _wire_generate_events). Every rule below exists purely to strip
+Gradio's button chrome back off so it still looks like inert heading text
+until the user's cursor says otherwise. !important is needed throughout
+because the theme's own button rules are otherwise more specific. ────────── */
+#thumbnails-gallery-link {
+all: unset !important;
+display: inline-block !important;
+font-size: 1.25rem !important;
+font-weight: 600 !important;
+line-height: 1.6 !important;
+color: var(--body-text-color) !important;
+cursor: pointer !important;
+margin: 0 !important;
+padding: 0 !important;
+}
+#thumbnails-gallery-link:hover { text-decoration: underline !important; }
 
 /* ── Preview box: the box height is driven by configure.PREVIEW_IMAGE_HEIGHT
 (see the __PREVIEW_IMG_HEIGHT__px placeholder below, substituted once at the
