@@ -57,8 +57,8 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 
 ### Models (basic):
 I put Q# because it should support any quantization, the model variety will be expanded upon later....
-- First you need an encoding model, get "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf" from here [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF).
-- Second you need an image generation model, get "z_image_turbo-Q#.gguf" from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF)
+- First you need an encoding model, get "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf" from here [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF). The encoder should be a Qwen3 4b Q4 or something of that level.
+- Second you need an image generation model, get "z_image_turbo-Q#.gguf" from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF). The image generation model should be the highest quantization you can fit on your GPU. The filesize does not represent the loaded/operating size. Ask AI which is the largest quantization of said url Provided gguf model, that will safely load on your specified GPU, and download that one, there is also diffuser split to consider for a little more space in VRAM, I would.
 - Third the "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, use it with all z-image-turbo image generation model variants.
 
 ### Models (advanced):
@@ -101,6 +101,7 @@ Currently...
 - If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, I cant remember the exact prompt, but you can compare it to my picture of a Woodch uck standing next to a pile of wood and juggling small logs of wood.
 
 ### Notation:
+- If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...there are such things to consider when it tells you it ran out of ram.
 - The assessment by OPUS said, the reason why I could not fit Q4 ImageGen model with DP on Full while could fit Q8 ImageGen model with DP on Split, is because the difference between DP on Split or FUll, is up to 4.6GB extra on top. Keep in mind the models are done in 1-shot mode not m-lock.
 - Something to consider is how much memory the Image model takes, image models need more space when loaded compared to a text model, if yo uneed more room for the image model then try Diffuser Placement is set to Split. So some tweaking settings may be requried with low VRAM. 
 - If you have older hardware, then I strongly advise generating 256x256 images unless you need them larger, as optimally 256x256 will take little time compared to 512x512 images. This is not such a problem if you have newer/expensive hardware. 
