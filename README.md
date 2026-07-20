@@ -153,7 +153,7 @@ Development is somewhat stopped for now due to having implemented, z-image-turbo
 - Flux 2 model variants, possibly ungated or reinforced.
 
 ### Structure:
-- Plan for scripts is...
+- Scripts structure is...
 ```
 Image-Gradio-Gguf/
 ├── Image-Gradio-Gguf.bat      # Windows launcher batch file
