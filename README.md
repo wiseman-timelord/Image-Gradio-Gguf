@@ -61,15 +61,21 @@ I put Q# because it should support any quantization, the model variety will be e
 - Second you need an image generation model, get "z_image_turbo-Q#.gguf" from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF). The image generation model should be the highest quantization you can fit on your GPU. The filesize does not represent the loaded/operating size. Ask AI which is the largest quantization of said url Provided gguf model, that will safely load on your specified GPU, and download that one.
 - Third the "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, use it with all z-image-turbo image generation model variants. One is also able to split this to CPU, for a little more space in VRAM, I do, but you might not if you had 12GB+ VRAM.
 
-### Models (advanced z-image-turbo):
-- Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+### Models
+
+All encoders and image models are **GGUF** — on [HuggingFace](https://huggingface.co) look for the GGUF builds (any quantization, shown here as `Q#`). Each family also needs one `.safetensors` VAE, downloaded once.
+
+**Encoder rule:** the encoder size must match the image model — Qwen3-**4B** for Z-Image-Turbo and Flux.2-klein-**4B**, Qwen3-**8B** for Flux.2-klein-**9B**. The program auto-detects this and warns on a mismatch. One Qwen3-4B encoder serves both Z-Image-Turbo and klein-4B. Qwen3-VL models work as text-only encoders (no mmproj needed); Qwen2.5 encoders are **not** compatible with Flux.2.
+
+#### Z-Image-Turbo
+Encoders — Qwen3-4B:
 ```
 Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
 Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
-Qwen3-8b-erotic-heretic-Q#.gguf
-Qwen3-8B-Gemini-2.5-Flash-Uncensored-Q#.gguf
+qwen_3_4b.Q#.gguf              (plain Qwen3-4B)
+Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
 ```
-- Image Generation Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+Image models:
 ```
 z_image_turbo-Q#.gguf
 darkBeastMar1526Latest_dbzit8SDAFOK-Q#.gguf
@@ -81,43 +87,44 @@ zImageTurboAnime_v10-Q#.gguf
 zImageTurboNSFW_60BF16Diffusion-Q#.gguf
 zImageTurboNSFW_61BF16Diffusion-Q#.gguf
 ```
-- ae.safetensors, you still going to need that from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) 
+VAE — from [Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF):
 ```
 ae.safetensors
 ```
 
-### Models (advanced flux 2 4b):
-- Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+#### Flux.2-klein 4B
+Encoders — Qwen3-4B (same set as Z-Image-Turbo):
 ```
-Qwen3-4b-Z-Image-Turbo-Abliterated*      (also works for Z-Image-Turbo)
-Qwen3-4b-Uncensored-Z-Image-Engineer-V4  (also works for Z-Image-Turbo)
-Qwen3-VL-4B*        (VL model used text-only; no mmproj needed)
-qwen_3_4b           (plain Qwen3-4B, ComfyUI/sd.cpp naming)
+Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
+Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
+qwen_3_4b.Q#.gguf              (plain Qwen3-4B)
+Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
 ```
-- Image Generation Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+Image models:
 ```
-flux-2-klein-4b           Qwen3-4B                 2560
-flux-2-klein-base-4b      Qwen3-4B                 2560
+flux-2-klein-4b-Q#.gguf
+flux-2-klein-base-4b-Q#.gguf
 ```
-- diffusion_pytorch_model.safetensors, you still going to need that from [Vanilla FLUX.2-klein-4B -GGUF](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) 
+VAE — the `vae/` file from [FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B):
 ```
 diffusion_pytorch_model.safetensors
 ```
 
-### Models (advanced flux 2 9b):
-- Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+#### Flux.2-klein 9B
+Encoders — Qwen3-8B:
 ```
-Qwen3-4b-Z-Image-Turbo-Abliterated*      (also works for Z-Image-Turbo)
-Qwen3-4b-Uncensored-Z-Image-Engineer-V4  (also works for Z-Image-Turbo)
-Qwen3-VL-4B*        (VL model used text-only; no mmproj needed)
-qwen_3_4b           (plain Qwen3-4B, ComfyUI/sd.cpp naming)
+Qwen3-8b-erotic-heretic-Q#.gguf
+Qwen3-8B-Gemini-2.5-Flash-Uncensored-Q#.gguf
+qwen_3_8b.Q#.gguf              (plain Qwen3-8B)
+qwen3-vl-flux2-8b-Q#.gguf      (VL, text-only)
+Qwen3-VL-8B*.Q#.gguf           (VL, text-only)
 ```
-- Image Generation Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+Image models:
 ```
-flux-2-klein-9b           Qwen3-8B                 4096
-flux-2-klein-base-9b      Qwen3-8B                 4096
+flux-2-klein-9b-Q#.gguf
+flux-2-klein-base-9b-Q#.gguf
 ```
-- diffusion_pytorch_model.safetensors, you still going to need that from [Vanilla FLUX.2-klein-9B -GGUF](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) 
+VAE — the `vae/` file from [FLUX.2-klein-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B):
 ```
 diffusion_pytorch_model.safetensors
 ```
