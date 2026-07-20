@@ -1,6 +1,6 @@
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Gradio-Gguf
-Status: Beta (working but further development possible)
+Status: z-Image-Turbo is working NICE! (soon flux 2)
 - Current Phase v1.19-v1.25 - Z-Image-Turbo support expanded with individual handling of "ae.safetensors". A new a Preferences page. Some fixes/improvements.
 - v1.26-v1.27 - Small but significant improvments. Confirmed some of the Collection models are working.
 - Next Phase ~v1.28+ - Two words "Flux Klein", enabling AI Image Editing. But, must be happy 100% with z-image-turbo performance first, then can just fall-back if its impossible.
@@ -55,13 +55,13 @@ A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder
 - Libraries - Required libraries is handled by the installer script, but they include both, Llama.Cpp and Stable Diffusion.
 - Building - VS 2022 C++, specifically the Desktop Build Tools including CMake. Additionally the Vulkan 1.4 SDK. Additionally Windows 10/11 SDK relevant to your os version.
 
-### Models (basic):
+### Models (basic z-image-turbo):
 I put Q# because it should support any quantization, the model variety will be expanded upon later....
 - First you need an encoding model, get "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf" from here [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF). The encoder should be a Qwen3 4b Q4 or something of that level, we are mainly dealing with the positive/negative prompt, just dont write a book in those boxes.
 - Second you need an image generation model, get "z_image_turbo-Q#.gguf" from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF). The image generation model should be the highest quantization you can fit on your GPU. The filesize does not represent the loaded/operating size. Ask AI which is the largest quantization of said url Provided gguf model, that will safely load on your specified GPU, and download that one.
 - Third the "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, use it with all z-image-turbo image generation model variants. One is also able to split this to CPU, for a little more space in VRAM, I do, but you might not if you had 12GB+ VRAM.
 
-### Models (advanced):
+### Models (advanced z-image-turbo):
 - Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
 ```
 Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
@@ -81,9 +81,45 @@ zImageTurboAnime_v10-Q#.gguf
 zImageTurboNSFW_60BF16Diffusion-Q#.gguf
 zImageTurboNSFW_61BF16Diffusion-Q#.gguf
 ```
-- ae.safetensors,  you still going to need that from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) 
+- ae.safetensors, you still going to need that from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) 
 ```
 ae.safetensors
+```
+
+### Models (advanced flux 2 4b):
+- Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+```
+Qwen3-4b-Z-Image-Turbo-Abliterated*      (also works for Z-Image-Turbo)
+Qwen3-4b-Uncensored-Z-Image-Engineer-V4  (also works for Z-Image-Turbo)
+Qwen3-VL-4B*        (VL model used text-only; no mmproj needed)
+qwen_3_4b           (plain Qwen3-4B, ComfyUI/sd.cpp naming)
+```
+- Image Generation Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+```
+flux-2-klein-4b           Qwen3-4B                 2560
+flux-2-klein-base-4b      Qwen3-4B                 2560
+```
+- diffusion_pytorch_model.safetensors, you still going to need that from [Vanilla FLUX.2-klein-4B -GGUF](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) 
+```
+diffusion_pytorch_model.safetensors
+```
+
+### Models (advanced flux 2 9b):
+- Image Encoder Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+```
+Qwen3-4b-Z-Image-Turbo-Abliterated*      (also works for Z-Image-Turbo)
+Qwen3-4b-Uncensored-Z-Image-Engineer-V4  (also works for Z-Image-Turbo)
+Qwen3-VL-4B*        (VL model used text-only; no mmproj needed)
+qwen_3_4b           (plain Qwen3-4B, ComfyUI/sd.cpp naming)
+```
+- Image Generation Models Supported, find them on [HuggingFace.Co](https://huggingface.co), but be sure to look for the GGUF versions:
+```
+flux-2-klein-9b           Qwen3-8B                 4096
+flux-2-klein-base-9b      Qwen3-8B                 4096
+```
+- diffusion_pytorch_model.safetensors, you still going to need that from [Vanilla FLUX.2-klein-9B -GGUF](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) 
+```
+diffusion_pytorch_model.safetensors
 ```
 
 ### Instructions:
