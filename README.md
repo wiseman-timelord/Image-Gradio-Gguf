@@ -7,8 +7,12 @@ Status: Working
 ### Description
 A local python image generator from prompt using, 1 various compatible Encoders, and 2 choice of either, Z-Image-Turbo-GGUF or Flux-2-Klein-GGUF. This is a super, TXT to IMG and IMG to IMG image, generation project, covering what is possible currently to be most compitent through lightweight GGUF models that can fit on a 8GB GPU, but also scales to larger VRAM if you have that, and of course if you want you can also run it through CPU. The installer compiles for your specific CPU/GPU combo for the BEST speeds in inference you will find out there right now. As you can see it generates OK images, but has the typical issues associated with the libraries/models one would expect. The program uses a separate encoder file (optional but just do it), and it ensures to load this in one-shot mode, ensuring that both models will be loaded individually to the GPU, maxizing the potential size of the Image generation model. All that said, there may be a little learning if you are used to Grok or something of that level of simplicity.
 
+### Output
+- Preferences page, recently created and minimal, but strictly program/interface settings go here (v1.28)...  
+![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/flux_results.jpg)
+
 ### Media
-- Generation page showing a image to image, and other development images. BTW, the red line is not a glitch its SecondLife (v1.28)...  
+- Generation page showing a image to image, and other development images. (v1.28)...  
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/generate_page.jpg)
 
 - Configure page, recently refined/corrected and 1 detail moved to new Preference page (v1.21)...  
@@ -146,6 +150,7 @@ Currently...
 - If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...consider such things when it tells you it ran out of ram.
 - The assessment by OPUS said, the reason why I could not fit Q4 ImageGen model with DP on Full while could fit Q8 ImageGen model with DP on Split, is because the difference between DP on Split or FUll, is up to 4.6GB extra on top. Keep in mind the models are done in 1-shot mode not m-lock.
 - Something to consider is how much memory the Image model takes, image models need more space when loaded compared to a text model, if yo uneed more room for the image model then try Diffuser Placement is set to Split. So some tweaking settings may be requried with low VRAM. 
+- 512x512 on flux 2 may be iffy, however, 512x768 or 768x512, seems to work good, while for me 768x768 will not fit in 8GB VRAM.
 
 ### Development:
 Development is somewhat stopped for now due to having implemented, z-image-turbo (txt-img) and flux 2 (img-img, txt-img), however ideas for improvement will be here...
