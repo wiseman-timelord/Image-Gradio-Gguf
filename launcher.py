@@ -46,6 +46,7 @@ try:
     from PyQt6.QtGui import QIcon
     from PyQt6.QtWidgets import QApplication, QMainWindow
     from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEnginePage
 except ImportError:
     print("ERROR: PyQt6 (and PyQt6-WebEngine) are not installed.")
     print("Run option 2 (Installation) from the batch menu first.")
@@ -113,6 +114,22 @@ class _ExitBridge(QObject):
     close_requested = pyqtSignal()
 
 
+class _QuietPage(QWebEnginePage):
+    """QWebEnginePage that swallows one specific benign console message.
+
+    As the Gradio frontend boots inside the embedded Chromium, QtWebEngine
+    forwards a couple of 'Method not implemented.' console lines — a browser
+    API the embedded engine does not implement, harmless to us since it only
+    affects features we don't use. They are pure noise on the batch console,
+    so we drop exactly those and pass everything else through unchanged (real
+    errors still surface)."""
+
+    def javaScriptConsoleMessage(self, level, message, line, source):  # noqa: N802
+        if "Method not implemented" in str(message):
+            return
+        super().javaScriptConsoleMessage(level, message, line, source)
+
+
 class AppWindow(QMainWindow):
     """A QMainWindow hosting a QWebEngineView, dressed up as a standalone
     desktop app rather than a browser tab. Keeps the native title bar
@@ -137,6 +154,7 @@ class AppWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
 
         self.view = QWebEngineView(self)
+        self.view.setPage(_QuietPage(self.view))
         self.setCentralWidget(self.view)
         self.view.load(QUrl(url))
 

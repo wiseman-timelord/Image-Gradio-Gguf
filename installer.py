@@ -154,11 +154,11 @@ SD_CPP_SOURCE_URL = "https://github.com/leejet/stable-diffusion.cpp.git"
 # changing (the --backend module-assignment syntax replaced the older
 # whole-component flags), so a floating ref can break the program with no
 # local edit. Bump SD_CPP_RELEASE_TAG and LLAMA_CPP_REF together, on purpose.
-SD_CPP_RELEASE_TAG = "master-778-c00a9e9"
+SD_CPP_RELEASE_TAG = "master-782-b290693"
 SD_CPP_REF         = SD_CPP_RELEASE_TAG
 # Release TAG is master-<n>-<sha>, but the ASSET name embeds only master-<sha>.
 # Keep both; they are not derivable from one another.
-SD_CPP_ASSET_STEM  = "master-c00a9e9"
+SD_CPP_ASSET_STEM  = "master-b290693"
 SD_CPP_SOURCE_DIR = "sd_src"      # Short name keeps paths under MAX_PATH for MSBuild FileTracker
 
 LLAMA_BIN_DIR = "data/llama_cpp_binaries"
@@ -497,6 +497,11 @@ _GGML_DEV_RE = re.compile(
     r"\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)\s*$"
 )
 
+# ggml backend-init capability line, e.g.:
+#   ggml_vulkan: 1 = Radeon (TM) RX 470 Graphics (...) | uma: 0 | fp16: 0 | ...
+# Used to record per-GPU fp16 support for Flux.2 flash-attention auto-decision.
+_GGML_FP16_RE = re.compile(r"ggml_vulkan:\s*(\d+)\s*=.*?\bfp16:\s*(\d+)")
+
 
 def probe_ggml_devices(exe: Path) -> List[Dict[str, Any]]:
     """Phase 2. Enumerate GPUs exactly as ggml sees them, by asking it.
@@ -531,6 +536,19 @@ def probe_ggml_devices(exe: Path) -> List[Dict[str, Any]]:
             "vram_total_mb": int(total),
             "vram_free_mb": int(free),
         })
+
+    # Second pass: ggml prints a per-device capability line to stderr on backend
+    # init, e.g. "ggml_vulkan: 1 = <name> (...) | uma: 0 | fp16: 0 | ...". The
+    # fp16 flag decides whether Flux.2 may use --diffusion-fa on that GPU, so
+    # record it per index (missing -> left unset / unknown).
+    fp16_by_index: Dict[int, bool] = {}
+    for line in (proc.stdout + "\n" + proc.stderr).splitlines():
+        fm = _GGML_FP16_RE.search(line)
+        if fm:
+            fp16_by_index[int(fm.group(1))] = (fm.group(2) != "0")
+    for d in devices:
+        if d["index"] in fp16_by_index:
+            d["fp16"] = fp16_by_index[d["index"]]
     return devices
 
 
@@ -593,6 +611,10 @@ def write_constants(cpu: Dict[str, Any], vk: Dict[str, Any],
         cfg["vulkan"][f"gpu{i}_backend"]  = d.get("backend", "Vulkan")
         cfg["vulkan"][f"gpu{i}_vram_mb"]  = str(d.get("vram_total_mb", 0))
         cfg["vulkan"][f"gpu{i}_free_mb"]  = str(d.get("vram_free_mb", 0))
+        # fp16 support (for Flux.2 flash-attention auto-decision). Only written
+        # when ggml actually reported it, so an absent key reads as "unknown".
+        if "fp16" in d:
+            cfg["vulkan"][f"gpu{i}_fp16"] = str(d["fp16"])
         
     with open(_CONST_PATH, "w", encoding="utf-8") as f:
         cfg.write(f)
@@ -667,7 +689,6 @@ def write_default_configuration(cpu: Dict[str, Any],
         "encoder_threads": dt,
         "encoder_batch_size": 512,
         "encoder_ctx_size": 4096,
-        "encoder_flash_attn": True,
         "encoder_gpu_layers": -1,
         # Per-side device indices. Kept separate because the encoder and the
         # diffuser can legitimately sit on different devices (or one on CPU),
@@ -676,9 +697,9 @@ def write_default_configuration(cpu: Dict[str, Any],
         "imagegen_vulkan_device": gpu,
         "imagegen_placement": ("Full GPU" if has_gpu else "Full CPU"),
         "imagegen_threads": dt,
-        "imagegen_width": 256,
-        "imagegen_height": 256,
-        "imagegen_steps": 8,
+        "imagegen_width": 512,
+        "imagegen_height": 512,
+        "imagegen_steps": 6,
         "imagegen_cfg_scale": 1.5,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
@@ -726,6 +747,7 @@ def write_default_preferences() -> None:
     defaults: Dict[str, Any] = {
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
         "max_thumbnails": 50,
+        "encoder_model_debug": False,
     }
     tmp = _PREFS_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
