@@ -149,18 +149,11 @@ Currently...
 - The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3 is the only encoder, but not that old that its naff. 
 
 ### Development:
-Development is somewhat stopped for now due to, v1 done (working + nice) and funding issues, in the mean time you could check out my donation/sponsorship links on profile page, but there are still some improvements possible/planned...
-- New Models Options for Z-Image-Turbo - https://huggingface.co/BigDannyPt/Z-Image-Turbo-GGUF-Collection
-- Moved from notation.
-```
-more models supported for Flux Klein integration will be attempted after that, though this will be highly experimental, because I think it needs comfy UI, so will attempt to integrate it, but advanced features will possibly be limited, it may be generation only, or I may be able to have dynamic interface depending upon if using flux or z-image. We will see. I just want to get it working here, before I integrate it into my Agentic framework project, as a cheat sheet. Possibly I can just use the encoders here "Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF", for both, I have that encoder anyhow, downloading the Flux model "https://huggingface.co/unsloth/FLUX.2-klein-9B-GGUF" now. Start tomorrow. What I am hoping for, AI image editing and possibly better image generation, however Flux are models with guardrails, so both have their purposes. Oh, also I will test/fix the installer, hoping it works currently. 
-```
-- Attempting Flux Klein with flux encoder, this involves new panel for flux, but also hardcoding of common values to known good settings for most in order to decomplicate what would otherwise be the Comfy-UI, hence with reduced inputs we would have a functional image generation and editing, where the user may associate an image with their prompt, and then for example use the flux image to text encoder with the flux model and a prompt from the user to create filtered image, ie "Change the background to beaches, keep pose and central character, but put light brown shorts and t-shirt on the character".
-- Done all noted improvements, though possibly will still noticinmg things that can be improved, see recent releases.
-- Add AI edit image feature, ie outpaint, etc. Requires Flux-Klein support because Z-image-turbo only supports generation and not editing. The UI woudl also require a rethink, ie what are the options and how am I going to fit them in. It would also need a Qwen 3 Flux Klein Encoder. If you would like to see the project reach "add image editing via SD Klein and Qwen3 for SD", then please support via sponsor/donate via kofi/patreon, otherwise development may grind to a halt here at some unexpected point.
+Development is somewhat stopped for now due to having implemented, z-image-turbo (txt-img) and flux 2 (img-img, txt-img), however ideas for improvement will be here...
+- Flux 2 model variants, possibly ungated or reinforced.
 
 ### Structure:
-- Current plan for scripts is...
+- Plan for scripts is...
 ```
 Image-Gradio-Gguf/
 ├── Image-Gradio-Gguf.bat      # Windows launcher batch file
