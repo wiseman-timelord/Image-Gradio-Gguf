@@ -70,16 +70,44 @@ ENCODER_VOCAB_SIZE = 151936    # same for both
 # differs, so it is the field that tells you which family you are looking at
 # if you ever dump GGUF metadata by hand.
 ENCODER_FAMILIES: Dict[str, Dict[str, Any]] = {
+    # Qwen3-VL variants used as TEXT encoders. sd.cpp's --llm (and llama.cpp's
+    # llama-completion) load only the language backbone of a VL gguf; the vision
+    # tower lives in a SEPARATE mmproj file, so passing the base *.gguf WITHOUT
+    # an mmproj means vision never activates and no mmproj is loaded or
+    # requested -- the model behaves as a plain Qwen3 text encoder. Its text
+    # backbone IS the same Qwen3 architecture (and hidden dim) as the dense
+    # model of the same size, so klein-9B pairs with a VL-8B backbone (4096) and
+    # Z-Image / klein-4B with a VL-4B backbone (2560). These entries exist so
+    # the enhance step and -ngl resolution know the specs; the compatibility
+    # check still trusts the gguf's own embedding_length over this table.
+    # (Confirmed by sd.cpp's Krea2 guide, which drives --llm Qwen3-VL-4B with no
+    # mmproj.) These MUST precede the plain entries: a VL filename such as
+    # "qwen3-vl-flux2-8b" carries "flux2" but is an ENCODER, and the "vl" token
+    # is what distinguishes it.
+    "qwen3-vl-8b": {
+        "label": "Qwen3-VL-8B (text backbone)",
+        "pattern": r"qwen[-_. ]?3[-_. ]?vl.*?8[-_. ]?b(?![a-z0-9])",
+        "layers": 36,
+        "embedding_length": 4096,
+        "max_context": 40960,
+    },
+    "qwen3-vl-4b": {
+        "label": "Qwen3-VL-4B (text backbone)",
+        "pattern": r"qwen[-_. ]?3[-_. ]?vl.*?4[-_. ]?b(?![a-z0-9])",
+        "layers": 36,
+        "embedding_length": 2560,
+        "max_context": 40960,
+    },
     "qwen3-8b": {
         "label": "Qwen3-8B",
-        "pattern": r"qwen3[-_. ]?8[-_. ]?b(?![a-z0-9])",
+        "pattern": r"qwen[-_. ]?3[-_. ]?8[-_. ]?b(?![a-z0-9])",
         "layers": 36,
         "embedding_length": 4096,
         "max_context": 40960,
     },
     "qwen3-4b": {
         "label": "Qwen3-4B",
-        "pattern": r"qwen3[-_. ]?4[-_. ]?b(?![a-z0-9])",
+        "pattern": r"qwen[-_. ]?3[-_. ]?4[-_. ]?b(?![a-z0-9])",
         "layers": 36,
         "embedding_length": 2560,
         "max_context": 40960,
@@ -146,6 +174,259 @@ DIFFUSER_PLACEMENT_CHOICES: List[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Diffuser FAMILY  (Z-Image-Turbo vs Flux.2-Klein)  --  the whole flux.2 story
+# ---------------------------------------------------------------------------
+# This program drives exactly two diffusion families through sd.cpp, and every
+# per-family difference (which VAE, which encoder size, which cfg/step defaults,
+# which extra CLI flags, which Settings panel to show) hangs off this one
+# discriminator. Adding a third family later means adding one dict entry here
+# plus the matching branch in inference.generate_image(), nothing more.
+#
+# BOTH families condition through a Qwen3 LLM passed as sd.cpp's --llm and reach
+# pixels through a --vae; neither uses CLIP or T5. What differs:
+#
+#   Z-Image-Turbo (Tongyi-MAI, arch `lumina2`, 6B S3-DiT)
+#       encoder : Qwen3-4B  (hidden 2560) -- the ONLY size that fits; the DiT's
+#                 text projection is built for 2560-dim input, so a Qwen3-8B
+#                 (4096) mismatches exactly the way Flux.2-klein-4B rejects an
+#                 8B encoder. (The old note in this file claiming 8B works for
+#                 Z-Image was wrong; Tongyi-MAI themselves say use the coupled
+#                 Qwen3-4B.)
+#       vae     : ae.safetensors  (the Flux.1 VAE Z-Image reuses)
+#
+#   Flux.2-Klein (Black-Forest-Labs, arch `flux`/`flux2`)
+#       klein-4B / klein-base-4B : encoder Qwen3-4B (2560), vae flux2_ae
+#       klein-9B / klein-base-9B : encoder Qwen3-8B (4096), vae flux2_ae
+#       image-to-image / editing : native, via sd.cpp -r <ref.png> (repeatable),
+#                                  NO vision model needed -- the reference image
+#                                  goes straight into the pipeline.
+#       distilled  (klein / klein-9b)      : cfg 1.0, ~4 steps
+#       base       (klein-base / *-base-*) : cfg 4.0, ~20 steps
+#
+# So a single Qwen3-4B encoder serves BOTH Z-Image and klein-4B; only klein-9B
+# needs the 8B. There are, in effect, just two encoder "slots".
+# ---------------------------------------------------------------------------
+DIFFUSER_FAMILY_ZIMAGE = "z-image"
+DIFFUSER_FAMILY_FLUX2  = "flux2"
+
+# Reference-image input formats sd.cpp can decode. sd.cpp loads -r images via
+# stb_image, which handles PNG, JPEG (baseline+progressive), BMP (non-RLE),
+# TGA, GIF, PSD, HDR and PNM/PPM/PGM. Every common photo format the user is
+# likely to hand us (png/jpg/bmp) is in that set, so NO external converter
+# (nconvert etc.) is warranted -- we simply refuse, with a clear message,
+# anything stb_image cannot read (WEBP, AVIF, HEIC/HEIF, TIFF, JPEG-2000).
+# Note WebP is an OUTPUT-only format in sd.cpp (libwebp encode), not decodable
+# as an input here. Extensions are compared lowercased, leading dot included.
+SUPPORTED_REF_IMAGE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".gif",
+    ".psd", ".hdr", ".pic", ".pnm", ".ppm", ".pgm",
+}
+
+# Encoder hidden_size per Qwen3 size, and the size each diffuser demands. The
+# check in inference.check_model_compatibility() is a dimension comparison, not
+# a name guess: GGUF `*.embedding_length` (already read by _probe_gguf) gives
+# 2560 for Qwen3-4B and 4096 for Qwen3-8B directly.
+ENCODER_DIM_QWEN3_4B = 2560
+ENCODER_DIM_QWEN3_8B = 4096
+
+# general.architecture (lowercased, exact) -> family. Klein GGUFs report `flux`
+# or `flux2`; Z-Image and its finetunes report `lumina2`.
+DIFFUSER_FLUX2_ARCH:  List[str] = ["flux2", "flux"]
+DIFFUSER_ZIMAGE_ARCH: List[str] = ["lumina2"]
+
+# Filename/folder patterns (re.search, lowercased) for when arch is unreadable.
+# Flux2 is checked FIRST: a "flux-2-klein" name must not fall through to the
+# z-image bucket. These are a strict subset of DIFFUSION_NAME_PATTERNS split by
+# family -- the "flux"/"klein" tokens go to flux2, everything Z-Image to zimage.
+DIFFUSER_FLUX2_NAME_PATTERNS: List[str] = [
+    r"flux[-_. ]?2",
+    r"flux[-_. ]?klein",
+    r"\bklein\b",
+]
+DIFFUSER_ZIMAGE_NAME_PATTERNS: List[str] = [
+    r"z[-_. ]?image",
+    r"zit[-_. ]?v?\d",
+    r"\bzit\b",
+    r"dark[-_. ]?beast",
+    r"event[-_. ]?horizon",
+    r"perfeczion",
+    r"smooth[-_. ]?mix",
+    r"turbo",
+]
+
+# VAE name patterns per family. flux2's VAE frequently downloads from the BFL
+# repo as the generic "diffusion_pytorch_model.safetensors" (identifies
+# nothing), so flux2 auto-detection legitimately misses and the user points at
+# it by hand -- display.py blanks the VAE box on a cross-family switch for
+# exactly this reason. Z-Image's ae.safetensors is reliably named.
+#
+# NOTE the z-image pattern is boundaried so it matches "ae.safetensors" but NOT
+# "flux2_ae" (underscore is a word char, so a bare \bae\b would never have fired
+# on flux2_ae anyway -- this is also the fix for that latent miss).
+VAE_ZIMAGE_NAME_PATTERNS: List[str] = [
+    r"(?<![a-z0-9])ae(?![a-z0-9_])",
+]
+VAE_FLUX2_NAME_PATTERNS: List[str] = [
+    r"flux[-_. ]?2[-_. ]?ae",
+    r"flux[-_. ]?2[-_. ]?vae",
+    r"flux2ae",
+]
+
+DIFFUSER_FAMILY_LABELS: Dict[str, str] = {
+    DIFFUSER_FAMILY_ZIMAGE: "Z-Image-Turbo",
+    DIFFUSER_FAMILY_FLUX2:  "Flux.2-Klein",
+}
+
+# What each family's VAE box should say it wants, shown as the box's info hint.
+DIFFUSER_VAE_HINTS: Dict[str, str] = {
+    DIFFUSER_FAMILY_ZIMAGE: "Z-Image expects ae.safetensors (the Flux.1 VAE).",
+    DIFFUSER_FAMILY_FLUX2:  ("Flux.2 expects flux2_ae "
+                             "(often downloaded as diffusion_pytorch_model.safetensors)."),
+}
+
+# Per-family generation defaults for the distilled (fast) and base variants.
+# Used by display.py to seed the correct Settings panel and by inference.py as
+# fall-backs. Z-Image-Turbo keeps its existing turbo defaults elsewhere.
+FLUX2_DISTILLED_DEFAULTS: Dict[str, Any] = {
+    "imagegen_cfg_scale": 1.0, "imagegen_steps": 4, "imagegen_sampling": "euler",
+}
+FLUX2_BASE_DEFAULTS: Dict[str, Any] = {
+    "imagegen_cfg_scale": 4.0, "imagegen_steps": 20, "imagegen_sampling": "euler",
+}
+
+
+def diffuser_family(name: str, arch: str = "") -> Optional[str]:
+    """Return DIFFUSER_FAMILY_FLUX2 / DIFFUSER_FAMILY_ZIMAGE / None.
+
+    Architecture metadata wins when present (same policy as classify_model());
+    filename+folder patterns are the fallback. Flux2 is tested before Z-Image.
+    `name` may be a bare filename or a full path; matching is case-insensitive.
+    """
+    a = str(arch).strip().lower()
+    if a:
+        if a in DIFFUSER_FLUX2_ARCH:
+            return DIFFUSER_FAMILY_FLUX2
+        if a in DIFFUSER_ZIMAGE_ARCH:
+            return DIFFUSER_FAMILY_ZIMAGE
+    low = str(name).lower()
+    for pat in DIFFUSER_FLUX2_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_FLUX2
+    for pat in DIFFUSER_ZIMAGE_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_ZIMAGE
+    return None
+
+
+def diffuser_family_label(name: str, arch: str = "") -> str:
+    """Human label for a diffuser, or 'no model selected' when unrecognised."""
+    fam = diffuser_family(name, arch)
+    return DIFFUSER_FAMILY_LABELS.get(fam, "no model selected")
+
+
+def is_flux2_base_variant(name: str) -> bool:
+    """True for klein-base checkpoints (higher cfg / more steps), False for the
+    distilled klein. `base` appears in the filename of every base variant."""
+    return bool(re.search(r"\bbase\b|[-_.]base[-_.]", str(name).lower()))
+
+
+def flux2_size_dim(name: str) -> Optional[int]:
+    """Required encoder hidden dim for a Flux.2-klein diffuser, from its size
+    token: klein-4B -> 2560 (Qwen3-4B), klein-9B -> 4096 (Qwen3-8B).
+    Returns None if no clean 4b/9b token is present."""
+    m = re.search(r"(?<![a-z0-9])(\d{1,2})b(?![a-z0-9])", str(name).lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    if n == 4:
+        return ENCODER_DIM_QWEN3_4B
+    if n == 9:
+        return ENCODER_DIM_QWEN3_8B
+    return None
+
+
+def required_encoder_dim(diffuser_name: str, diffuser_arch: str = "") -> Optional[int]:
+    """The encoder hidden dim a given diffuser demands, or None if unknown.
+
+    Z-Image-Turbo -> 2560 (Qwen3-4B). Flux.2-klein -> 2560 for 4B, 4096 for 9B.
+    None means "cannot tell" (unrecognised family, or a flux2 file with no
+    parseable size) -- callers treat None as "skip the check", never as a
+    mismatch, so an oddly-named file is allowed through rather than blocked.
+    """
+    fam = diffuser_family(diffuser_name, diffuser_arch)
+    if fam == DIFFUSER_FAMILY_ZIMAGE:
+        return ENCODER_DIM_QWEN3_4B
+    if fam == DIFFUSER_FAMILY_FLUX2:
+        return flux2_size_dim(diffuser_name)
+    return None
+
+
+def encoder_dim_from_spec(name: str) -> Optional[int]:
+    """Encoder hidden dim from the filename's Qwen3 family, or None.
+
+    Fallback for when GGUF `embedding_length` metadata is unavailable;
+    inference.py reads the metadata first and only calls this if it is missing.
+    """
+    spec = get_encoder_family_spec(name)
+    if spec:
+        try:
+            return int(spec["embedding_length"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def vae_family(name: str) -> Optional[str]:
+    """Which family a VAE filename belongs to, or None if it identifies nothing
+    (e.g. flux2's generic diffusion_pytorch_model.safetensors)."""
+    low = str(name).lower()
+    for pat in VAE_FLUX2_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_FLUX2
+    for pat in VAE_ZIMAGE_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_ZIMAGE
+    return None
+
+
+def flux2_flash_attn_for(cfg: Dict[str, Any]) -> bool:
+    """Decide whether a Flux.2 run should pass --diffusion-fa, automatically,
+    from the selected diffuser GPU's fp16 capability — no user toggle.
+
+    sd.cpp's Vulkan flash attention needs device fp16; on a GPU that reports
+    fp16:0 (e.g. RX 470 / Polaris) it silently garbles output, which is the bug
+    this replaces the old checkbox for. Rules:
+      * Diffuser on CPU (no Vulkan backend): fp16 is a GPU concern, so keep FA
+        on (it still trims memory and does not garble on CPU).
+      * Diffuser on a Vulkan device: FA on only if that device supports fp16.
+      * fp16 unknown (detection not re-run since this was added): default OFF,
+        the safe choice — an fp16-capable card merely loses a little VRAM
+        headroom until the installer's detect pass records gpu<N>_fp16 in
+        constants.ini (see installer.probe_ggml_devices).
+    """
+    placement = parse_diffuser_placement(
+        cfg.get("imagegen_placement", DIFFUSER_PLACEMENT_FULL_GPU))
+    if not placement.get("use_vulkan_backend"):
+        return True
+    try:
+        dev = int(cfg.get("imagegen_vulkan_device", -1))
+    except (TypeError, ValueError):
+        dev = -1
+    return bool(device_supports_fp16(dev))
+
+
+def device_supports_fp16(dev: int) -> Optional[bool]:
+    """fp16 capability for a ggml Vulkan device index, from what the installer
+    detected and recorded per device in constants.ini (gpu<N>_fp16), read back
+    via get_vulkan_info(). Returns None when the device was not recorded (e.g.
+    detection has not been re-run since this feature was added); callers treat
+    None as 'no'. Re-run the installer's detect-only pass to populate it."""
+    for d in get_vulkan_info().get("devices", []):
+        if d.get("index") == dev and d.get("fp16") is not None:
+            return bool(d["fp16"])
+    return None
+
+# ---------------------------------------------------------------------------
 # Model family identification
 # ---------------------------------------------------------------------------
 # Single source of truth for "what kind of model is this file?". Consumed by
@@ -185,8 +466,8 @@ DIFFUSER_PLACEMENT_CHOICES: List[str] = [
 # Exact, because "qwen_image" is a DIFFUSION arch while "qwen3" is an ENCODER
 # arch -- a substring test for "qwen" would put the diffuser in the wrong bin.
 ENCODER_ARCHITECTURES: List[str] = [
-    "qwen3", "qwen3moe", "qwen2", "qwen2vl", "llama", "gemma3",
-    "mistral", "phi3", "t5", "t5encoder", "umt5", "clip",
+    "qwen3", "qwen3moe", "qwen3vl", "qwen3vlmoe", "qwen2", "qwen2vl",
+    "llama", "gemma3", "mistral", "phi3", "t5", "t5encoder", "umt5", "clip",
 ]
 
 DIFFUSION_ARCHITECTURES: List[str] = [
@@ -296,7 +577,35 @@ SAMPLER_MAP: Dict[str, str] = {
 # without telling the UI, so the dropdown would show one value while the
 # actual output used another. Restricting the choices to confirmed-safe,
 # already-64-aligned values eliminates that mismatch entirely.
-IMAGE_SIZES       = [256, 512, 768, 1024]
+IMAGE_SIZES       = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+
+# Per-family width/height choices (both axes share a list). All multiples of
+# 256 within each family's usable band:
+#   * Flux.2 klein is ~1024-native and visibly degrades below 512 (confirmed in
+#     testing — sub-512 output goes mushy/semi-garbled), so its floor is 512.
+#     Black Forest Labs' documented ceiling is 4MP (2048x2048); they recommend
+#     staying at or below ~2MP (~1536) for best quality/speed, but the hard max
+#     is 2048, so a big-VRAM card can use it.
+#   * Z-Image-Turbo is also 1024-native, tolerates smaller sizes (256 floor),
+#     and Tongyi-MAI report anything up to 2048 is fine — same 2048 ceiling.
+# _generate_family_updates() swaps the width/height dropdowns to the matching
+# list when a model is selected, keeping a currently-valid value and only
+# snapping an out-of-band one to a sensible default. VRAM, not this list, is the
+# practical limit at the top end (2048 forces heavy CPU-offload on 8GB).
+FLUX2_IMAGE_SIZES  = [512, 768, 1024, 1280, 1536, 1792, 2048]
+ZIMAGE_IMAGE_SIZES = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
+
+FAMILY_IMAGE_SIZES: Dict[str, List[int]] = {
+    "flux2_distilled": FLUX2_IMAGE_SIZES,
+    "flux2_base":      FLUX2_IMAGE_SIZES,
+    "z-image":         ZIMAGE_IMAGE_SIZES,
+    "none":            IMAGE_SIZES,
+}
+
+
+def family_image_sizes(diffuser_name: str) -> List[int]:
+    """Allowed width/height values for the loaded diffuser's family."""
+    return FAMILY_IMAGE_SIZES.get(family_step_cfg_key(diffuser_name), IMAGE_SIZES)
 
 # Z-Image-Turbo is a distilled few-step model; step counts are conventionally
 # chosen as doubling powers of two (2/4/6/8/10/12) to match the distillation
@@ -305,6 +614,63 @@ IMAGE_SIZES       = [256, 512, 768, 1024]
 # turbo schedule was actually trained on.
 STEP_CHOICES      = [2, 4, 6, 8, 10, 12]
 BATCH_SIZE_CHOICES = [128, 256, 512, 1024, 2048]
+
+# ---------------------------------------------------------------------------
+# Per-family step / CFG ranges  (the two setting sets the Generation page
+# swaps between when the diffuser family changes)
+# ---------------------------------------------------------------------------
+# Sources: BFL/ComfyUI/community testing for Flux.2-klein (Jan 2026 onward) and
+# the Z-Image-Turbo distillation schedule. Key facts encoded here:
+#   * Klein DISTILLED: cfg is fixed at 1.0 (guidance-distilled; other values
+#     degrade), and it is a 4-step model — 4-6 is ideal, 8 is the practical
+#     ceiling, higher REDUCES quality. Editing wants the same, not higher cfg.
+#   * Klein BASE (undistilled): behaves like a normal flow model — cfg ~4 and
+#     ~20 steps.
+#   * Z-Image-Turbo: its own few-step schedule; the app's existing 8-step /
+#     cfg-1.0 default is kept (it was already working), with the full slider.
+#
+# Each entry: steps -> (choices, default); cfg -> (min, max, step, default).
+FAMILY_STEP_CFG = {
+    "flux2_distilled": {
+        "steps":  ([4, 6, 8], 4),
+        "cfg":    (1.0, 2.0, 0.5, 1.0),
+    },
+    "flux2_base": {
+        "steps":  ([16, 20, 24, 28], 20),
+        "cfg":    (1.0, 8.0, 0.5, 4.0),
+    },
+    # Z-Image-Turbo (distilled S3-DiT): 8-step model — 8 is the sweet spot,
+    # 10-12 rarely helps (try a new seed instead). cfg stays low (~1.0-2.0);
+    # 4+ "fries"/over-saturates a distilled model, so the range caps at 4.0.
+    # Sampler is NOT forced (euler AND euler_a both work well for Z-Image),
+    # unlike Flux.2 which must be euler.
+    "z-image": {
+        "steps":  ([4, 6, 8, 10, 12], 8),
+        "cfg":    (1.0, 4.0, 0.5, 1.0),
+    },
+    # No diffuser chosen yet: keep the permissive superset.
+    "none": {
+        "steps":  (STEP_CHOICES, 8),
+        "cfg":    (0.5, 20.0, 0.5, 1.0),
+    },
+}
+
+
+def family_step_cfg_key(diff_path: str, diff_arch: str = "") -> str:
+    """Map a diffuser to its FAMILY_STEP_CFG key: 'flux2_distilled',
+    'flux2_base', 'z-image', or 'none'."""
+    fam = diffuser_family(diff_path, diff_arch) if diff_path else None
+    if fam == DIFFUSER_FAMILY_FLUX2:
+        return "flux2_base" if is_flux2_base_variant(diff_path) else "flux2_distilled"
+    if fam == DIFFUSER_FAMILY_ZIMAGE:
+        return "z-image"
+    return "none"
+
+
+def family_step_cfg(diff_path: str, diff_arch: str = "") -> Dict[str, Any]:
+    """The step choices + cfg range set for a diffuser's family (see
+    FAMILY_STEP_CFG). Always returns a valid entry (falls back to 'none')."""
+    return FAMILY_STEP_CFG[family_step_cfg_key(diff_path, diff_arch)]
 
 # Context size maxes out at the model's trained context length (40960)
 CTX_SIZE_CHOICES  = [2048, 4096, 8192, 16384, 32768, 40960]
@@ -619,12 +985,21 @@ def get_vulkan_info() -> Dict[str, Any]:
 
     devices: List[Dict[str, Any]] = []
     for idx in indices:
+        raw_fp16 = sec.get(f"gpu{idx}_fp16", "")
+        fp16_val: Optional[bool]
+        if raw_fp16 == "True":
+            fp16_val = True
+        elif raw_fp16 == "False":
+            fp16_val = False
+        else:
+            fp16_val = None  # unknown (not recorded by this install)
         devices.append({
             "index":         idx,
             "name":          sec.get(f"gpu{idx}_name", f"GPU{idx}"),
             "backend":       sec.get(f"gpu{idx}_backend", "Vulkan"),
             "vram_total_mb": int(sec.get(f"gpu{idx}_vram_mb", "0") or 0),
             "vram_free_mb":  int(sec.get(f"gpu{idx}_free_mb", "0") or 0),
+            "fp16":          fp16_val,
         })
 
     return {
@@ -796,7 +1171,6 @@ def _default_configuration() -> Dict[str, Any]:
         "encoder_threads": dt,
         "encoder_batch_size": 512,
         "encoder_ctx_size": 4096,
-        "encoder_flash_attn": True,
         "encoder_gpu_layers": -1,
         # Per-side device indices, read by inference.py. The encoder and the
         # diffuser may sit on different devices, or one may be on CPU, so a
@@ -811,9 +1185,9 @@ def _default_configuration() -> Dict[str, Any]:
                                if (is_cpu_only or gpu < 0)
                                else DIFFUSER_PLACEMENT_FULL_GPU),
         "imagegen_threads": dt,
-        "imagegen_width": 256,
-        "imagegen_height": 256,
-        "imagegen_steps": 8,
+        "imagegen_width": 512,
+        "imagegen_height": 512,
+        "imagegen_steps": 6,
         "imagegen_cfg_scale": 1.0,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
@@ -908,6 +1282,7 @@ def _default_preferences() -> Dict[str, Any]:
     return {
         "prompt_template": DEFAULT_PROMPT_TEMPLATE,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
+        "encoder_model_debug": False,
     }
 
 
@@ -1111,31 +1486,45 @@ def resolve_model_path(path_str: str,
 # ---------------------------------------------------------------------------
 
 def get_generation_presets() -> Dict[str, Dict[str, Any]]:
+    """Preset NAMES for the Quality-Preset dropdown. The actual values are
+    resolved per model family at apply time by resolve_preset() — a preset now
+    means "this resolution/aspect, with the family's correct steps/cfg/sampler"
+    rather than a fixed set that could be wrong for a distilled model (e.g. the
+    old 'Quality' used cfg 7.0 / dpm++2m / 16 steps, which fries Z-Image and
+    Flux.2 klein). Kept as a dict of empty values so existing callers that only
+    read .keys() for the dropdown choices keep working."""
+    return {name: {} for name in GENERATION_PRESET_SIZES}
+
+
+# Preset -> (width, height). All dims divisible by 32. Steps/cfg/sampler are
+# NOT here; they come from the loaded family (see resolve_preset). "Custom"
+# carries no size and leaves every widget untouched.
+GENERATION_PRESET_SIZES: Dict[str, Optional[Tuple[int, int]]] = {
+    "Fast (Turbo)": (512, 512),
+    "Balanced":     (768, 768),
+    "Quality":      (1024, 1024),
+    "Portrait":     (768, 1024),
+    "Widescreen":   (1024, 512),
+    "Custom":       None,
+}
+
+
+def resolve_preset(name: str, diffuser_name: str = "") -> Dict[str, Any]:
+    """Full settings for a preset given the loaded diffuser: the preset's
+    resolution plus the family's tuned steps / cfg / sampler (from
+    FAMILY_STEP_CFG defaults; sampler is always euler_a, the good default for
+    both families). Empty dict for 'Custom'/unknown -> caller leaves widgets
+    as they are."""
+    size = GENERATION_PRESET_SIZES.get(name)
+    if not size:
+        return {}
+    spec = family_step_cfg(diffuser_name)
+    _, step_default = spec["steps"]
+    _, _, _, cfg_default = spec["cfg"]
+    w, h = size
     return {
-        "Fast (Turbo)": {
-            "imagegen_steps": 4, "imagegen_cfg_scale": 1.0,
-            "imagegen_sampling": "euler_a",
-            "imagegen_width": 256, "imagegen_height": 256,
-        },
-        "Balanced": {
-            "imagegen_steps": 8, "imagegen_cfg_scale": 1.5,
-            "imagegen_sampling": "euler_a",
-            "imagegen_width": 512, "imagegen_height": 512,
-        },
-        "Quality": {
-            "imagegen_steps": 16, "imagegen_cfg_scale": 7.0,
-            "imagegen_sampling": "dpm++2m",
-            "imagegen_width": 768, "imagegen_height": 768,
-        },
-        "Portrait": {
-            "imagegen_steps": 8, "imagegen_cfg_scale": 1.5,
-            "imagegen_sampling": "euler_a",
-            "imagegen_width": 512, "imagegen_height": 768,
-        },
-        "Widescreen": {
-            "imagegen_steps": 8, "imagegen_cfg_scale": 1.5,
-            "imagegen_sampling": "euler_a",
-            "imagegen_width": 1024, "imagegen_height": 512,
-        },
-        "Custom": {},
+        "imagegen_width": w, "imagegen_height": h,
+        "imagegen_steps": step_default,
+        "imagegen_cfg_scale": cfg_default,
+        "imagegen_sampling": "euler_a",
     }

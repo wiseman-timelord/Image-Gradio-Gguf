@@ -257,6 +257,77 @@ def categorize_models(models: List[Dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# Cross-model compatibility (encoder size / VAE family vs the diffuser)
+# ---------------------------------------------------------------------------
+
+def _encoder_hidden_dim(enc_path: str) -> Optional[int]:
+    """Encoder hidden dimension: GGUF `embedding_length` metadata first
+    (2560 for Qwen3-4B, 4096 for Qwen3-8B), filename family as a fallback."""
+    meta = probe_model(enc_path) or {}
+    emb = meta.get("embedding_length")
+    try:
+        if emb is not None and int(emb) > 0:
+            return int(emb)
+    except (TypeError, ValueError):
+        pass
+    return configure.encoder_dim_from_spec(Path(str(enc_path)).name)
+
+
+def check_model_compatibility(cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    """Validate that the configured encoder + VAE actually match the configured
+    diffusion model, BEFORE spending a model load on a run that sd.cpp would
+    only reject with a cryptic tensor-shape error.
+
+    Returns (ok, message). ok=True with message="" means "no detectable
+    problem" -- which includes the "cannot tell" cases (unrecognised family,
+    unreadable metadata): unknowns are allowed through, never blocked, so an
+    oddly-named-but-valid pairing still runs. A False is only ever returned for
+    a POSITIVE mismatch (a dim we know against a dim we know, or a VAE whose
+    family we recognise as the wrong one).
+
+    The rules come straight from configure.py's family matrix:
+      * Z-Image-Turbo / Flux.2-klein-4B  need a 2560-dim (Qwen3-4B) encoder.
+      * Flux.2-klein-9B                  needs a 4096-dim (Qwen3-8B) encoder.
+      * Z-Image uses ae.safetensors; Flux.2 uses flux2_ae -- never swapped.
+    """
+    diff_path = cfg.get("imagegen_model_path", "")
+    if not diff_path or not Path(diff_path).exists():
+        return True, ""
+
+    diff_meta = probe_model(diff_path) or {}
+    diff_arch = _arch_of(diff_meta)
+    fam = configure.diffuser_family(diff_path, diff_arch)
+    fam_label = configure.diffuser_family_label(diff_path, diff_arch)
+
+    # ── Encoder size ↔ diffuser size ──────────────────────────────────────
+    enc_path = cfg.get("encoder_model_path", "")
+    need_dim = configure.required_encoder_dim(diff_path, diff_arch)
+    if enc_path and Path(enc_path).exists() and need_dim:
+        have_dim = _encoder_hidden_dim(enc_path)
+        if have_dim and have_dim != need_dim:
+            need_lbl = "Qwen3-8B (4096-dim)" if need_dim == configure.ENCODER_DIM_QWEN3_8B \
+                       else "Qwen3-4B (2560-dim)"
+            have_lbl = "Qwen3-8B (4096-dim)" if have_dim == configure.ENCODER_DIM_QWEN3_8B \
+                       else (f"Qwen3-4B (2560-dim)" if have_dim == configure.ENCODER_DIM_QWEN3_4B
+                             else f"{have_dim}-dim")
+            return False, (f"Encoder mismatch: {fam_label} needs a {need_lbl} encoder; "
+                           f"the selected encoder is {have_lbl}.")
+
+    # ── VAE family ↔ diffuser family ──────────────────────────────────────
+    vae_path = cfg.get("vae_model_path", "")
+    if vae_path and Path(vae_path).exists() and fam:
+        vfam = configure.vae_family(Path(vae_path).name)
+        if vfam and vfam != fam:
+            want = "flux2_ae.safetensors" if fam == configure.DIFFUSER_FAMILY_FLUX2 \
+                   else "ae.safetensors"
+            have = configure.DIFFUSER_FAMILY_LABELS.get(vfam, vfam)
+            return False, (f"VAE mismatch: {fam_label} needs {want}; "
+                           f"the selected VAE looks like the {have} VAE.")
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # GGUF parser
 # ---------------------------------------------------------------------------
 
@@ -574,7 +645,13 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
         "-n", "256", "--temp", "0.7",
         "-no-cnv",
         "--no-display-prompt",
-        "--flash-attn", "on" if cfg.get("encoder_flash_attn", True) else "off",
+        # Encoder flash attention: pass "auto" and let llama.cpp choose. Unlike
+        # sd.cpp's Vulkan diffusion FA (which garbles on a no-fp16 GPU), llama.cpp
+        # FA on a GPU without coopmat2/fp16 simply falls back to CPU for the
+        # attention math — correct results, only slower — so there is nothing to
+        # gate on fp16 here. "auto" also picks the fast path where the hardware
+        # supports it, with no user toggle and no head-banging.
+        "--flash-attn", "auto",
     ]
 
     backend = cfg.get("backend_encoder", "CPU")
@@ -628,6 +705,18 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
                 timeout=120, encoding="utf-8", errors="replace", env=env,
             )
             combined_output = result.stdout + result.stderr
+
+            # Encoder Model Debug (Preferences page, off by default): dump what
+            # the encoder actually produced to the background console, so garbled
+            # or empty conditioning can be inspected. Prints the raw stdout — the
+            # model's own text output — between fixed markers.
+            try:
+                if configure.load_preferences().get("encoder_model_debug", False):
+                    print("\n*** ENCODER DEBUG BEGIN ***\n", flush=True)
+                    print(result.stdout.rstrip("\n"), flush=True)
+                    print("\n*** ENCODER DEBUG END ***\n", flush=True)
+            except Exception:
+                pass
 
             # Check for OOM before inspecting the text output
             if result.returncode != 0 and _is_oom_output(combined_output):
@@ -706,6 +795,37 @@ def _parse_step_line(line: str, total_steps: int) -> Optional[Tuple[int, int]]:
 # Image generation
 # ---------------------------------------------------------------------------
 
+def _flux2_needs_offload(diff_path: str, width: int, height: int,
+                         vk_dev: int, is_edit: bool) -> bool:
+    """Decide whether a Flux.2 run must stream the DiT from CPU RAM
+    (--offload-to-cpu) to fit, automatically, so we only pay its heavy speed
+    penalty when the DiT plus its compute buffer would actually overflow the
+    target GPU's VRAM.
+
+    With the encoder/VAE already forced to CPU for flux.2, only the DiT and its
+    compute buffer sit in VRAM. The compute buffer scales with pixel count
+    (~3 GB at 1024x1024, measured), and edit mode enlarges it (extra reference
+    tokens). If the estimate fits under a VRAM headroom margin, keep the DiT
+    resident (GPU speed); otherwise offload. Unknown VRAM -> don't force the
+    slow path.
+    """
+    try:
+        dit_mb = Path(diff_path).stat().st_size / (1024.0 * 1024.0)
+    except OSError:
+        return False
+    vram_mb = 0
+    for d in configure.get_vulkan_info().get("devices", []):
+        if d.get("index") == vk_dev:
+            vram_mb = d.get("vram_total_mb", 0) or 0
+            break
+    if not vram_mb:
+        return False
+    buf_mb = 3000.0 * (max(width, 1) * max(height, 1)) / (1024.0 * 1024.0)
+    if is_edit:
+        buf_mb *= 1.5
+    return (dit_mb + buf_mb) > vram_mb * 0.92
+
+
 def generate_image(prompt: str, cfg: Dict[str, Any],
                    progress_callback: Optional[Callable] = None
                    ) -> Dict[str, Any]:
@@ -731,10 +851,46 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
                              "Run installer or build from Configuration tab.")
         return result
 
+    # Refuse a run whose encoder/VAE cannot match the diffuser, with a plain
+    # message, rather than letting sd.cpp die on a tensor-shape error the user
+    # cannot read. Unknown pairings are allowed through (see the function).
+    compat_ok, compat_msg = check_model_compatibility(cfg)
+    if not compat_ok:
+        result["message"] = compat_msg
+        return result
+
+    # Which family are we driving? Everything flux.2-specific below hangs off
+    # this; when it is Z-Image the code path is byte-for-byte what it always
+    # was. Reference images (flux.2 image-to-image / editing, sd.cpp -r) come
+    # in as a list of paths on the cfg; empty/absent means plain text-to-image.
+    diff_meta = probe_model(diff_path) or {}
+    family = configure.diffuser_family(diff_path, _arch_of(diff_meta))
+    is_flux2 = family == configure.DIFFUSER_FAMILY_FLUX2
+    ref_images = [p for p in (cfg.get("ref_images") or [])
+                  if p and Path(str(p)).exists()]
+    is_flux2_edit = is_flux2 and bool(ref_images)
+
+    # Refuse formats sd.cpp's stb_image loader cannot decode (WEBP/AVIF/HEIC/
+    # TIFF/JP2), with a plain message, rather than letting it fail mid-encode.
+    # PNG/JPG/BMP and friends pass straight through -- no converter needed.
+    bad_fmt = [Path(str(r)).name for r in ref_images
+               if Path(str(r)).suffix.lower() not in configure.SUPPORTED_REF_IMAGE_EXTS]
+    if bad_fmt:
+        result["message"] = (
+            "Unsupported input-image format: " + ", ".join(bad_fmt) +
+            ". Use PNG, JPG or BMP — WEBP, AVIF, HEIC and TIFF cannot be read.")
+        return result
+
     # Enhance prompt — wire OOM status so the message surfaces in the UI.
+    # Skipped for flux.2 EDIT runs: the reference image already reaches the
+    # conditioner via -r, and a flowery expansion of a literal edit instruction
+    # ("change the background to a park") fights it rather than helping — and it
+    # would cost a whole extra model load per generation for no gain.
     enhanced = prompt
     _oom_msg: List[str] = []  # populated by callback if OOM exhausted all retries
-    if cfg.get("encoder_model_path") and Path(cfg["encoder_model_path"]).exists():
+    if (not is_flux2_edit
+            and cfg.get("encoder_model_path")
+            and Path(cfg["encoder_model_path"]).exists()):
         try:
             enhanced = enhance_prompt(
                 prompt, cfg, progress_callback,
@@ -819,7 +975,16 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
 
     if placement["use_vulkan_backend"] and vk_dev >= 0:
         dev = f"vulkan{vk_dev}"
-        if placement["split_to_cpu"]:
+        if is_flux2:
+            # Flux.2's Qwen3 text encoder (4-8B, several GB) is far too large to
+            # sit on the GPU beside the DiT on consumer VRAM, and conditioning
+            # is a one-shot pass, so it ALWAYS goes to CPU for flux.2 — the DiT
+            # stays resident on the GPU. This automatic encoder/DiT split (not
+            # the placement dropdown) is what lets the 9B fit AND run at GPU
+            # speed instead of streaming every step. (Answers "automate the
+            # encoder like we did flash attention".)
+            assign = f"diffusion={dev},te=cpu,vae=cpu"
+        elif placement["split_to_cpu"]:
             # Diffusion on the GPU; Qwen3 conditioner (~3.6GB) and VAE stay in
             # system RAM, both for execution and for weight allocation.
             assign = f"diffusion={dev},te=cpu,vae=cpu"
@@ -854,6 +1019,52 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     if clip_skip > 1 and is_sd_classic:
         args.extend(["--clip-skip", str(clip_skip)])
 
+    # ------------------------------------------------------------------
+    # Flux.2-Klein specifics. Z-Image needs none of this, so it is all gated
+    # on the family and the Z-Image command line is unchanged.
+    #
+    #   --offload-to-cpu  stages the DiT through system RAM. HEAVY speed penalty
+    #                     (streams weights every step), so applied ONLY when the
+    #                     DiT + compute buffer would overflow VRAM — decided
+    #                     automatically by _flux2_needs_offload(). The encoder is
+    #                     already forced to CPU (see placement above), so the DiT
+    #                     stays resident on the GPU whenever it fits.
+    #   --diffusion-fa    flash attention on the DiT; auto-gated on GPU fp16.
+    #   -r <ref.png>      one per reference image, for image-to-image / editing.
+    #                     Repeatable (flux.2 is a multi-reference editor).
+    #   sampler           left as the user set it (default euler_a); euler_a
+    #                     empirically beats plain euler on this build/hardware.
+    # See stable-diffusion.cpp docs/flux2.md.
+    # ------------------------------------------------------------------
+    if is_flux2:
+        # --offload-to-cpu only when the DiT + its compute buffer would not fit
+        # the GPU (auto, resolution-aware). Forcing it unconditionally streamed
+        # ~5.6GB every step for the 9B and left the GPU idle at ~0% — glacial.
+        # With the encoder already on CPU, the DiT stays resident on the GPU
+        # whenever it fits, at full GPU speed.
+        _w = int(cfg.get("imagegen_width", 512))
+        _h = int(cfg.get("imagegen_height", 512))
+        if _flux2_needs_offload(str(diff_path), _w, _h, vk_dev, is_flux2_edit):
+            args.append("--offload-to-cpu")
+        args.append("--vae-tiling")
+        # Flash attention keeps the compute buffer small and the flux.2 docs
+        # recommend it, BUT the Vulkan flash-attention path needs fp16. Some
+        # older GPUs (Polaris / RX 470 report "fp16: 0") do not expose it, and
+        # there --diffusion-fa can silently produce a garbled image rather than
+        # error. The decision is now automatic per the SELECTED diffuser GPU's
+        # fp16 capability, detected by the installer and stored in constants.ini
+        # (configure.flux2_flash_attn_for / device_supports_fp16); no user
+        # toggle. Turning it off raises VRAM use, fine on the 4B but tight on 9B.
+        if configure.flux2_flash_attn_for(cfg):
+            args.append("--diffusion-fa")
+        for ref in ref_images:
+            args.extend(["-r", str(ref)])
+        # Sampler is left as the user set it (default euler_a). Although Flux.2
+        # is a rectified-flow model, in practice on this sd.cpp build euler_a
+        # gives clean results and plain euler comes out semi-garbled on the
+        # target hardware, so we do NOT override the user's choice here. sd.cpp
+        # still applies the Flux2 scheduler internally regardless of sampler.
+
     total_steps = int(cfg.get("imagegen_steps", 4))
     diffusion_t0 = time.time()
     if progress_callback:
@@ -862,6 +1073,17 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
                            "step": 0, "total_steps": total_steps})
 
     try:
+        # Echo the resolved command so the ACTUAL sampler / flags in effect are
+        # visible on the console — no guessing whether the dropdown took effect.
+        try:
+            _sm = args[args.index("--sampling-method") + 1] if "--sampling-method" in args else "?"
+        except (ValueError, IndexError):
+            _sm = "?"
+        print(f"[generate] sd-cli: sampler={_sm}  "
+              f"steps={cfg.get('imagegen_steps')}  cfg={cfg.get('imagegen_cfg_scale')}  "
+              f"flux2={is_flux2}  fa={'--diffusion-fa' in args}  "
+              f"offload={'--offload-to-cpu' in args}")
+        print("[generate] full command: " + " ".join(str(a) for a in args))
         process = subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", env=env,

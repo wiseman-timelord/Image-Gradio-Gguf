@@ -172,10 +172,25 @@ def _thread_choices() -> List[int]:
     return configure.get_thread_choices()
 
 
+def _vae_name_matches_family(filename: str, family: Optional[str]) -> bool:
+    """True when a safetensors filename is the VAE the given diffuser family
+    wants. For Z-Image that is ae.safetensors; for Flux.2 it is flux2_ae (which
+    frequently is NOT name-detectable, so this legitimately returns False for
+    the generic diffusion_pytorch_model.safetensors and the user picks by hand).
+    When family is None, fall back to the historic ae.safetensors match so a
+    flat models folder still behaves as before.
+    """
+    low = filename.lower()
+    if family == configure.DIFFUSER_FAMILY_FLUX2:
+        return configure.vae_family(low) == configure.DIFFUSER_FAMILY_FLUX2
+    # z-image or unknown -> the exact ae.safetensors filename
+    return low == "ae.safetensors"
+
+
 def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
     r"""
-    Given a diffusion model path, locate ae.safetensors and return
-    (vae_full_path, vae_stem), or ("", "") if not found.
+    Given a diffusion model path, locate the VAE that matches its family and
+    return (vae_full_path, vae_stem), or ("", "") if not found.
 
     Search order: the model's own folder first, then each folder above it up
     to and including .\models, then a full sweep of .\models.
@@ -194,10 +209,14 @@ def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
     if not p.exists():
         return "", ""
 
+    # Family of the NEW diffuser decides which VAE filename we hunt for.
+    family = configure.diffuser_family(diff_path_str)
+
     def _scan(folder: Path) -> Optional[Path]:
         try:
             for f in folder.iterdir():
-                if f.is_file() and f.name.lower() == "ae.safetensors":
+                if f.is_file() and f.name.lower().endswith(".safetensors") \
+                        and _vae_name_matches_family(f.name, family):
                     return f
         except OSError:
             pass
@@ -223,7 +242,7 @@ def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
         return str(hit), hit.stem
     try:
         for f in models_dir.rglob("*.safetensors"):
-            if f.is_file() and f.name.lower() == "ae.safetensors":
+            if f.is_file() and _vae_name_matches_family(f.name, family):
                 return str(f), f.stem
     except OSError:
         pass
@@ -247,12 +266,68 @@ def _resolve_vae(diff_path_str: str, current_vae_path: str,
          A stale path to a deleted file is cleared rather than kept, so the
          box never claims a VAE that generation would then fail on.
     """
+    # Rule 0 (new): cross-family switch. If the VAE currently held belongs to
+    # the OTHER family (z-image ae vs flux2 vae), it can never be valid for the
+    # new diffuser, so blank it unconditionally and make the user set the right
+    # one. This is the flux.2 ⇄ z-image switch the user asked to be handled.
+    new_family = configure.diffuser_family(diff_path_str) if diff_path_str else None
+    cur_vae_family = configure.vae_family(current_vae_name or "")
+    if new_family and cur_vae_family and new_family != cur_vae_family:
+        return "", ""
+
     vae_path, vae_name = _detect_vae(diff_path_str)
     if vae_path:
         return vae_path, vae_name
     if current_vae_path and Path(current_vae_path).expanduser().exists():
         return gr.update(), gr.update()          # rule 2 — leave as-is
     return "", ""
+
+
+def _diff_change_message(diff_path_str: str, current_vae_name: str) -> str:
+    """Status-bar line for a diffusion-model change: announces the family the
+    interface has switched to, and prompts for a VAE path on a cross-family
+    switch (where _resolve_vae just blanked the box).
+
+    Examples:
+      "Handling/interface set to Z-Image-Turbo."
+      "Switched from Z-Image-Turbo to Flux.2-Klein — set VAE (safetensors) path."
+    """
+    if not diff_path_str:
+        return "Handling/interface set to no model selected."
+    new_family = configure.diffuser_family(diff_path_str)
+    new_label = configure.diffuser_family_label(diff_path_str)
+    cur_vae_family = configure.vae_family(current_vae_name or "")
+    if new_family and cur_vae_family and new_family != cur_vae_family:
+        old_label = configure.DIFFUSER_FAMILY_LABELS.get(cur_vae_family, "the previous model")
+        return f"Switched from {old_label} to {new_label} — set VAE (safetensors) path."
+    return f"Handling/interface set to {new_label}."
+
+
+def _vae_hint_update(diff_path_str: str) -> Any:
+    """gr.update(info=...) naming the VAE the current diffuser family expects."""
+    fam = configure.diffuser_family(diff_path_str) if diff_path_str else None
+    hint = configure.DIFFUSER_VAE_HINTS.get(
+        fam, "Auto-filled when found next to the diffusion model.")
+    return gr.update(info=hint)
+
+
+def _on_diff_path_change_full(path: str, current_vae_path: str,
+                              current_vae_name: str) -> Tuple[Any, Any, Any]:
+    """Combined diffusion-path change handler used in _wire_config_events so it
+    can also write the shared status bar. Returns updates for
+    (vae_path_tb, vae_name_tb, status_box). The family hint is folded INTO the
+    vae_name update so a single widget is not targeted twice in one event."""
+    vae_p, vae_n = _resolve_vae(path, current_vae_path, current_vae_name)
+    fam = configure.diffuser_family(path) if path else None
+    hint = configure.DIFFUSER_VAE_HINTS.get(
+        fam, "Auto-filled when found next to the diffusion model.")
+    # vae_n is one of: "" (blank), a stem string, or gr.update() (keep as-is).
+    if isinstance(vae_n, str):
+        vae_n = gr.update(value=vae_n, info=hint)
+    else:
+        vae_n = gr.update(info=hint)   # keep value, just retune the hint
+    msg = _diff_change_message(path, current_vae_name)
+    return vae_p, vae_n, msg
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +486,80 @@ def _generate_gate_updates() -> Tuple[Any, Any, Any]:
     )
 
 
+def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
+                             cur_width: Any = None, cur_height: Any = None
+                             ) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
+    """(settings_header, ref_row, status, sampler_dd, steps_dd, cfg_scale_sld,
+    width_dd, height_dd) for the current diffuser.
+
+    Keeps the "Settings (Flux 2 / Z-Image-Turbo / no model selected)" header and
+    the Flux.2-only controls in step with whatever model is set, flashes any
+    encoder/VAE compatibility problem on arrival, leaves the Sampler untouched
+    (euler_a default suits both families), and swaps the Diffuse Steps, CFG-Scale
+    and Width/Height choices to the set that fits the family: distilled klein →
+    steps 4-8, cfg ~1.0, sizes 512-1536; klein-base → ~20 steps, cfg ~4; Z-Image
+    → 8 steps, cfg ~1-2, sizes 256-1536. (Flux.2's 512 floor is deliberate — it
+    degrades below that.)
+
+    Current steps/cfg/width/height are passed in so a value already valid for the
+    new family is KEPT (no clobbering a deliberate choice); only an out-of-range
+    value is snapped to the family default. Returned in the generate_tab.select
+    outputs order.
+    """
+    c = configure.load_configuration()
+    diff = c.get("imagegen_model_path", "")
+    fam_label = configure.diffuser_family_label(diff)
+    is_flux2 = (configure.diffuser_family(diff)
+                == configure.DIFFUSER_FAMILY_FLUX2)
+    ok, msg = inference.check_model_compatibility(c)
+    status = gr.update() if ok else gr.update(value="⚠ " + msg)
+    # Sampler is NOT touched by family selection — euler_a is the default for
+    # both families and empirically the better choice for Flux.2 on this build,
+    # so leave whatever the user has set (no reset-to-euler).
+    sampler_upd = gr.update()
+
+    spec = configure.family_step_cfg(diff)
+    step_choices, step_default = spec["steps"]
+    cfg_min, cfg_max, cfg_step, cfg_default = spec["cfg"]
+
+    try:
+        cs = int(cur_steps)
+    except (TypeError, ValueError):
+        cs = None
+    step_val = cs if cs in step_choices else step_default
+    steps_upd = gr.update(choices=step_choices, value=step_val)
+
+    try:
+        cc = float(cur_cfg)
+    except (TypeError, ValueError):
+        cc = None
+    cfg_val = cc if (cc is not None and cfg_min <= cc <= cfg_max) else cfg_default
+    cfg_upd = gr.update(minimum=cfg_min, maximum=cfg_max, step=cfg_step, value=cfg_val)
+
+    # Width / height: swap to the family's allowed sizes, keeping a valid current
+    # value, else snapping to 768 (a safe native-ish default for both families).
+    sizes = configure.family_image_sizes(diff)
+    def _size_upd(cur: Any) -> Any:
+        try:
+            cv = int(cur)
+        except (TypeError, ValueError):
+            cv = None
+        return gr.update(choices=sizes, value=(cv if cv in sizes else 768))
+    width_upd = _size_upd(cur_width)
+    height_upd = _size_upd(cur_height)
+
+    return (
+        gr.update(value=f"### Settings ({fam_label})"),
+        gr.update(visible=is_flux2),
+        status,
+        sampler_upd,
+        steps_upd,
+        cfg_upd,
+        width_upd,
+        height_upd,
+    )
+
+
 def _build_generate_tab_inner() -> None:
     """Build Generate tab widgets; store refs in _gen for later wiring."""
     cfg = _cfg()
@@ -420,32 +569,68 @@ def _build_generate_tab_inner() -> None:
     prompt_ph  = _PROMPT_PH_READY if configured else _PROMPT_PH_NOMODEL
     neg_ph     = _NEG_PH_READY    if configured else _NEG_PH_NOMODEL
 
+    # Settings header names the active diffuser family, per the requested
+    # "Settings (Flux 2)" / "Settings (Z-Image-Turbo)" / "Settings (no model
+    # selected)". Rebuilt once at launch; refreshed on tab-select by
+    # _generate_family_updates() so it tracks a model chosen after launch.
+    _initial_family_label = configure.diffuser_family_label(
+        cfg.get("imagegen_model_path", ""))
+
     with gr.Row():
-        # ── Left column: settings ────────────────────────────────────────────
-        with gr.Column(scale=3):
-            gr.Markdown("### Settings")
-            # elem_id is what hooks the auto-height CSS in build_app() onto
-            # these two boxes and NOTHING else on the page — the Thumbnails
-            # Gallery has its own, separate rules and is not affected.
-            # lines=2 remains the MINIMUM height (build_app()'s min-height
-            # mirrors it); max_lines=10 is now only a fallback ceiling for an
-            # engine with no CSS field-sizing support, since on the engine we
-            # actually ship (Chromium 130, via PyQt6-WebEngine 6.9) the CSS
-            # governs the height and the box grows to fit all of the text.
+        # ── Column 1: settings only ─────────────────────────────────────────
+        # Prompts and the Generate button moved to column 2 so the three
+        # sections read left-to-right as: tune → describe/input/go → view.
+        with gr.Column(scale=1):
+            _gen["settings_header"] = gr.Markdown(f"### Settings ({_initial_family_label})")
+            with gr.Row():
+                _gen["preset_dd"] = gr.Dropdown(
+                    label="Quality Preset", choices=list(presets.keys()),
+                    value=cfg.get("imagegen_quality_preset", "Fast (Turbo)"),
+                )
+                _gen["sampler_dd"] = gr.Dropdown(
+                    label="Sampler Type", choices=list(configure.SAMPLER_MAP.keys()),
+                    value=cfg.get("imagegen_sampling", "euler_a"),
+                )
+            with gr.Row():
+                _gen["width_dd"]  = gr.Dropdown(label="Image Width",  choices=configure.IMAGE_SIZES,
+                                                value=cfg.get("imagegen_width", 512))
+                _gen["height_dd"] = gr.Dropdown(label="Image Height", choices=configure.IMAGE_SIZES,
+                                                value=cfg.get("imagegen_height", 512))
+            with gr.Row():
+                _gen["steps_dd"] = gr.Dropdown(
+                    label="Diffuse Steps", choices=configure.STEP_CHOICES,
+                    value=cfg.get("imagegen_steps", 4),
+                )
+                _gen["cfg_scale_sld"] = gr.Slider(
+                    label="CFG Scale", minimum=0.5, maximum=20.0, step=0.5,
+                    value=cfg.get("imagegen_cfg_scale", 1.0),
+                )
+            with gr.Row():
+                _gen["batch_dd"] = gr.Dropdown(label="Batch Count",
+                                               choices=configure.BATCH_COUNT_CHOICES,
+                                               value=cfg.get("imagegen_batch_count", 1)
+                )
+                _gen["output_fmt_dd"] = gr.Dropdown(
+                    label="Output Format", choices=configure.OUTPUT_FORMATS,
+                    value=cfg.get("output_format", "png"),
+                )
+            with gr.Row():
+                _gen["seed_num"] = gr.Number(label="Gen Seed (-1 = random)",
+                                             value=cfg.get("imagegen_seed", -1), precision=0)
+            # NOTE: no manual "Save as Default" button — successful generations
+            # auto-save their settings panel values (see do_generate's success
+            # branch), so the next launch picks up the last settings that worked.
+
+        # ── Column 2: prompts, dynamic image input, Generate button ──────────
+        with gr.Column(scale=1):
+            gr.Markdown("### Prompts")
             # ── Positive Prompt, with a "(history)" popout ──────────────────
-            # The label itself is the toggle: a gr.Button stripped of all
-            # button chrome by the #positive-history-toggle CSS rule in
-            # build_app(), so it reads as plain label text until clicked.
-            # Clicking it either opens the panel below (closed -> open,
-            # showing up to 5 recent prompts to choose from) or closes it
-            # again (open -> closed, leaving the edit box untouched) --
-            # both directions are the exact same click/handler, matching
-            # the requested "click to show, click again to hide" behaviour.
-            # Initial button values are pre-loaded from prompt_cache.json at
-            # build time so a fresh launch already has history available the
-            # first time the user opens the panel; they are re-fetched fresh
-            # on every toggle too, so a generation made just now is reflected
-            # immediately without needing a page reload.
+            # The label itself is the toggle: a gr.Button stripped of button
+            # chrome by #positive-history-toggle CSS, reading as plain label
+            # text until clicked. Clicking opens/closes the recent-prompts
+            # panel (same handler both directions). History is pre-loaded at
+            # build time and re-fetched on every toggle so a just-made
+            # generation shows without a reload.
             _gen["positive_history_toggle"] = gr.Button(
                 "Positive Prompt (click for history)",
                 elem_id="positive-history-toggle",
@@ -488,65 +673,48 @@ def _build_generate_tab_inner() -> None:
                                  elem_classes=["prompt-history-item"])
                     )
             _gen["negative_history_state"] = gr.State(False)
-            with gr.Row():
-                _gen["preset_dd"] = gr.Dropdown(
-                    label="Quality Preset", choices=list(presets.keys()),
-                    value=cfg.get("imagegen_quality_preset", "Fast (Turbo)"),
-                )
-                _gen["sampler_dd"] = gr.Dropdown(
-                    label="Sampler Type", choices=list(configure.SAMPLER_MAP.keys()),
-                    value=cfg.get("imagegen_sampling", "euler_a"),
-                )
 
-            with gr.Row():
-                _gen["batch_dd"] = gr.Dropdown(label="Batch Count",
-                                               choices=configure.BATCH_COUNT_CHOICES,
-                                               value=cfg.get("imagegen_batch_count", 1)
+            # ── Flux.2 controls: flash-attn toggle + reference images ───────
+            # Whole column shown ONLY when the diffuser is Flux.2.
+            _flux2_now = (configure.diffuser_family(cfg.get("imagegen_model_path", ""))
+                          == configure.DIFFUSER_FAMILY_FLUX2)
+            with gr.Column(visible=_flux2_now) as _gen["ref_row"]:
+                gr.Markdown("#### Image Edit (img+txt to img)")
+                # Reference images for image-to-image / editing (sd.cpp -r,
+                # repeatable). "Add Image" opens a file picker and APPENDS to
+                # the list (add, then add again); "Clear Images" empties it. No
+                # drop-zone. The chosen files are listed one per line below and
+                # are cleared automatically when a generation completes.
+                with gr.Row():
+                    _gen["ref_add_btn"] = gr.UploadButton(
+                        "Add Image", file_count="multiple",
+                        file_types=["image"], type="filepath", size="sm",
+                    )
+                    _gen["ref_clear_btn"] = gr.Button("Clear Images", size="sm")
+                _gen["ref_list_tb"] = gr.Textbox(
+                    show_label=False, interactive=False, visible=False,
+                    lines=1, max_lines=8, elem_id="ref-image-list",
                 )
-                _gen["width_dd"]  = gr.Dropdown(label="Image Width",  choices=configure.IMAGE_SIZES,
-                                                value=cfg.get("imagegen_width", 512))
-                _gen["height_dd"] = gr.Dropdown(label="Image Height", choices=configure.IMAGE_SIZES,
-                                                value=cfg.get("imagegen_height", 512))
-                _gen["output_fmt_dd"] = gr.Dropdown(
-                    label="Output Format", choices=configure.OUTPUT_FORMATS,
-                    value=cfg.get("output_format", "png"),
-                )
+                # Accumulated list of reference-image paths (the real input to
+                # generation); the textbox above is just its visible form.
+                _gen["ref_images_state"] = gr.State([])
 
-            with gr.Row():
-                _gen["steps_dd"] = gr.Dropdown(
-                    label="Diffuse Steps", choices=configure.STEP_CHOICES,
-                    value=cfg.get("imagegen_steps", 4),
-                )
-                _gen["cfg_scale_sld"] = gr.Slider(
-                    label="CFG Scale", minimum=0.5, maximum=20.0, step=0.5,
-                    value=cfg.get("imagegen_cfg_scale", 1.0),
-                )
-                _gen["seed_num"] = gr.Number(label="Gen Seed (-1 = random)",
-                                             value=cfg.get("imagegen_seed", -1), precision=0)
-
-            # NOTE: no manual "Save as Default" button — successful
-            # generations auto-save their settings panel values (see
-            # on_generate_click / do_generate's success branch), so the
-            # next launch picks up the last settings that actually worked.
-
-        # ── Right column: image preview only ────────────────────────────────
-        with gr.Column(scale=2):
-            gr.Markdown("### Output")
+            gr.Markdown("#### Submitting Input (check settings)")
             with gr.Row(visible=configured) as _gen["generate_row"]:
-                # Single dynamic button: shows "Generate" (primary) when idle
-                # and switches to "..Please Wait.." (disabled) while a
-                # generation is running. do_generate() flips it to Please Wait
-                # on entry and back to Generate on its final yield.
+                # Single dynamic button: "Generate" (primary) when idle,
+                # "..Please Wait.." (disabled) while running. do_generate()
+                # flips it on entry and back on its final yield.
                 _gen["generate_btn"] = gr.Button("Generate Image", variant="primary", size="lg")
 
-            # Single currently-selected/in-progress image — the ONLY image
-            # shown here is either the most recent generation, the live
-            # encoding/diffusion phase status image, or whatever the user
-            # has clicked in the gallery below. Never shows Gradio's
-            # built-in progress bar.
+        # ── Column 3: image preview only ────────────────────────────────────
+        with gr.Column(scale=1):
+            gr.Markdown("### Output")
+            # Single currently-selected/in-progress image — most recent
+            # generation, the live phase status image, or a clicked gallery
+            # thumbnail. Never shows Gradio's built-in progress bar.
             # Gradio 6 replaced show_download_button/show_share_button with a
             # single buttons=[...] list, so build the kwarg for whichever
-            # major version is actually installed.
+            # major version is installed.
             _img_button_kwargs = (
                 {"buttons": ["download"]} if _GRADIO_MAJOR >= 6
                 else {"show_download_button": True, "show_share_button": False}
@@ -606,13 +774,17 @@ def _build_generate_tab_inner() -> None:
     presets_map = presets
 
     def apply_preset(name: str):
-        # Custom preset carries no values — leave all widgets unchanged.
-        if name == "Custom":
+        # Resolve the preset against the currently-loaded diffuser family, so
+        # steps/cfg/sampler come out correct for Z-Image vs Flux.2 (distilled
+        # or base) rather than a one-size-fits-all set. Custom/unknown leaves
+        # every widget unchanged.
+        model = configure.load_configuration().get("imagegen_model_path", "")
+        p = configure.resolve_preset(name, model)
+        if not p:
             return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
-        p = presets_map.get(name, {})
-        return (p.get("imagegen_width", 512), p.get("imagegen_height", 512),
-                p.get("imagegen_steps", 4), p.get("imagegen_sampling", "euler_a"),
-                p.get("imagegen_cfg_scale", 1.0))
+        return (p["imagegen_width"], p["imagegen_height"],
+                p["imagegen_steps"], p["imagegen_sampling"],
+                p["imagegen_cfg_scale"])
 
     _gen["preset_dd"].change(
         apply_preset, inputs=_gen["preset_dd"],
@@ -657,7 +829,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             _timeout_timer["handle"] = None
 
     def do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset):
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None):
         """
         Generator: yields (preview_img, gallery, status, btn_update) tuples
         so the preview box can switch between program_encoding.jpg /
@@ -708,6 +880,17 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         gen_cfg = dict(c)
         gen_cfg["prompt_template"] = _prefs().get(
             "prompt_template", configure.DEFAULT_PROMPT_TEMPLATE)
+        # Reference images (Flux.2 -r). gr.File(file_count="multiple") returns
+        # a list of paths, a single path, or None; normalise to a list of
+        # existing paths. inference.generate_image() ignores this entirely for
+        # Z-Image and only uses it when the diffuser is Flux.2.
+        if ref_images is None:
+            _refs = []
+        elif isinstance(ref_images, (list, tuple)):
+            _refs = [str(r) for r in ref_images if r]
+        else:
+            _refs = [str(ref_images)]
+
         gen_cfg.update(
             imagegen_width=int(width), imagegen_height=int(height),
             imagegen_steps=int(steps), imagegen_sampling=sampler,
@@ -715,6 +898,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             imagegen_seed=int(seed), imagegen_batch_count=int(batch),
             negative_prompt=negative,
             output_format=output_format,
+            ref_images=_refs,
         )
 
         configure.APP_STATE["cancel_requested"] = False
@@ -763,15 +947,19 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 _phase["total_steps"] = info["total_steps"]
 
         def _format_status() -> str:
-            """Build the 'Batch Number X/Y; Generate Stage N/2; ... Phase
+            """Build the 'Generate Stage N/2; [Batch Number X/Y; ]... Phase
             {step}/{total}...###s (prev_batch_Ns)' status string. Seconds are
             always whole numbers (no split seconds) per the fixed status-bar
-            format — never decimals."""
+            format — never decimals.
+
+            Ordering: Generate Stage leads, because Stage 1 (encoding) runs ONCE
+            up front and Stage 2 (diffusion) is what actually iterates per image
+            — so Batch Number is a Stage-2 concept and is shown only then, after
+            the stage, never during encoding."""
             name = _phase["name"]
             elapsed_s = int(time.time() - _phase["phase_start"])
             batch_cur = _phase["batch_current"]
             batch_tot = _phase["batch_total"]
-            batch_prefix = f"Batch Number {batch_cur}/{batch_tot}; "
 
             # Previous batch elapsed suffix — only shown when we have a
             # recorded time from a completed batch earlier this session.
@@ -784,18 +972,20 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 # progress_callback, so step/total are only ever populated
                 # once a step-aware encoder backend supplies them. Until
                 # then this degrades to a plain running timer rather than
-                # showing a fabricated "0/0".
+                # showing a fabricated "0/0". No Batch Number here: encoding
+                # is a one-time Stage-1 step, not per-image.
                 step = _phase.get("step", 0)
                 total = _phase.get("total_steps", 0)
                 step_part = f" {step}/{total}" if total else ""
-                return (f"{batch_prefix}Generate Stage 1/2; Encoding Phase{step_part}..."
+                return (f"Generate Stage 1/2; Encoding Phase{step_part}..."
                         f"{elapsed_s}s{prev_suffix}")
 
-            # diffusion
+            # diffusion (Stage 2) — Batch Number belongs here, after the stage.
+            batch_prefix = f"Batch Number {batch_cur}/{batch_tot}; "
             step = _phase.get("step", 0)
             total = _phase.get("total_steps", 0) or int(gen_cfg.get("imagegen_steps", 0))
             step_part = f" {step}/{total}" if total else ""
-            return (f"{batch_prefix}Generate Stage 2/2; Diffusing Phase{step_part}..."
+            return (f"Generate Stage 2/2; {batch_prefix}Diffusing Phase{step_part}..."
                     f"{elapsed_s}s{prev_suffix}")
 
         def worker():
@@ -896,24 +1086,68 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
 
     def on_generate_click(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset):
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None):
         """Dispatch a click on the single dynamic button. The button reads
         "Generate" when idle and starts a run (delegating to the do_generate
         generator, which yields its own button-state updates). While a run
         is in progress the button is disabled and shows "..Please Wait..",
-        preventing concurrent runs."""
+        preventing concurrent runs. ref_images is the Flux.2 input-image list
+        (from ref_images_state); it is ignored for Z-Image runs inside
+        inference.generate_image(). Flash attention is decided automatically
+        from the selected GPU's fp16 capability — no input here."""
         yield from do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset)
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images)
 
-    _gen["generate_btn"].click(
+    # ── Reference-image Add / Clear handlers ────────────────────────────────
+    def _render_ref_list(paths: List[str]) -> Any:
+        """Show accumulated reference filenames one per line; hide when empty."""
+        if not paths:
+            return gr.update(value="", visible=False)
+        names = "\n".join(Path(p).name for p in paths)
+        return gr.update(value=names, visible=True)
+
+    def _add_ref_images(new_files, current):
+        """Append the just-picked file(s) to the accumulated list. gr.UploadButton
+        hands us a path, a list of paths, or None."""
+        acc = list(current or [])
+        if new_files:
+            if isinstance(new_files, (list, tuple)):
+                acc.extend(str(f) for f in new_files if f)
+            else:
+                acc.append(str(new_files))
+        return acc, _render_ref_list(acc)
+
+    def _clear_ref_images():
+        return [], _render_ref_list([])
+
+    _gen["ref_add_btn"].upload(
+        _add_ref_images,
+        inputs=[_gen["ref_add_btn"], _gen["ref_images_state"]],
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"]],
+    )
+    _gen["ref_clear_btn"].click(
+        _clear_ref_images,
+        inputs=None,
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"]],
+    )
+
+    _gen_evt = _gen["generate_btn"].click(
         on_generate_click,
         inputs=[_gen["prompt_tb"], _gen["negative_tb"],
         _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
         _gen["sampler_dd"], _gen["cfg_scale_sld"],
         _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"],
-        _gen["preset_dd"]],
+        _gen["preset_dd"], _gen["ref_images_state"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
+    )
+    # Reference images are consumed at generation time, then cleared once the
+    # run finishes (the requested "disappear on complete response"). Done via
+    # .then so do_generate's yield contract is untouched.
+    _gen_evt.then(
+        _clear_ref_images,
+        inputs=None,
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"]],
     )
 
     _gen["thumbnails_link"].click(
@@ -956,6 +1190,19 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         _generate_gate_updates,
         inputs=None,
         outputs=[_gen["generate_row"], _gen["prompt_tb"], _gen["negative_tb"]],
+    )
+
+    # Second select handler: refresh the family-dependent bits — the Settings
+    # header label, the Flux.2-only input-image row's visibility, and an
+    # encoder/VAE compatibility warning — whenever the user lands on the page.
+    # Separate from the gate above so neither has to know the other's outputs.
+    _gen["generate_tab"].select(
+        _generate_family_updates,
+        inputs=[_gen["steps_dd"], _gen["cfg_scale_sld"],
+                _gen["width_dd"], _gen["height_dd"]],
+        outputs=[_gen["settings_header"], _gen["ref_row"], status_box,
+                 _gen["sampler_dd"], _gen["steps_dd"], _gen["cfg_scale_sld"],
+                 _gen["width_dd"], _gen["height_dd"]],
     )
 
     _gen["prompt_tb"].focus(
@@ -1054,7 +1301,7 @@ def _build_config_tab_inner() -> None:
     # and locks both dropdowns — it just does not announce itself.
     is_cpu_only = configure.get_install_type() == "cpu_only"
 
-    gr.Markdown("### Backend Selection")
+    gr.Markdown("### Backend Selection (model loading is one-shot)")
     with gr.Row():
         with gr.Column(scale=2):
             _cfg_w["enc_backend_dd"] = gr.Dropdown(
@@ -1160,11 +1407,12 @@ def _build_config_tab_inner() -> None:
                           else "Encoder Backend is CPU — all layers run on CPU."),
                     interactive=enc_is_vulkan,
                 )
-                _cfg_w["enc_flash_chk"] = gr.Checkbox(
-                    label="Flash Attention",
-                    value=cfg.get("encoder_flash_attn", True),
-                    info="Reduces VRAM usage for long contexts.",
-                )
+                # Encoder flash attention is automatic and needs no toggle:
+                # inference.py passes llama.cpp --flash-attn "auto". Unlike
+                # sd.cpp's Vulkan diffusion FA, llama.cpp FA on a GPU without
+                # fp16/coopmat2 just falls back to CPU for the attention math
+                # (correct, only slower), so it is safe on any card including a
+                # no-fp16 RX 470 — no fp16 gating, no checkbox.
 
         # ── ImageGen settings ──
         with gr.Column(scale=2):
@@ -1236,16 +1484,11 @@ def _build_config_tab_inner() -> None:
     # VAE. Same _resolve_vae() as the browse handler, so whichever of the two
     # fires (and .change fires for programmatic updates too, so both often do)
     # the outcome is identical and re-running is harmless.
-    def _on_diff_path_change(path: str, current_vae_path: str,
-                             current_vae_name: str):
-        return _resolve_vae(path, current_vae_path, current_vae_name)
-
-    _cfg_w["diff_path_tb"].change(
-        _on_diff_path_change,
-        inputs=[_cfg_w["diff_path_tb"], _cfg_w["vae_path_tb"],
-                _cfg_w["vae_name_tb"]],
-        outputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
-    )
+    # NOTE: the diffusion-path .change registration moved to
+    # _wire_config_events so it can also write the shared status bar (the
+    # "Switched to Flux.2-Klein — set VAE path" message) and update the VAE
+    # box's family hint. Same _resolve_vae logic, now via
+    # _on_diff_path_change_full.
 
     # ── Keep GPU Layers / Diffuser Placement in sync with their backend
     # dropdowns. Switching a backend to CPU must force the dependent
@@ -1301,9 +1544,19 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
     """Register Configuration tab save event that outputs to shared status_box."""
     w = _cfg_w
 
+    # Diffusion-path change: re-resolve the VAE (blanking it on a cross-family
+    # z-image ⇄ flux.2 switch), flash the family/switch message, and retune the
+    # VAE box's hint. Fires for Browse (which sets diff_path_tb programmatically)
+    # and for hand-edits alike.
+    w["diff_path_tb"].change(
+        _on_diff_path_change_full,
+        inputs=[w["diff_path_tb"], w["vae_path_tb"], w["vae_name_tb"]],
+        outputs=[w["vae_path_tb"], w["vae_name_tb"], status_box],
+    )
+
     def save_all(ep, en, dp, dn, vp, vn,
                  enc_back, img_back, threads,
-                 eb, ec, engl, ef,
+                 eb, ec, engl,
                  ic, img_placement):
         enc_parsed = configure.parse_backend_choice(enc_back)
         img_parsed = configure.parse_backend_choice(img_back)
@@ -1325,7 +1578,6 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "encoder_batch_size":  int(eb),
             "encoder_ctx_size":    int(ec),
             "encoder_gpu_layers":  int(engl),
-            "encoder_flash_attn":  bool(ef),
             "imagegen_clip_skip":  int(ic),
             "imagegen_placement":  img_placement,
             "first_run":           False,
@@ -1351,7 +1603,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["vae_path_tb"], w["vae_name_tb"],
             w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
             w["enc_batch_dd"], w["enc_ctx_dd"],
-            w["enc_ngl_dd"], w["enc_flash_chk"],
+            w["enc_ngl_dd"],
             w["img_clip_dd"], w["img_placement_dd"],
         ],
         outputs=[status_box, _gen["generate_row"], _gen["prompt_tb"],
@@ -1391,9 +1643,14 @@ def _build_preferences_tab_inner() -> None:
                 value=configure.get_max_thumbnails(),
                 info="How many images the Thumbnails Gallery shows, newest first.",
             )
-        # Empty spacer column so the dropdown keeps a sane width instead of
-        # stretching across the whole page on its own row.
-        with gr.Column(scale=2):
+        with gr.Column(scale=1):
+            _prf["encoder_debug_chk"] = gr.Checkbox(
+                label="Encoder Model Debug",
+                value=bool(prefs.get("encoder_model_debug", False)),
+                info="Print encoder output to terminal.",
+            )
+        # Spacer so the two controls keep a sane width instead of stretching.
+        with gr.Column(scale=1):
             pass
 
     with gr.Row():
@@ -1409,7 +1666,7 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
     output listing is unsliced (see _get_recent_images), so this costs a
     re-render, not a rescan.
     """
-    def save_prefs(prompt_template, max_thumbs):
+    def save_prefs(prompt_template, max_thumbs, encoder_debug):
         try:
             thumbs = int(max_thumbs)
         except (TypeError, ValueError):
@@ -1419,12 +1676,14 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
         configure.update_preferences({
             "prompt_template": prompt_template,
             "max_thumbnails":  thumbs,
+            "encoder_model_debug": bool(encoder_debug),
         })
         return "All preferences saved!", _get_recent_images(thumbs)
 
     _prf["save_prefs_btn"].click(
         save_prefs,
-        inputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"]],
+        inputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
+                _prf["encoder_debug_chk"]],
         outputs=[status_box, _gen["output_gallery"]],
     )
 
@@ -1877,7 +2136,7 @@ many paths that returns, they all land in this one scrolling row. ────�
 
         # ── Tabs ──────────────────────────────────────────────────────────────
         with gr.Tabs():
-            with gr.TabItem("Generate") as _gen["generate_tab"]:
+            with gr.TabItem("Generation") as _gen["generate_tab"]:
                 _build_generate_tab_inner()
 
             with gr.TabItem("Configuration"):
