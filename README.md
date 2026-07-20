@@ -5,7 +5,7 @@ Status: Working
 - Still updating readme for flux2...
 
 ### Description
-A local python image generator from prompt using Qwen 3 Z-Image Engineer encoder and Z-Image Turbo. This is a simple image generation project, covering what is possible currently to be most compitent through GGUF models, through but eventually cover several encoders and image generation models. While this program work great for what it does, it is also example scripts for AI on how to do image inference with such libraries/models, and useful in the production of other progreams that require such things. As you can see it generates OK images, they can look pretty real, but has the typical issues one would exoect under such restrictions and with AI image generation in general, but for simple images I think it will be effective in generating your result in a few iterations, so long as the request is not too barmy.   
+A local python image generator from prompt using, 1 various compatible Encoders, and 2 choice of either, Z-Image-Turbo-GGUF or Flux-2-Klein-GGUF. This is a super, TXT to IMG and IMG to IMG image, generation project, covering what is possible currently to be most compitent through lightweight GGUF models that can fit on a 8GB GPU, but also scales to larger VRAM if you have that, and of course if you want you can also run it through CPU. The installer compiles for your specific CPU/GPU combo for the BEST speeds in inference you will find out there right now. As you can see it generates OK images, but has the typical issues associated with the libraries/models one would expect. The program uses a separate encoder file (optional but just do it), and it ensures to load this in one-shot mode, ensuring that both models will be loaded individually to the GPU, maxizing the potential size of the Image generation model. All that said, there may be a little learning if you are used to Grok or something of that level of simplicity.
 
 ### Media
 - Generation page showing a image to image, and other development images. BTW, the red line is not a glitch its SecondLife (v1.28)...  
@@ -140,14 +140,12 @@ Currently...
 ```
 
 ### Examples:
-- If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, I cant remember the exact prompt, but you can compare it to my picture of a Woodch uck standing next to a pile of wood and juggling small logs of wood.
+- If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, or `A man walking his dog on the meadow on a sunny day.`, or if you want to do image to image then possibly `A photo-realistic version of the provided image.`.
 
 ### Notation:
-- If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...there are such things to consider when it tells you it ran out of ram.
+- If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...consider such things when it tells you it ran out of ram.
 - The assessment by OPUS said, the reason why I could not fit Q4 ImageGen model with DP on Full while could fit Q8 ImageGen model with DP on Split, is because the difference between DP on Split or FUll, is up to 4.6GB extra on top. Keep in mind the models are done in 1-shot mode not m-lock.
 - Something to consider is how much memory the Image model takes, image models need more space when loaded compared to a text model, if yo uneed more room for the image model then try Diffuser Placement is set to Split. So some tweaking settings may be requried with low VRAM. 
-- If you have older hardware, then I strongly advise generating 256x256 images unless you need them larger, as optimally 256x256 will take little time compared to 512x512 images. This is not such a problem if you have newer/expensive hardware. 
-- The Qwen3 encoder will do a good job of turning a bad prompt into something workable from a small input, but this is all experimental and an experiment too, so do not expect premium AI image quality, gguf versions of image generation models are sparse, you can see its slightly dated now because Qwen3 is the only encoder, but not that old that its naff. 
 
 ### Development:
 Development is somewhat stopped for now due to having implemented, z-image-turbo (txt-img) and flux 2 (img-img, txt-img), however ideas for improvement will be here...
