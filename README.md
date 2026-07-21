@@ -156,8 +156,7 @@ Currently...
 
 ### Development:
 Development is somewhat stopped for now due to having implemented, z-image-turbo (txt-img) and flux 2 (img-img, txt-img), however ideas for improvement will be here. There may be a few minor bugs to iron out too...
-- Flux 2 Encoder/ImageGen model variants, research and implement.
-- The first attached image seems to not refresh the display when added, so the user is forced to clear images then re-add to confirm its added.
+- there is a download icon on the image preview, but it doesnt work, but I prefer to click to open the thumbnails gallery on the Thumbnails Gallery, so I'd rather remove the little download image icon on the image preview, in order to reduce unneccesary complexity.
 
 ### Structure:
 - Scripts structure is...
