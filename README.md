@@ -34,15 +34,15 @@ A local python image generator from prompt using, 1 various compatible Encoders,
     GPU0: NVIDIA GeForce GTX 1060 3GB
     GPU1: Radeon (TM) RX 470 Graphics
 
-  llama-cli : C:\Inference_Files\Image-Gradio-Gguf\Image-Gradio-Gguf\data\llama_cpp_binaries\llama-cli.exe
-  sd        : C:\Inference_Files\Image-Gradio-Gguf\Image-Gradio-Gguf\data\stable_diffusion_binaries\sd-cli.exe
+  llama-cli : C:\Inference_Files\Image-Gradio-Gguf\data\llama_cpp_binaries\llama-cli.exe
+  sd        : C:\Inference_Files\Image-Gradio-Gguf\data\stable_diffusion_binaries\sd-cli.exe
 
   Encoder  : OK — G:/LargeModels/Text and Image/Qwen3-4b-Z-Image-Turbo-AbliteratedV1-GGUF/Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q4_K_M.gguf
   Diffusion: OK — G:/LargeModels/Text and Image/Z-Image-Turbo-GGUF/z_image_turbo-Q4_0.gguf
   VAE      : OK — G:\LargeModels\Text and Image\Z-Image-Turbo-GGUF\ae.safetensors
 
 [gallery] Scanning for Thumbnails....
-[gallery] Rescanned C:\Inference_Files\Image-Gradio-Gguf\Image-Gradio-Gguf-A013\output: 3 images
+[gallery] Rescanned C:\Inference_Files\Image-Gradio-Gguf\output: 3 images
 
 * Running on local URL:  http://127.0.0.1:7860
 * To create a public link, set `share=True` in `launch()`.
