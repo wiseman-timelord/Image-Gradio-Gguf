@@ -1,7 +1,7 @@
 ![image missing](https://raw.githubusercontent.com/wiseman-timelord/Image-Generator-Gguf/refs/heads/main/media/banner_llama.jpg)
 # Image-Gradio-Gguf
 Status: Working
-- Recently v1.28 - Now supporting both z-image-turbo and flux 2.
+- Recently v1.29 - A few bugs were fixed and some things checked.
 
 ### Description
 A local python image generator from prompt using, 1 various compatible Encoders, and 2 choice of either, Z-Image-Turbo-GGUF or Flux-2-Klein-GGUF. This is a super, TXT to IMG and IMG to IMG image, generation project, covering what is possible currently to be most compitent through lightweight GGUF models that can fit on a 8GB GPU, but also scales to larger VRAM if you have that, and of course if you want you can also run it through CPU. The installer compiles for your specific CPU/GPU combo for the BEST speeds in inference you will find out there right now. As you can see it generates OK images, but has the typical issues associated with the libraries/models one would expect. The program uses a separate encoder file (optional but just do it), and it ensures to load this in one-shot mode, ensuring that both models will be loaded individually to the GPU, maxizing the potential size of the Image generation model. All that said, there may be a little learning if you are used to Grok or something of that level of simplicity.
