@@ -691,9 +691,18 @@ def _build_generate_tab_inner() -> None:
                         file_types=["image"], type="filepath", size="sm",
                     )
                     _gen["ref_clear_btn"] = gr.Button("Clear Images", size="sm")
+                # Built visible=True (mounted) on purpose. A Textbox created
+                # visible=False is not placed in the DOM by Gradio 6, so the
+                # first Add — which sends value + visible=True together — paints
+                # nothing until a second update mounts it (the "first image
+                # doesn't appear, second makes both appear" bug). Keeping it
+                # mounted and never toggling visibility fixes that; the empty
+                # state is conveyed by the placeholder instead of by hiding.
+                # (See gradio issues #11768 / #12511.)
                 _gen["ref_list_tb"] = gr.Textbox(
-                    show_label=False, interactive=False, visible=False,
+                    show_label=False, interactive=False, visible=True,
                     lines=1, max_lines=8, elem_id="ref-image-list",
+                    placeholder="No reference images added yet \u2014 use \u201cAdd Image\u201d above.",
                 )
                 # Accumulated list of reference-image paths (the real input to
                 # generation); the textbox above is just its visible form.
@@ -1100,11 +1109,17 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
     # ── Reference-image Add / Clear handlers ────────────────────────────────
     def _render_ref_list(paths: List[str]) -> Any:
-        """Show accumulated reference filenames one per line; hide when empty."""
-        if not paths:
-            return gr.update(value="", visible=False)
-        names = "\n".join(Path(p).name for p in paths)
-        return gr.update(value=names, visible=True)
+        """Show accumulated reference filenames one per line.
+
+        Only the value is updated here — visibility is intentionally left
+        alone. The textbox is built visible=True (see its construction), so it
+        is already in the DOM and its value renders on the very first Add. When
+        the list is empty the value is cleared and the placeholder shows,
+        giving the same "nothing listed" read the old hide-when-empty gave,
+        but without the Gradio first-reveal drop.
+        """
+        names = "\n".join(Path(p).name for p in (paths or []))
+        return gr.update(value=names)
 
     def _add_ref_images(new_files, current):
         """Append the just-picked file(s) to the accumulated list. gr.UploadButton
@@ -1450,7 +1465,19 @@ def _build_config_tab_inner() -> None:
     # ── Events: browse & scan — no status output, wire immediately ──
     def _browse_encoder():
         p = _browse_file()
-        return (p, Path(p).stem) if p else (gr.update(), gr.update())
+        if not p:
+            return gr.update(), gr.update()
+        # The mmproj vision projector lives beside the VL model in the same
+        # folder, so it shows up in this dialog. It is not a text encoder;
+        # refuse it here and leave the current selection untouched.
+        if inference.is_mmproj(p):
+            try:
+                gr.Warning("That file is an mmproj vision projector, not a text "
+                           "encoder — not loaded. Pick the main model .gguf.")
+            except Exception:
+                pass
+            return gr.update(), gr.update()
+        return p, Path(p).stem
 
     def _browse_diffusion(current_vae_path: str, current_vae_name: str):
         p = _browse_file()
@@ -1560,6 +1587,14 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
                  ic, img_placement):
         enc_parsed = configure.parse_backend_choice(enc_back)
         img_parsed = configure.parse_backend_choice(img_back)
+        # Never persist a vision projector as the encoder (covers a path carried
+        # over from a prior session or a hand-edited config file). Clear it so
+        # it can't reach the backend, and flag it in the saved-status message.
+        mmproj_note = ""
+        if ep and inference.is_mmproj(ep):
+            ep, en = "", ""
+            mmproj_note = ("The selected encoder was an mmproj vision projector "
+                           "and has been cleared — pick the main model .gguf. ")
         configure.update_configuration({
             "encoder_model_path":  ep,  "encoder_model_name":  en,
             "imagegen_model_path": dp,  "imagegen_model_name": dn,
@@ -1594,7 +1629,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
                    f"model is set and on disk (missing: {', '.join(missing)}).")
         else:
             msg = "All configuration saved! Generate page is ready."
-        return msg, row_u, prompt_u, neg_u
+        return mmproj_note + msg, row_u, prompt_u, neg_u
 
     w["save_all_btn"].click(
         save_all,

@@ -104,8 +104,12 @@ def scan_directory(dir_path: str,
     results: List[Dict[str, Any]] = []
     for ext in extensions:
         for fp in path.rglob(f"*{ext}"):
+            # Cheap name reject before the probe so a projector sitting beside
+            # a model is never enumerated (and so never auto-selected).
+            if is_mmproj_name(fp.name):
+                continue
             meta = probe_model(str(fp))
-            if meta:
+            if meta and not is_mmproj(meta):
                 results.append(meta)
     return results
 
@@ -129,7 +133,8 @@ def find_model_by_name(substring: str, search_dirs: List[str]) -> Optional[str]:
             continue
         for fp in dp.rglob("*"):
             if (substring.lower() in fp.name.lower()
-                    and fp.suffix.lower() in (".gguf", ".safetensors")):
+                    and fp.suffix.lower() in (".gguf", ".safetensors")
+                    and not is_mmproj_name(fp.name)):
                 return str(fp)
     return None
 
@@ -185,6 +190,77 @@ def _arch_of(meta: Dict[str, Any]) -> str:
     return str(meta.get("architecture", "")).strip().lower()
 
 
+# ---------------------------------------------------------------------------
+# mmproj / vision-projector detection  --  these must NEVER load
+# ---------------------------------------------------------------------------
+# A VL model (Qwen3-VL-4B etc.) ships its language backbone in the main *.gguf
+# and its VISION tower in a SEPARATE companion file, conventionally named
+# mmproj-*.gguf. This program uses the language backbone as a TEXT encoder only
+# (sd.cpp --llm / llama-completion) and has no use for image input, so the
+# mmproj must never be loaded. Neither sd.cpp nor llama-completion auto-loads a
+# sibling mmproj without an explicit --mmproj flag (which we never pass), but a
+# projector can still slip in one way: the user pointing the Encoder selection
+# straight at the mmproj file, because it sits in the same folder as the model.
+# is_mmproj() is the single gate every selection path funnels through so that
+# can't happen -- whichever folder or drive the model was picked from.
+#
+# Two signals, either one is decisive:
+#   1. Filename -- the ecosystem names these mmproj-*.gguf (also mm-proj / mm_proj
+#      / *-mmproj-* and, rarely, projector-*). This is the primary signal and is
+#      exactly what the user sees in the folder.
+#   2. GGUF metadata -- a projector reports general.architecture "clip" AND
+#      carries a vision marker (clip.has_vision_encoder true, or a projector_type).
+#      A PLAIN CLIP-L/-G TEXT encoder also reports arch "clip" but has NO vision
+#      encoder, so the vision marker -- not the arch alone -- is what separates a
+#      projector (reject) from a legitimate CLIP text encoder (keep).
+_MMPROJ_NAME_RE = re.compile(
+    r"(?:^|[-_. ])mm[-_. ]?proj(?:ector)?(?![a-z])"
+    r"|(?:^|[-_. ])projector(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def is_mmproj_name(name: str) -> bool:
+    """True if the bare filename looks like a vision projector (mmproj)."""
+    return bool(_MMPROJ_NAME_RE.search(str(name)))
+
+
+def is_mmproj(model: Any, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """True if `model` is a multimodal vision projector rather than a usable
+    text encoder / diffuser / VAE. Accepts a path (str/Path) or an already
+    probed metadata dict. Filename decides first (cheap, universal); GGUF
+    metadata is the fallback for an oddly-named projector.
+    """
+    if isinstance(model, dict):
+        meta = model
+        name = str(meta.get("filename") or Path(str(meta.get("file", ""))).name)
+    else:
+        name = Path(str(model)).name
+
+    if name and is_mmproj_name(name):
+        return True
+
+    # Only probe if we were handed a path and no metadata, and it is a gguf on
+    # disk. A missing/unreadable file simply falls through to False here; the
+    # existence checks live at the call sites.
+    if meta is None and not isinstance(model, dict):
+        p = Path(str(model)).expanduser()
+        if p.suffix.lower() == ".gguf" and p.exists():
+            meta = _probe_gguf(p) or {}
+
+    if meta:
+        arch = str(meta.get("architecture", "")).lower()
+        has_vision = bool(meta.get("has_vision_encoder"))
+        projector_type = str(meta.get("projector_type", "")).strip()
+        # Explicit vision encoder is decisive on its own; combined with a
+        # clip-family arch it is doubly so. Never flag on arch alone.
+        if has_vision:
+            return True
+        if arch in ("clip", "clip_vision", "mmproj") and projector_type:
+            return True
+    return False
+
+
 def classify_model(meta: Dict[str, Any]) -> str:
     """
     Return "encoder", "diffusion", "vae" or "unknown" for one probed model.
@@ -197,6 +273,14 @@ def classify_model(meta: Dict[str, Any]) -> str:
     folder patterns are the fallback for unreadable metadata and safetensors.
     See configure.py's "Model family identification" block for the lists.
     """
+    # A vision projector must never be routed to any usable bin. Catch it
+    # BEFORE the arch check: a projector's general.architecture is "clip",
+    # which is in ENCODER_ARCHITECTURES, so arch routing would otherwise misfile
+    # it as an encoder and offer it as one. "unknown" keeps it out of every
+    # encoder list, dropdown, and auto-detection path -- present and future.
+    if is_mmproj(meta):
+        return "unknown"
+
     arch = _arch_of(meta)
     if arch:
         if arch in configure.ENCODER_ARCHITECTURES:
@@ -299,8 +383,18 @@ def check_model_compatibility(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     fam = configure.diffuser_family(diff_path, diff_arch)
     fam_label = configure.diffuser_family_label(diff_path, diff_arch)
 
-    # ── Encoder size ↔ diffuser size ──────────────────────────────────────
+    # ── Encoder is a vision projector, not a text encoder ─────────────────
+    # A positive, always-checked reject (independent of the diffuser family, so
+    # it fires even when the diffuser is unrecognised). Catches the mmproj that
+    # lives beside the VL model on disk being picked as the Encoder.
     enc_path = cfg.get("encoder_model_path", "")
+    if enc_path and Path(enc_path).exists() and is_mmproj(enc_path):
+        return False, ("The selected encoder is a multimodal vision projector "
+                       "(mmproj), not a text encoder. Select the main model "
+                       ".gguf instead — the mmproj file adds image input and is "
+                       "not used by this program.")
+
+    # ── Encoder size ↔ diffuser size ──────────────────────────────────────
     need_dim = configure.required_encoder_dim(diff_path, diff_arch)
     if enc_path and Path(enc_path).exists() and need_dim:
         have_dim = _encoder_hidden_dim(enc_path)
@@ -360,6 +454,15 @@ def _probe_gguf(p: Path) -> Optional[Dict[str, Any]]:
             # written after them is unreachable by design.
             wanted = ("architecture", "name", "description",
                       "block_count", "embedding_length", "context_length")
+            # Vision-projector markers, captured if present so is_mmproj() can
+            # recognise a projector by metadata as well as by name. These are
+            # deliberately NOT part of the early-stop gate below: ordinary
+            # encoders/diffusers/VAEs never carry them, so gating on them would
+            # defeat the early stop for every file. mmproj files, in turn, lack
+            # the block_count/embedding_length keys the gate needs, so they
+            # never early-stop and these markers are reached and recorded.
+            opportunistic = ("has_vision_encoder", "projector_type")
+            gate = wanted[:1] + wanted[3:]
             for _ in range(min(kv_count, 128)):
                 try:
                     kv = _read_gguf_kv(f)
@@ -367,11 +470,11 @@ def _probe_gguf(p: Path) -> Optional[Dict[str, Any]]:
                         break
                     key, value = kv
                     short = key.split(".")[-1]
-                    if short in wanted:
+                    if short in wanted or short in opportunistic:
                         meta[short] = value
                     # Everything we care about is present: stop early rather
                     # than parse tokenizer arrays we will never look at.
-                    if all(k in meta for k in wanted[:1] + wanted[3:]):
+                    if all(k in meta for k in gate):
                         break
                 except Exception:
                     break
@@ -598,6 +701,13 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
     """
     model_path = cfg.get("encoder_model_path", "")
     if not model_path or not Path(model_path).exists():
+        return prompt
+    # Never load a vision projector as a text encoder. If the configured
+    # encoder is an mmproj, skip enhancement entirely rather than feed it to
+    # llama-completion (the run itself is separately blocked by
+    # check_model_compatibility). Returning the prompt unchanged keeps a
+    # mis-selection from silently loading a projector here.
+    if is_mmproj(model_path):
         return prompt
     cli = find_llama_completion()
     if not cli:
@@ -940,6 +1050,14 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
 
     # Pass the Qwen3 encoder as the LLM text encoder for Z-Image-Turbo.
     # This is mandatory — the diffusion gguf has no bundled text encoder.
+    # Last-resort guard: never hand sd.cpp a vision projector as --llm, and
+    # never emit --mmproj at all, so a projector cannot load by any route even
+    # if one slipped past the earlier checks.
+    if enc_path and is_mmproj(enc_path):
+        raise ValueError(
+            "Refusing to run: the configured encoder is an mmproj vision "
+            "projector, not a text encoder. Reselect the main model .gguf in "
+            "Configuration.")
     if enc_path and Path(enc_path).exists():
         args.extend(["--llm", enc_path])
 
