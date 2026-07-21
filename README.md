@@ -101,6 +101,8 @@ Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
 Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
 qwen_3_4b.Q#.gguf              (plain Qwen3-4B)
 Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
+Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
+flux2-klein-4b-uncensored-q#.gguf and qwen3-4b-abl-q#.gguf (same model)
 ```
 Image models:
 ```
