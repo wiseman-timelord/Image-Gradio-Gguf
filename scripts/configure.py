@@ -112,6 +112,29 @@ ENCODER_FAMILIES: Dict[str, Dict[str, Any]] = {
         "embedding_length": 2560,
         "max_context": 40960,
     },
+    # flux2-klein-4B "uncensored" text encoder (WeReCooking / Cordux). This IS a
+    # Qwen3-4B under the hood -- an abliterated huihui-ai/Qwen3-4B-abliterated
+    # (arch qwen3, hidden 2560, 36 layers) republished for Flux.2-klein-4B -- so
+    # its specs are identical to the qwen3-4b entry above; it exists only so the
+    # name-fallback recognises the flux2-klein-*-uncensored FILENAME, which the
+    # qwen3-4b pattern misses (no "qwen" token). The other in-the-wild filename,
+    # qwen3-4b-abl-q#.gguf, already matches the qwen3-4b entry.
+    #
+    # The pattern is anchored on BOTH "4b" AND "uncensored" on purpose:
+    #   * "uncensored" (with "klein") keeps it off the real klein DIFFUSERS,
+    #     which are never uncensored -- matching ENCODER_NAME_PATTERNS above.
+    #   * "4b" keeps it from ever claiming Qwen3-4B (2560) for a hypothetical
+    #     flux2-klein-9B uncensored encoder, which would be a Qwen3-8B (4096) and
+    #     must fall through to metadata rather than be mislabelled here. This is
+    #     mutually exclusive with every other entry (none carry "klein"), so its
+    #     position in the dict does not matter.
+    "flux2-klein-4b-encoder": {
+        "label": "Qwen3-4B (Flux.2-klein uncensored text encoder)",
+        "pattern": r"klein[-_. ]?4b.*?uncensored",
+        "layers": 36,
+        "embedding_length": 2560,
+        "max_context": 40960,
+    },
 }
 
 # llama.cpp clamps any -ngl larger than the real block count to "all layers".
@@ -485,6 +508,20 @@ ENCODER_NAME_PATTERNS: List[str] = [
     r"qwen(?!.{0,3}image)",   # qwen3-4b-... but not qwen_image / qwen-image
     r"engineer",
     r"encoder",
+    # flux2-klein "uncensored" TEXT ENCODER (WeReCooking / Cordux). It is a
+    # Qwen3-4B encoder (general.architecture=qwen3) republished for
+    # Flux.2-klein-4B, but its bare FILENAME -- flux2-klein-4b-uncensored-q#.gguf
+    # -- carries the flux2/klein tokens and NOT "qwen" or "encoder", so nothing
+    # above catches it and it would otherwise fall through to the "flux"
+    # DIFFUSION pattern and be misfiled as a diffuser. "klein" + "uncensored" is
+    # the discriminator: the real klein DIFFUSERS (flux-2-klein-4b*,
+    # flux-2-klein-base-4b*) are never "uncensored". Metadata still wins in
+    # classify_model() -- arch=qwen3 already classifies a readable copy as an
+    # encoder -- so this is purely the name-fallback for an unreadable-metadata
+    # file, bringing this encoder to the same fallback parity as every other.
+    # (The sibling filename qwen3-4b-abl-q#.gguf is already caught by the qwen
+    # pattern above.)
+    r"klein.*?uncensored",
     r"\bllava\b",
     r"\bvision\b",
     r"\bvl\b",
