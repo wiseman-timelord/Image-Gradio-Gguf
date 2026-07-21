@@ -149,7 +149,7 @@ Currently...
 - If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...consider such things when it tells you it ran out of ram.
 - The assessment by OPUS said, the reason why I could not fit Q4 ImageGen model with DP on Full while could fit Q8 ImageGen model with DP on Split, is because the difference between DP on Split or FUll, is up to 4.6GB extra on top. Keep in mind the models are done in 1-shot mode not m-lock.
 - Something to consider is how much memory the Image model takes, image models need more space when loaded compared to a text model, if yo uneed more room for the image model then try Diffuser Placement is set to Split. So some tweaking settings may be requried with low VRAM. 
-- 512x512 or less on flux 2 seems buggy, however, 512x768 or 768x512, seems to work good, while for me 768x768 will not fit in 8GB VRAM.
+- 512x512 or less on flux 2 seems buggy, however, 512x512 and 512x768 and 768x512, seems to work good, while for me 768x768 will not fit in 8GB VRAM when diffuse placement is Split.
 
 ### Development:
 Development is somewhat stopped for now due to having implemented, z-image-turbo (txt-img) and flux 2 (img-img, txt-img), however ideas for improvement will be here...
