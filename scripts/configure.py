@@ -1247,6 +1247,17 @@ def _default_configuration() -> Dict[str, Any]:
     }
 
 
+def default_configuration() -> Dict[str, Any]:
+    """Public accessor for the canonical factory-default configuration dict.
+
+    Same single source of truth that seeds a fresh install (installer.py's
+    write_default_configuration) and backfills missing keys at load time
+    (_default_configuration / _load_json_with_defaults). Exposed so the
+    Configuration page's "Revert To Defaults" button resets its widgets from
+    exactly these values rather than a second, drift-prone copy."""
+    return _default_configuration()
+
+
 # ---------------------------------------------------------------------------
 # Config I/O
 # ---------------------------------------------------------------------------

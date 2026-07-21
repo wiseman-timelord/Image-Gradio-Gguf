@@ -721,12 +721,16 @@ def _build_generate_tab_inner() -> None:
             # Single currently-selected/in-progress image — most recent
             # generation, the live phase status image, or a clicked gallery
             # thumbnail. Never shows Gradio's built-in progress bar.
+            # No corner buttons on the preview at all. The little download
+            # icon was removed on purpose: it did not reliably work, and the
+            # intended way to keep/open an image is the Thumbnails Gallery
+            # below (click a thumbnail), so the icon was only added complexity.
             # Gradio 6 replaced show_download_button/show_share_button with a
-            # single buttons=[...] list, so build the kwarg for whichever
-            # major version is installed.
+            # single buttons=[...] list — an empty list hides every corner
+            # button; the pre-6 branch turns the download button off directly.
             _img_button_kwargs = (
-                {"buttons": ["download"]} if _GRADIO_MAJOR >= 6
-                else {"show_download_button": True, "show_share_button": False}
+                {"buttons": []} if _GRADIO_MAJOR >= 6
+                else {"show_download_button": False, "show_share_button": False}
             )
             _gen["preview_img"] = gr.Image(
                 label="Image Preview",
@@ -1457,9 +1461,14 @@ def _build_config_tab_inner() -> None:
     # stored in data/preferences.json, not data/configuration.json — so the
     # Save All Configuration button below neither reads nor writes it.
 
-    # ── Save ──
+    # ── Save / Revert ──
+    # "Revert To Defaults" sits to the right of Save; variant="stop" gives it
+    # the red styling (same as the Exit Program button). It only repaints the
+    # widgets to their factory defaults — nothing is written to
+    # configuration.json until the user clicks Save All Configuration.
     with gr.Row():
-        _cfg_w["save_all_btn"]    = gr.Button("Save All Configuration", variant="primary", size="lg")
+        _cfg_w["save_all_btn"] = gr.Button("Save All Configuration", variant="primary", size="lg")
+        _cfg_w["revert_btn"]   = gr.Button("Revert To Defaults", variant="stop", size="lg")
 
 
     # ── Events: browse & scan — no status output, wire immediately ──
@@ -1645,6 +1654,62 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
                  _gen["negative_tb"]],
     )
 
+    # ── Revert To Defaults ──
+    # Repaints every Configuration widget from the single canonical source
+    # (configure.default_configuration()), so this button, a fresh install and
+    # the load-time backfill can never disagree. Confirmation is a gr.Info
+    # toast rather than the shared status bar: clearing the diffusion path
+    # below re-fires the diff-path .change handler, which writes its own line
+    # to the status bar, so a toast avoids two writers fighting over it.
+    #
+    # Backends revert to CPU (first choice), which is why GPU Layers and
+    # Diffuser Placement are returned disabled at their CPU-forced values
+    # (0 layers / Full CPU) — matching how the page locks them whenever a
+    # backend is CPU. Model name/path boxes are emptied. Nothing is persisted
+    # until Save All Configuration is clicked; the Generate gate therefore
+    # stays as-is (it reads configuration.json, not these textboxes).
+    def revert_config():
+        d = configure.default_configuration()
+        choices = _backend_choices()
+        cpu_backend = choices[0] if choices else "CPU"
+        try:
+            gr.Info("Configuration reverted to defaults — click "
+                    "'Save All Configuration' to apply.")
+        except Exception:
+            pass
+        return (
+            gr.update(value=cpu_backend),                       # enc_backend_dd
+            gr.update(value=cpu_backend),                       # img_backend_dd
+            gr.update(value=d["encoder_threads"]),              # threads_dd
+            gr.update(value=""),                                # enc_name_tb
+            gr.update(value=""),                                # enc_path_tb
+            gr.update(value=""),                                # diff_name_tb
+            gr.update(value=""),                                # diff_path_tb
+            gr.update(value=""),                                # vae_name_tb
+            gr.update(value=""),                                # vae_path_tb
+            gr.update(value=d["encoder_batch_size"]),           # enc_batch_dd
+            gr.update(value=d["encoder_ctx_size"]),             # enc_ctx_dd
+            gr.update(value=0, interactive=False,               # enc_ngl_dd
+                      info="Encoder Backend is CPU — all layers run on CPU."),
+            gr.update(value=d["imagegen_clip_skip"]),           # img_clip_dd
+            gr.update(value=configure.DIFFUSER_PLACEMENT_FULL_CPU,  # img_placement_dd
+                      interactive=False,
+                      info="ImageGen Backend is CPU — sd.cpp will not touch the GPU at all."),
+        )
+
+    w["revert_btn"].click(
+        revert_config,
+        inputs=[],
+        outputs=[
+            w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
+            w["enc_name_tb"], w["enc_path_tb"],
+            w["diff_name_tb"], w["diff_path_tb"],
+            w["vae_name_tb"], w["vae_path_tb"],
+            w["enc_batch_dd"], w["enc_ctx_dd"], w["enc_ngl_dd"],
+            w["img_clip_dd"], w["img_placement_dd"],
+        ],
+    )
+
 # ---------------------------------------------------------------------------
 # Tab 3 — Preferences  (UI widgets + event wiring split for shared status)
 # ---------------------------------------------------------------------------
@@ -1688,9 +1753,14 @@ def _build_preferences_tab_inner() -> None:
         with gr.Column(scale=1):
             pass
 
+    # "Revert To Defaults" sits to the right of Save; variant="stop" gives it
+    # the red styling. It only repaints the widgets — preferences.json is not
+    # written until the user clicks Save All Preferences.
     with gr.Row():
-        _prf["save_prefs_btn"] = gr.Button("Save All Preferences",
-                                           variant="primary", size="lg")
+        _prf["save_prefs_btn"]   = gr.Button("Save All Preferences",
+                                             variant="primary", size="lg")
+        _prf["revert_prefs_btn"] = gr.Button("Revert To Defaults",
+                                             variant="stop", size="lg")
 
 
 def _wire_preferences_events(status_box: gr.Textbox) -> None:
@@ -1720,6 +1790,30 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
         inputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
                 _prf["encoder_debug_chk"]],
         outputs=[status_box, _gen["output_gallery"]],
+    )
+
+    # ── Revert To Defaults ──
+    # Repaints the three Preferences widgets to the same values that seed a
+    # fresh preferences.json (configure._default_preferences()). Confirmation
+    # is a gr.Info toast, matching the Configuration page's revert button, and
+    # nothing is written to disk until Save All Preferences is clicked.
+    def revert_prefs():
+        try:
+            gr.Info("Preferences reverted to defaults — click "
+                    "'Save All Preferences' to apply.")
+        except Exception:
+            pass
+        return (
+            gr.update(value=configure.DEFAULT_PROMPT_TEMPLATE),  # prompt_template_tb
+            gr.update(value=configure.DEFAULT_MAX_THUMBNAILS),   # max_thumbs_dd
+            gr.update(value=False),                              # encoder_debug_chk
+        )
+
+    _prf["revert_prefs_btn"].click(
+        revert_prefs,
+        inputs=[],
+        outputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
+                 _prf["encoder_debug_chk"]],
     )
 
 
