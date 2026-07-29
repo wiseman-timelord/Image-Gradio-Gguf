@@ -149,7 +149,7 @@ class AppWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self._apply_saved_geometry(geometry)
 
-        icon_path = configure.get_media_dir() / "program_icon.ico"
+        icon_path = configure.get_images_dir() / "banner_llama.ico"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
@@ -219,7 +219,26 @@ def _shutdown(window_geometry: dict, gradio_app) -> None:
     os._exit(0)
 
 
+def _set_windows_app_id() -> None:
+    """Give this process its own AppUserModelID on Windows.
+
+    Without this, Windows groups the taskbar entry under the host
+    interpreter (python.exe) and shows *its* icon instead of ours,
+    regardless of what QIcon we set on the window. Must run before the
+    QApplication / any window is created."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            f"WiseManTimeLord.{APP_TITLE}"
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _set_windows_app_id()
     configure.ensure_data_dirs()
     _print_banner()
     blocks_app, _css = display.build_app()
@@ -253,6 +272,10 @@ def main() -> None:
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName(APP_TITLE)
+
+    app_icon_path = configure.get_images_dir() / "banner_llama.ico"
+    if app_icon_path.exists():
+        qt_app.setWindowIcon(QIcon(str(app_icon_path)))
 
     saved_geometry = configure.get_window_geometry()
     window = AppWindow(

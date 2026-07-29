@@ -75,7 +75,7 @@ REM venv python path - used to run launcher directly, no activate needed
 set "VENVPY=venv\Scripts\python.exe"
 
 :menu
-cls
+REM cls
 echo ================================================================================
 echo       Image-Gradio-Gguf: Batch Menu
 echo ================================================================================
