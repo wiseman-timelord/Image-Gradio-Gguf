@@ -245,6 +245,24 @@ SUPPORTED_REF_IMAGE_EXTS = {
     ".psd", ".hdr", ".pic", ".pnm", ".ppm", ".pgm",
 }
 
+# Reference-image handling mode when 2+ images are accumulated in the Flux.2
+# "Image Edit" input list (see display.py's ref_images_state / ref_mode_radio
+# and inference.generate_image's ref_images handling):
+#   REF_MODE_USE_ALL   - all accumulated images are handed to a SINGLE
+#                        generation as multiple -r references (sd.cpp's
+#                        native multi-reference edit); one run, one batch.
+#   REF_MODE_CHAIN_ALL - the list is split and each image is run through its
+#                        OWN generation individually (one -r per run), in
+#                        sequence; with N images and a batch count of B this
+#                        produces N*B images total. Status lines show
+#                        "Chain i/N" for whichever run is currently active.
+# Only offered as a choice (i.e. the radio is shown at all) once 2+ reference
+# images are accumulated -- with 0 or 1 images there is nothing to chain.
+REF_MODE_USE_ALL   = "Use All"
+REF_MODE_CHAIN_ALL = "Chain All"
+REF_MODE_CHOICES   = [REF_MODE_USE_ALL, REF_MODE_CHAIN_ALL]
+REF_MODE_DEFAULT   = REF_MODE_USE_ALL
+
 # Encoder hidden_size per Qwen3 size, and the size each diffuser demands. The
 # check in inference.check_model_compatibility() is a dimension comparison, not
 # a name guess: GGUF `*.embedding_length` (already read by _probe_gguf) gives
@@ -890,12 +908,23 @@ def get_models_dir() -> Path:
 
 def get_media_dir() -> Path:
     """
-    Static UI status images (not user data, not generated output):
-      media/program_no_media.jpg  - shown when output/ is empty / idle
-      media/program_encoding.jpg  - shown while the prompt-encoder LLM runs
-      media/program_diffusion.jpg - shown while sd.cpp diffusion runs
+    Graphics for the README only (./media). Not read by the running
+    program — see get_images_dir() for the program's own UI/taskbar
+    graphics.
     """
     return _get_project_root() / "media"
+
+
+def get_images_dir() -> Path:
+    """
+    Static UI/taskbar graphics for the running program (not user data,
+    not generated output):
+      images/banner_llama.ico      - app/taskbar icon (see launcher.py)
+      images/program_no_media.jpg  - shown when output/ is empty / idle
+      images/program_encoding.jpg  - shown while the prompt-encoder LLM runs
+      images/program_diffusion.jpg - shown while sd.cpp diffusion runs
+    """
+    return _get_project_root() / "images"
 
 
 def get_build_dir() -> Path:
@@ -912,7 +941,7 @@ def get_sd_bin_dir() -> Path:
 
 def ensure_data_dirs() -> None:
     root = _get_project_root()
-    for d in ("data", "output", "models", "media"):
+    for d in ("data", "output", "models", "media", "images"):
         (root / d).mkdir(parents=True, exist_ok=True)
 
 

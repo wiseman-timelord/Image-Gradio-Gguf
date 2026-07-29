@@ -387,12 +387,12 @@ def _get_recent_images(max_images: Optional[int] = None) -> List[str]:
         return []
 
 # ---------------------------------------------------------------------------
-# Preview box status images (.\media\program_*.jpg)
+# Preview box status images (.\images\program_*.jpg)
 # ---------------------------------------------------------------------------
 
 def _status_image(name: str) -> Optional[str]:
-    """Return str path to a media/program_<name>.jpg, or None if missing."""
-    p = configure.get_media_dir() / f"program_{name}.jpg"
+    """Return str path to a images/program_<name>.jpg, or None if missing."""
+    p = configure.get_images_dir() / f"program_{name}.jpg"
     return str(p) if p.exists() else None
 
 
@@ -707,6 +707,19 @@ def _build_generate_tab_inner() -> None:
                 # Accumulated list of reference-image paths (the real input to
                 # generation); the textbox above is just its visible form.
                 _gen["ref_images_state"] = gr.State([])
+                # Only meaningful once 2+ images are accumulated (nothing to
+                # choose between with 0 or 1), so built hidden and toggled by
+                # _add_ref_images / _clear_ref_images alongside the list itself.
+                # "Use All" matches the previous, only prior behaviour (every
+                # accumulated image handed to sd.cpp as one multi-reference
+                # edit); "Chain All" instead runs each image through its own
+                # generation in sequence (see do_generate's chain_mode branch).
+                _gen["ref_mode_radio"] = gr.Radio(
+                    label="Multiple Reference Images",
+                    choices=configure.REF_MODE_CHOICES,
+                    value=configure.REF_MODE_DEFAULT,
+                    visible=False, elem_id="ref-image-mode",
+                )
 
             gr.Markdown("#### Submitting Input (check settings)")
             with gr.Row(visible=configured) as _gen["generate_row"]:
@@ -842,7 +855,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             _timeout_timer["handle"] = None
 
     def do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None):
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None,
+    ref_mode=None):
         """
         Generator: yields (preview_img, gallery, status, btn_update) tuples
         so the preview box can switch between program_encoding.jpg /
@@ -855,6 +869,17 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         as Generate). Final yield swaps the preview to the finished image
         and rescans .\\output into the gallery — the gallery never receives
         a per-call image list, only full folder rescans.
+
+        ref_mode (configure.REF_MODE_USE_ALL / REF_MODE_CHAIN_ALL) only
+        matters when 2+ reference images are accumulated:
+          - REF_MODE_USE_ALL (default/only prior behaviour): every
+            accumulated image is handed to ONE generation as multiple -r
+            references.
+          - REF_MODE_CHAIN_ALL: each image is instead run through its OWN
+            generation, one after another (see chain_mode / ref_batches
+            below); with N images and a batch count of B this produces
+            N*B images total, and the status line gets a "Chain i/N;"
+            prefix identifying which run in the sequence is active.
         """
         gallery_now  = _get_recent_images()
         preview_now  = _idle_preview_image()
@@ -890,13 +915,24 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # preferences.json, while everything else comes from configuration.json.
         # Merged here, at the one place a generation is launched, so neither
         # inference.py nor the save handlers need to know about the split.
-        gen_cfg = dict(c)
-        gen_cfg["prompt_template"] = _prefs().get(
+        # ref_images is added per-run below (see ref_batches) rather than
+        # here, since Chain All needs a different list on each run.
+        base_gen_cfg = dict(c)
+        base_gen_cfg["prompt_template"] = _prefs().get(
             "prompt_template", configure.DEFAULT_PROMPT_TEMPLATE)
-        # Reference images (Flux.2 -r). gr.File(file_count="multiple") returns
-        # a list of paths, a single path, or None; normalise to a list of
-        # existing paths. inference.generate_image() ignores this entirely for
-        # Z-Image and only uses it when the diffuser is Flux.2.
+        base_gen_cfg.update(
+            imagegen_width=int(width), imagegen_height=int(height),
+            imagegen_steps=int(steps), imagegen_sampling=sampler,
+            imagegen_cfg_scale=float(cfg_scale),
+            imagegen_seed=int(seed), imagegen_batch_count=int(batch),
+            negative_prompt=negative,
+            output_format=output_format,
+        )
+
+        # Reference images (Flux.2 -r). gr.UploadButton hands us a path, a
+        # list of paths, or None; normalise to a list of existing paths.
+        # inference.generate_image() ignores this entirely for Z-Image and
+        # only uses it when the diffuser is Flux.2.
         if ref_images is None:
             _refs = []
         elif isinstance(ref_images, (list, tuple)):
@@ -904,179 +940,230 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         else:
             _refs = [str(ref_images)]
 
-        gen_cfg.update(
-            imagegen_width=int(width), imagegen_height=int(height),
-            imagegen_steps=int(steps), imagegen_sampling=sampler,
-            imagegen_cfg_scale=float(cfg_scale),
-            imagegen_seed=int(seed), imagegen_batch_count=int(batch),
-            negative_prompt=negative,
-            output_format=output_format,
-            ref_images=_refs,
-        )
+        # Chain All only kicks in with 2+ images -- with 0 or 1 there is
+        # nothing to split, so it collapses to the same single-run behaviour
+        # as Use All. Each chain "link" is a single-image list, run through
+        # its own call to inference.generate_image(); Use All (or the
+        # collapsed case) is one run carrying the whole list.
+        chain_mode = (ref_mode == configure.REF_MODE_CHAIN_ALL) and len(_refs) > 1
+        ref_batches: List[List[str]] = ([[r] for r in _refs] if chain_mode
+                                        else [_refs])
+        chain_total = len(ref_batches)
 
         configure.APP_STATE["cancel_requested"] = False
 
-        # ── Run generation on a worker thread; main thread yields preview
-        #    + status updates based on phase, polled from a shared mutable
-        #    holder ("_phase"). The status string shows which of the two
-        #    phases is active (1/2 Encoding, 2/2 Diffusing) plus a live
-        #    timer for that phase. Once configure.TIMING_STATS has data from
-        #    a prior generation this session, the timer becomes an ETA
-        #    countdown-style display ("~Ns left"); until then it just counts
-        #    up, since there's nothing to estimate against yet. ──
-        _batch_count = int(batch)
-        _phase: Dict[str, Any] = {
-            "name": "encoding", "result": None, "done": False,
-            "phase_start": time.time(), "step": 0, "total_steps": 0,
-            "batch_current": 1, "batch_total": _batch_count,
-            "last_step_seen": 0,
-        }
+        last_preview = preview_now
+        last_gallery = gallery_now
+        last_result: Dict[str, Any] = {"success": False, "message": "Unknown error"}
+        chain_successes = 0
 
-        def prog_cb(msg: str, pct: float, info: Dict[str, Any] = None):
-            info = info or {}
-            phase = info.get("phase")
-            if phase in ("encoding", "diffusion"):
-                _phase["name"] = phase
-            else:
-                # Fallback for any caller that didn't pass phase info.
-                m = msg.lower()
-                if "enhanc" in m or "encod" in m:
-                    _phase["name"] = "encoding"
-                elif "generat" in m or "step" in m or "%" in m:
-                    _phase["name"] = "diffusion"
-            if "phase_start" in info:
-                _phase["phase_start"] = info["phase_start"]
-            if "step" in info:
-                new_step = info["step"]
-                # Detect when the step counter resets (new image in batch):
-                # a step value of 1 arriving after we've already seen a
-                # higher step means sd.cpp has moved on to the next image.
-                if (new_step == 1 and _phase["last_step_seen"] > 1
-                        and _phase["batch_current"] < _phase["batch_total"]):
-                    _phase["batch_current"] += 1
-                _phase["last_step_seen"] = new_step
-                _phase["step"] = new_step
-            if "total_steps" in info:
-                _phase["total_steps"] = info["total_steps"]
+        for chain_idx, ref_batch in enumerate(ref_batches, start=1):
+            gen_cfg = dict(base_gen_cfg)
+            gen_cfg["ref_images"] = ref_batch
 
-        def _format_status() -> str:
-            """Build the 'Generate Stage N/2; [Batch Number X/Y; ]... Phase
-            {step}/{total}...###s (prev_batch_Ns)' status string. Seconds are
-            always whole numbers (no split seconds) per the fixed status-bar
-            format — never decimals.
+            # ── Run generation on a worker thread; main thread yields preview
+            #    + status updates based on phase, polled from a shared mutable
+            #    holder ("_phase"). The status string shows which of the two
+            #    phases is active (1/2 Encoding, 2/2 Diffusing) plus a live
+            #    timer for that phase. Once configure.TIMING_STATS has data
+            #    from a prior generation this session, the timer becomes an
+            #    ETA countdown-style display ("~Ns left"); until then it just
+            #    counts up, since there's nothing to estimate against yet. ──
+            _batch_count = int(batch)
+            _phase: Dict[str, Any] = {
+                "name": "encoding", "result": None, "done": False,
+                "phase_start": time.time(), "step": 0, "total_steps": 0,
+                "batch_current": 1, "batch_total": _batch_count,
+                "last_step_seen": 0,
+            }
 
-            Ordering: Generate Stage leads, because Stage 1 (encoding) runs ONCE
-            up front and Stage 2 (diffusion) is what actually iterates per image
-            — so Batch Number is a Stage-2 concept and is shown only then, after
-            the stage, never during encoding."""
-            name = _phase["name"]
-            elapsed_s = int(time.time() - _phase["phase_start"])
-            batch_cur = _phase["batch_current"]
-            batch_tot = _phase["batch_total"]
+            def prog_cb(msg: str, pct: float, info: Dict[str, Any] = None):
+                info = info or {}
+                phase = info.get("phase")
+                if phase in ("encoding", "diffusion"):
+                    _phase["name"] = phase
+                else:
+                    # Fallback for any caller that didn't pass phase info.
+                    m = msg.lower()
+                    if "enhanc" in m or "encod" in m:
+                        _phase["name"] = "encoding"
+                    elif "generat" in m or "step" in m or "%" in m:
+                        _phase["name"] = "diffusion"
+                if "phase_start" in info:
+                    _phase["phase_start"] = info["phase_start"]
+                if "step" in info:
+                    new_step = info["step"]
+                    # Detect when the step counter resets (new image in batch):
+                    # a step value of 1 arriving after we've already seen a
+                    # higher step means sd.cpp has moved on to the next image.
+                    if (new_step == 1 and _phase["last_step_seen"] > 1
+                            and _phase["batch_current"] < _phase["batch_total"]):
+                        _phase["batch_current"] += 1
+                    _phase["last_step_seen"] = new_step
+                    _phase["step"] = new_step
+                if "total_steps" in info:
+                    _phase["total_steps"] = info["total_steps"]
 
-            # Previous batch elapsed suffix — only shown when we have a
-            # recorded time from a completed batch earlier this session.
-            prev_elapsed = configure.APP_STATE.get("last_batch_elapsed_seconds", 0)
-            prev_suffix = f" ({int(prev_elapsed)}s)" if prev_elapsed else ""
+            def _format_status() -> str:
+                """Build the '[Chain I/N; ]Generate Stage N/2; [Batch Number
+                X/Y; ]... Phase {step}/{total}...###s (prev_batch_Ns)' status
+                string. Seconds are always whole numbers (no split seconds)
+                per the fixed status-bar format — never decimals.
 
-            if name == "encoding":
-                # enhance_prompt() (inference.py) is a single-shot llama-cli
-                # call with no per-token step/total reported back through
-                # progress_callback, so step/total are only ever populated
-                # once a step-aware encoder backend supplies them. Until
-                # then this degrades to a plain running timer rather than
-                # showing a fabricated "0/0". No Batch Number here: encoding
-                # is a one-time Stage-1 step, not per-image.
+                Ordering: Chain leads (it is the outermost loop, one full
+                Generate Stage 1-2 run per link), then Generate Stage, because
+                Stage 1 (encoding) runs ONCE up front per link and Stage 2
+                (diffusion) is what actually iterates per image — so Batch
+                Number is a Stage-2 concept and is shown only then, after the
+                stage, never during encoding."""
+                name = _phase["name"]
+                elapsed_s = int(time.time() - _phase["phase_start"])
+                batch_cur = _phase["batch_current"]
+                batch_tot = _phase["batch_total"]
+
+                chain_prefix = (f"Chain {chain_idx}/{chain_total}; "
+                                if chain_total > 1 else "")
+
+                # Previous batch elapsed suffix — only shown when we have a
+                # recorded time from a completed batch earlier this session.
+                prev_elapsed = configure.APP_STATE.get("last_batch_elapsed_seconds", 0)
+                prev_suffix = f" ({int(prev_elapsed)}s)" if prev_elapsed else ""
+
+                if name == "encoding":
+                    # enhance_prompt() (inference.py) is a single-shot llama-cli
+                    # call with no per-token step/total reported back through
+                    # progress_callback, so step/total are only ever populated
+                    # once a step-aware encoder backend supplies them. Until
+                    # then this degrades to a plain running timer rather than
+                    # showing a fabricated "0/0". No Batch Number here: encoding
+                    # is a one-time Stage-1 step, not per-image.
+                    step = _phase.get("step", 0)
+                    total = _phase.get("total_steps", 0)
+                    step_part = f" {step}/{total}" if total else ""
+                    return (f"{chain_prefix}Generate Stage 1/2; Encoding Phase"
+                            f"{step_part}...{elapsed_s}s{prev_suffix}")
+
+                # diffusion (Stage 2) — Batch Number belongs here, after the stage.
+                batch_prefix = f"Batch Number {batch_cur}/{batch_tot}; "
                 step = _phase.get("step", 0)
-                total = _phase.get("total_steps", 0)
+                total = _phase.get("total_steps", 0) or int(gen_cfg.get("imagegen_steps", 0))
                 step_part = f" {step}/{total}" if total else ""
-                return (f"Generate Stage 1/2; Encoding Phase{step_part}..."
-                        f"{elapsed_s}s{prev_suffix}")
+                return (f"{chain_prefix}Generate Stage 2/2; {batch_prefix}"
+                        f"Diffusing Phase{step_part}...{elapsed_s}s{prev_suffix}")
 
-            # diffusion (Stage 2) — Batch Number belongs here, after the stage.
-            batch_prefix = f"Batch Number {batch_cur}/{batch_tot}; "
-            step = _phase.get("step", 0)
-            total = _phase.get("total_steps", 0) or int(gen_cfg.get("imagegen_steps", 0))
-            step_part = f" {step}/{total}" if total else ""
-            return (f"Generate Stage 2/2; {batch_prefix}Diffusing Phase{step_part}..."
-                    f"{elapsed_s}s{prev_suffix}")
+            def worker():
+                try:
+                    _phase["result"] = inference.generate_image(
+                        prompt.strip(), gen_cfg, progress_callback=prog_cb)
+                except Exception as e:
+                    _phase["result"] = {"success": False, "output_path": "",
+                                        "message": f"Error: {e}"}
+                finally:
+                    _phase["done"] = True
 
-        def worker():
-            try:
-                _phase["result"] = inference.generate_image(
-                    prompt.strip(), gen_cfg, progress_callback=prog_cb)
-            except Exception as e:
-                _phase["result"] = {"success": False, "output_path": "",
-                                    "message": f"Error: {e}"}
-            finally:
-                _phase["done"] = True
+            t = threading.Thread(target=worker, daemon=True)
+            t.start()
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+            last_shown_img = None
+            last_shown_second = -1
+            first_tick = True
+            # Button switches to "..Please Wait.." the moment the worker thread
+            # starts. Only send that update on the FIRST poll tick of the FIRST
+            # chain link — re-sending the same gr.update() on every 0.15s tick
+            # forces Gradio to re-render the button node repeatedly, which was
+            # cascading into a layout recalculation of sibling nodes in the
+            # same column (incl. the preview image) and intermittently
+            # knocking out its object-fit CSS override. Once the button is
+            # already showing "..Please Wait..", later ticks (and later chain
+            # links) pass a true no-op (gr.update()) for it.
+            #
+            # The status string itself is also throttled to once per whole
+            # second (last_shown_second), independent of the 0.15s poll
+            # cadence — the timer display only ever shows whole seconds, so
+            # there is no reason to push a new status string more than once a
+            # second even though we keep polling faster for image/button
+            # responsiveness.
+            while not _phase["done"]:
+                img = _status_image(_phase["name"])
+                current_second = int(time.time() - _phase["phase_start"])
+                btn_update = _btn_wait if (first_tick and chain_idx == 1) else gr.update()
+                first_tick = False
 
-        last_shown_img = None
-        last_shown_second = -1
-        first_tick = True
-        # Button switches to "..Please Wait.." the moment the worker thread starts.
-        # Only send that update on the FIRST poll tick — re-sending the same
-        # gr.update() on every 0.15s tick forces Gradio to re-render the
-        # button node repeatedly, which was cascading into a layout
-        # recalculation of sibling nodes in the same column (incl. the
-        # preview image) and intermittently knocking out its object-fit
-        # CSS override. Once the button is already showing "..Please Wait..", later
-        # ticks pass a true no-op (gr.update()) for it.
-        #
-        # The status string itself is also throttled to once per whole
-        # second (last_shown_second), independent of the 0.15s poll
-        # cadence — the timer display only ever shows whole seconds, so
-        # there is no reason to push a new status string more than once a
-        # second even though we keep polling faster for image/button
-        # responsiveness.
-        while not _phase["done"]:
-            img = _status_image(_phase["name"])
-            current_second = int(time.time() - _phase["phase_start"])
-            btn_update = _btn_wait if first_tick else gr.update()
-            first_tick = False
+                status_update = gr.update()
+                if current_second != last_shown_second:
+                    last_shown_second = current_second
+                    status_update = _format_status()
 
-            status_update = gr.update()
-            if current_second != last_shown_second:
-                last_shown_second = current_second
-                status_update = _format_status()
+                if img and img != last_shown_img:
+                    last_shown_img = img
+                    last_preview = img
+                    yield img, gr.update(), status_update, btn_update
+                else:
+                    yield gr.update(), gr.update(), status_update, btn_update
+                time.sleep(0.15)
+            t.join()
 
-            if img and img != last_shown_img:
-                last_shown_img = img
-                yield img, gr.update(), status_update, btn_update
+            result = _phase["result"] or {"success": False, "message": "Unknown error"}
+            last_result = result
+            is_last_link = (chain_idx == chain_total)
+
+            # Button only flips back to idle on the FINAL link's terminal
+            # yield — mid-chain it stays "..Please Wait.." since the next
+            # link starts immediately. On that final link, when chaining,
+            # the per-link message is replaced by the aggregate summary
+            # below rather than shown here.
+            btn_final = _btn_generate if is_last_link else gr.update()
+
+            if result.get("success") and result.get("output_path"):
+                chain_successes += 1
+                out_path = Path(result["output_path"])
+                try:
+                    sz = out_path.stat().st_size
+                    print(f"[generate] output file: {out_path}  ({sz} bytes)", flush=True)
+                except Exception as e:
+                    print(f"[generate] output file STAT FAILED: {out_path}  {e}", flush=True)
+                # Record the total batch elapsed time so the next generation
+                # can display it as a reference in the status bar (previous
+                # batch time). Recorded per link so a mid-chain glance at the
+                # status bar still reflects the most recently finished run.
+                batch_elapsed = result.get("elapsed_seconds", 0.0)
+                configure.APP_STATE["last_batch_elapsed_seconds"] = int(round(batch_elapsed))
+                last_gallery = _get_recent_images()
+                last_preview = str(out_path)
             else:
-                yield gr.update(), gr.update(), status_update, btn_update
-            time.sleep(0.15)
-        t.join()
+                last_gallery = _get_recent_images()
 
-        # Start inactivity timer now that generation is finished
+            if is_last_link and chain_total > 1:
+                # Chain finished: report the aggregate result rather than
+                # just the last link's own message.
+                msg = f"Chain complete: {chain_successes}/{chain_total} succeeded."
+            elif result.get("success") and result.get("output_path"):
+                chain_prefix = f"Chain {chain_idx}/{chain_total}; " if chain_total > 1 else ""
+                msg = (f"{chain_prefix}{result['message']} | Seed: {result['seed_used']} "
+                       f"| Time: {int(round(result['elapsed_seconds']))}s")
+            else:
+                chain_prefix = f"Chain {chain_idx}/{chain_total}; " if chain_total > 1 else ""
+                msg = f"{chain_prefix}{result.get('message', 'Unknown error')}"
+
+            if result.get("success") and result.get("output_path"):
+                preview_update = last_preview
+            else:
+                preview_update = _idle_preview_image()
+            yield preview_update, last_gallery, msg, btn_final
+            # A failed link does not abort the rest of the chain — the
+            # remaining reference images still get their own attempt,
+            # matching "images dont go missing while processing".
+
+        # Start inactivity timer now that ALL links have finished
         _reset_inactivity_timer()
 
-        result = _phase["result"] or {"success": False, "message": "Unknown error"}
-
-        if result.get("success") and result.get("output_path"):
-            out_path = Path(result["output_path"])
-            try:
-                sz = out_path.stat().st_size
-                print(f"[generate] output file: {out_path}  ({sz} bytes)", flush=True)
-            except Exception as e:
-                print(f"[generate] output file STAT FAILED: {out_path}  {e}", flush=True)
-            # Record the total batch elapsed time so the next generation can
-            # display it as a reference in the status bar (previous batch time).
-            batch_elapsed = result.get("elapsed_seconds", 0.0)
-            configure.APP_STATE["last_batch_elapsed_seconds"] = int(round(batch_elapsed))
-            msg = (f"{result['message']} | Seed: {result['seed_used']} "
-                   f"| Time: {int(round(result['elapsed_seconds']))}s")
-            new_gallery = _get_recent_images()
-            yield str(out_path), new_gallery, msg, _btn_generate
-            # Auto-save settings only when the Quality Preset is "Custom".
-            # Named presets (Fast, Balanced, Quality, etc.) are fixed — no
-            # need to persist them since they are always reconstructed from
-            # configure.get_generation_presets(). Custom captures any
-            # user-modified combination that deviates from the named presets,
-            # and must be saved so it survives the next launch.
+        # Auto-save settings only when the Quality Preset is "Custom", and
+        # only once any link succeeded. Named presets (Fast, Balanced,
+        # Quality, etc.) are fixed — no need to persist them since they are
+        # always reconstructed from configure.get_generation_presets().
+        # Custom captures any user-modified combination that deviates from
+        # the named presets, and must be saved so it survives the next launch.
+        if chain_successes > 0:
             if quality_preset == "Custom":
                 configure.update_configuration({
                     "imagegen_quality_preset": "Custom",
@@ -1093,23 +1180,24 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 configure.update_configuration({
                     "imagegen_quality_preset": quality_preset,
                 })
-        else:
-            new_gallery = _get_recent_images()
-            yield _idle_preview_image(), new_gallery, result.get("message", "Unknown error"), _btn_generate
 
 
     def on_generate_click(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None):
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None,
+    ref_mode=None):
         """Dispatch a click on the single dynamic button. The button reads
         "Generate" when idle and starts a run (delegating to the do_generate
         generator, which yields its own button-state updates). While a run
         is in progress the button is disabled and shows "..Please Wait..",
         preventing concurrent runs. ref_images is the Flux.2 input-image list
         (from ref_images_state); it is ignored for Z-Image runs inside
-        inference.generate_image(). Flash attention is decided automatically
-        from the selected GPU's fp16 capability — no input here."""
+        inference.generate_image(). ref_mode (from ref_mode_radio) selects
+        Use All vs Chain All when 2+ reference images are present — see
+        do_generate's chain_mode handling. Flash attention is decided
+        automatically from the selected GPU's fp16 capability — no input
+        here."""
         yield from do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset, ref_images)
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images, ref_mode)
 
     # ── Reference-image Add / Clear handlers ────────────────────────────────
     def _render_ref_list(paths: List[str]) -> Any:
@@ -1125,6 +1213,11 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         names = "\n".join(Path(p).name for p in (paths or []))
         return gr.update(value=names)
 
+    def _render_ref_mode_visibility(count: int) -> Any:
+        """Show the Use All / Chain All switch only once there is an actual
+        choice to make -- i.e. 2 or more accumulated reference images."""
+        return gr.update(visible=count > 1)
+
     def _add_ref_images(new_files, current):
         """Append the just-picked file(s) to the accumulated list. gr.UploadButton
         hands us a path, a list of paths, or None."""
@@ -1134,20 +1227,23 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 acc.extend(str(f) for f in new_files if f)
             else:
                 acc.append(str(new_files))
-        return acc, _render_ref_list(acc)
+        return acc, _render_ref_list(acc), _render_ref_mode_visibility(len(acc))
 
     def _clear_ref_images():
-        return [], _render_ref_list([])
+        # Reset the mode back to its default too, so a fresh batch of images
+        # next time doesn't inherit a leftover "Chain All" selection.
+        return ([], _render_ref_list([]),
+                gr.update(visible=False, value=configure.REF_MODE_DEFAULT))
 
     _gen["ref_add_btn"].upload(
         _add_ref_images,
         inputs=[_gen["ref_add_btn"], _gen["ref_images_state"]],
-        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"]],
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
     )
     _gen["ref_clear_btn"].click(
         _clear_ref_images,
         inputs=None,
-        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"]],
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
     )
 
     _gen_evt = _gen["generate_btn"].click(
@@ -1156,7 +1252,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
         _gen["sampler_dd"], _gen["cfg_scale_sld"],
         _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"],
-        _gen["preset_dd"], _gen["ref_images_state"]],
+        _gen["preset_dd"], _gen["ref_images_state"], _gen["ref_mode_radio"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
     )
@@ -1166,7 +1262,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     _gen_evt.then(
         _clear_ref_images,
         inputs=None,
-        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"]],
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
     )
 
     _gen["thumbnails_link"].click(
