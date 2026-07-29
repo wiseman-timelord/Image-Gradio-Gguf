@@ -710,10 +710,12 @@ def _build_generate_tab_inner() -> None:
                 # Only meaningful once 2+ images are accumulated (nothing to
                 # choose between with 0 or 1), so built hidden and toggled by
                 # _add_ref_images / _clear_ref_images alongside the list itself.
-                # "Use All" matches the previous, only prior behaviour (every
+                # "Use All" matches the only prior behaviour (every
                 # accumulated image handed to sd.cpp as one multi-reference
                 # edit); "Chain All" instead runs each image through its own
-                # generation in sequence (see do_generate's chain_mode branch).
+                # generation in sequence (see do_generate's chain_mode branch)
+                # and is the default, since Use All holds every reference in
+                # VRAM at once and the OOM risk grows with each added image.
                 _gen["ref_mode_radio"] = gr.Radio(
                     label="Multiple Reference Images",
                     choices=configure.REF_MODE_CHOICES,
@@ -872,14 +874,17 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
         ref_mode (configure.REF_MODE_USE_ALL / REF_MODE_CHAIN_ALL) only
         matters when 2+ reference images are accumulated:
-          - REF_MODE_USE_ALL (default/only prior behaviour): every
-            accumulated image is handed to ONE generation as multiple -r
-            references.
-          - REF_MODE_CHAIN_ALL: each image is instead run through its OWN
+          - REF_MODE_CHAIN_ALL (default): each image is run through its OWN
             generation, one after another (see chain_mode / ref_batches
             below); with N images and a batch count of B this produces
             N*B images total, and the status line gets a "Chain i/N;"
-            prefix identifying which run in the sequence is active.
+            prefix identifying which run in the sequence is active. Only
+            one reference is ever resident at a time, which is the safer
+            choice memory-wise.
+          - REF_MODE_USE_ALL: every accumulated image is instead handed to
+            ONE generation as multiple -r references — a deliberate opt-in,
+            since sd.cpp holds all of them in VRAM at once for that single
+            run and the OOM risk grows with each added image.
         """
         gallery_now  = _get_recent_images()
         preview_now  = _idle_preview_image()

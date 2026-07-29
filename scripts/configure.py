@@ -261,7 +261,13 @@ SUPPORTED_REF_IMAGE_EXTS = {
 REF_MODE_USE_ALL   = "Use All"
 REF_MODE_CHAIN_ALL = "Chain All"
 REF_MODE_CHOICES   = [REF_MODE_USE_ALL, REF_MODE_CHAIN_ALL]
-REF_MODE_DEFAULT   = REF_MODE_USE_ALL
+# Chain All is the default: sd.cpp holds every -r reference in VRAM at once
+# for Use All, so as the accumulated image count grows so does the OOM risk
+# (especially on a card as small as the RX 470). Chain All only ever holds
+# one reference at a time, so it is the safer default; Use All remains a
+# deliberate opt-in for when the user actually wants a single multi-
+# reference edit.
+REF_MODE_DEFAULT   = REF_MODE_CHAIN_ALL
 
 # Encoder hidden_size per Qwen3 size, and the size each diffuser demands. The
 # check in inference.check_model_compatibility() is a dimension comparison, not
