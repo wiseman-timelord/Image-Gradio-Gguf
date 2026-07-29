@@ -260,7 +260,7 @@ SUPPORTED_REF_IMAGE_EXTS = {
 # images are accumulated -- with 0 or 1 images there is nothing to chain.
 REF_MODE_USE_ALL   = "Use All"
 REF_MODE_CHAIN_ALL = "Chain All"
-REF_MODE_CHOICES   = [REF_MODE_USE_ALL, REF_MODE_CHAIN_ALL]
+REF_MODE_CHOICES   = [REF_MODE_CHAIN_ALL, REF_MODE_USE_ALL]
 # Chain All is the default: sd.cpp holds every -r reference in VRAM at once
 # for Use All, so as the accumulated image count grows so does the OOM risk
 # (especially on a card as small as the RX 470). Chain All only ever holds
