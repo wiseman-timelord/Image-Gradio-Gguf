@@ -877,8 +877,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
           - REF_MODE_CHAIN_ALL (default): each image is run through its OWN
             generation, one after another (see chain_mode / ref_batches
             below); with N images and a batch count of B this produces
-            N*B images total, and the status line gets a "Chain i/N;"
-            prefix identifying which run in the sequence is active. Only
+            N*B images total, and the status line gets a "Chain Position
+            i/N;" prefix identifying which run in the sequence is active. Only
             one reference is ever resident at a time, which is the safer
             choice memory-wise.
           - REF_MODE_USE_ALL: every accumulated image is instead handed to
@@ -1026,7 +1026,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 batch_cur = _phase["batch_current"]
                 batch_tot = _phase["batch_total"]
 
-                chain_prefix = (f"Chain {chain_idx}/{chain_total}; "
+                chain_prefix = (f"Chain Position {chain_idx}/{chain_total}; "
                                 if chain_total > 1 else "")
 
                 # Previous batch elapsed suffix — only shown when we have a
@@ -1143,11 +1143,11 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 # just the last link's own message.
                 msg = f"Chain complete: {chain_successes}/{chain_total} succeeded."
             elif result.get("success") and result.get("output_path"):
-                chain_prefix = f"Chain {chain_idx}/{chain_total}; " if chain_total > 1 else ""
+                chain_prefix = f"Chain Position {chain_idx}/{chain_total}; " if chain_total > 1 else ""
                 msg = (f"{chain_prefix}{result['message']} | Seed: {result['seed_used']} "
                        f"| Time: {int(round(result['elapsed_seconds']))}s")
             else:
-                chain_prefix = f"Chain {chain_idx}/{chain_total}; " if chain_total > 1 else ""
+                chain_prefix = f"Chain Position {chain_idx}/{chain_total}; " if chain_total > 1 else ""
                 msg = f"{chain_prefix}{result.get('message', 'Unknown error')}"
 
             if result.get("success") and result.get("output_path"):
