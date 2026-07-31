@@ -635,6 +635,65 @@ def get_install_type_from_ini() -> str:
     return "cpu_only"
 
 
+def _default_pictures_dir() -> str:
+    """The logged-in user's real "Pictures" (My Pictures) folder.
+
+    Seeds configuration.json's last_image_browse_dir, the folder the Generate
+    page's "Add Image" picker opens in until the user browses somewhere else.
+
+    Asked of the shell rather than assumed: Pictures is a KNOWN FOLDER and it
+    moves. OneDrive relocates it to %USERPROFILE%\\OneDrive\\Pictures, and
+    anyone short on system-drive space repoints it at another drive entirely,
+    so a hand-built %USERPROFILE%\\Pictures can easily name a folder that does
+    not exist. SHGetKnownFolderPath(FOLDERID_Pictures) returns where it
+    actually lives; %USERPROFILE%\\Pictures and then the home folder are only
+    fallbacks for when the COM call is unavailable (non-Windows host).
+
+    This is a deliberate MIRROR of scripts/configure.py's get_pictures_dir() /
+    _windows_pictures_dir(). It cannot import it: this installer runs before
+    scripts/ is guaranteed to exist and imports nothing from scripts.* (see
+    the module docstring), exactly as detect_cpu() and _default_gpu_index()
+    are mirrored there. Change one, change the other.
+    """
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD),
+                            ("Data2", wintypes.WORD),
+                            ("Data3", wintypes.WORD),
+                            ("Data4", ctypes.c_byte * 8)]
+
+            # FOLDERID_Pictures, from KnownFolders.h.
+            folderid = "{33E28130-4E1E-4676-835A-98395C3BC3BB}"
+            ole32, shell32 = ctypes.windll.ole32, ctypes.windll.shell32
+            ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_GUID)]
+            shell32.SHGetKnownFolderPath.argtypes = [
+                ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+                ctypes.POINTER(ctypes.c_wchar_p),
+            ]
+            guid = _GUID()
+            if ole32.CLSIDFromString(folderid, ctypes.byref(guid)) == 0:
+                out = ctypes.c_wchar_p()
+                if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
+                                                ctypes.byref(out)) == 0:
+                    try:
+                        value = out.value or ""
+                    finally:
+                        ole32.CoTaskMemFree(out)
+                    if value and Path(value).is_dir():
+                        return value
+        except Exception:
+            pass
+    profile = os.environ.get("USERPROFILE", "")
+    if profile:
+        candidate = Path(profile) / "Pictures"
+        if candidate.is_dir():
+            return str(candidate)
+    return str(Path.home())
+
+
 def _default_gpu_index(vk: Dict[str, Any]) -> int:
     """Pick a sensible starting GPU for a fresh install, on ANY machine.
 
@@ -684,6 +743,11 @@ def write_default_configuration(cpu: Dict[str, Any],
         "imagegen_model_path": "", "imagegen_model_name": "",
         "vae_model_path": "", "vae_model_name": "",
         "last_model_browse_dir": ".\\models",
+        # Starting folder for the Generate page's "Add Image" picker. Models
+        # live under .\models, but reference images are the user's own files,
+        # so this starts at their Pictures folder for THIS login and is then
+        # overwritten with wherever they actually browse to.
+        "last_image_browse_dir": _default_pictures_dir(),
         "backend_encoder": "CPU",
         "backend_imagegen": "CPU",
         "encoder_threads": dt,

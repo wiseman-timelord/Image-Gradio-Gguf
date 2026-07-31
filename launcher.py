@@ -240,6 +240,13 @@ def _set_windows_app_id() -> None:
 def main() -> None:
     _set_windows_app_id()
     configure.ensure_data_dirs()
+    # Load the persisted bits of session state into configure.APP_STATE once,
+    # here, before any UI exists — currently the "Add Image" picker's starting
+    # folder (configuration.json's last_image_browse_dir). Doing it at startup
+    # rather than on first use keeps the file reads off the click path, and
+    # resets the session-only entries (reference-image list, Use All /
+    # Chain All mode) to their launch defaults.
+    configure.init_session_state()
     _print_banner()
     blocks_app, _css = display.build_app()
 
