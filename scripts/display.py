@@ -677,61 +677,19 @@ def _build_generate_tab_inner() -> None:
             # auto-save their settings panel values (see do_generate's success
             # branch), so the next launch picks up the last settings that worked.
 
-        # ── Column 2: prompts, dynamic image input, Generate button ──────────
+        # ── Column 2: image input, prompts, Generate button ──────────────────
+        # Order is deliberate, top to bottom: Image Edit, then the prompts,
+        # then Generate. The image input sits FIRST so that attaching images
+        # grows the list downward from the top of the column — pushing the
+        # negative prompt (the least interesting box, usually a set-and-forget
+        # boilerplate line) toward the bottom of the screen instead of pushing
+        # the image list off it. Generate stays pinned last, so the column
+        # still reads as input → describe → go.
         with gr.Column(scale=1):
-            gr.Markdown("### Prompts")
-            # ── Positive Prompt, with a "(history)" popout ──────────────────
-            # The label itself is the toggle: a gr.Button stripped of button
-            # chrome by #positive-history-toggle CSS, reading as plain label
-            # text until clicked. Clicking opens/closes the recent-prompts
-            # panel (same handler both directions). History is pre-loaded at
-            # build time and re-fetched on every toggle so a just-made
-            # generation shows without a reload.
-            _gen["positive_history_toggle"] = gr.Button(
-                "Positive Prompt (click for history)",
-                elem_id="positive-history-toggle",
-            )
-            _gen["prompt_tb"] = gr.Textbox(
-                show_label=False,
-                placeholder=prompt_ph,
-                lines=2, max_lines=10,
-                value=cfg.get("last_prompt", ""),
-                elem_id="prompt-positive",
-            )
-            _positive_history = configure.get_prompt_history("positive")
-            with gr.Column(visible=False, elem_id="positive-history-panel") as _gen["positive_history_panel"]:
-                _gen["positive_history_btns"] = []
-                for _hist_text in _positive_history:
-                    _gen["positive_history_btns"].append(
-                        gr.Button(_hist_text, visible=False,
-                                 elem_classes=["prompt-history-item"])
-                    )
-            _gen["positive_history_state"] = gr.State(False)
-
-            # ── Negative Prompt, same "(history)" popout pattern ─────────────
-            _gen["negative_history_toggle"] = gr.Button(
-                "Negative Prompt (click for history)",
-                elem_id="negative-history-toggle",
-            )
-            _gen["negative_tb"] = gr.Textbox(
-                show_label=False,
-                placeholder=neg_ph,
-                lines=2, max_lines=10,
-                value=cfg.get("negative_prompt", ""),
-                elem_id="prompt-negative",
-            )
-            _negative_history = configure.get_prompt_history("negative")
-            with gr.Column(visible=False, elem_id="negative-history-panel") as _gen["negative_history_panel"]:
-                _gen["negative_history_btns"] = []
-                for _hist_text in _negative_history:
-                    _gen["negative_history_btns"].append(
-                        gr.Button(_hist_text, visible=False,
-                                 elem_classes=["prompt-history-item"])
-                    )
-            _gen["negative_history_state"] = gr.State(False)
-
             # ── Flux.2 controls: flash-attn toggle + reference images ───────
-            # Whole column shown ONLY when the diffuser is Flux.2.
+            # Whole column shown ONLY when the diffuser is Flux.2. When hidden
+            # it occupies no height, so on a Z-Image model column 2 opens on
+            # "### Prompts" exactly as it did before this block moved up.
             _flux2_now = (configure.diffuser_family(cfg.get("imagegen_model_path", ""))
                           == configure.DIFFUSER_FAMILY_FLUX2)
             with gr.Column(visible=_flux2_now) as _gen["ref_row"]:
@@ -801,6 +759,57 @@ def _build_generate_tab_inner() -> None:
                     value=configure.get_ref_mode(),
                     visible=False, elem_id="ref-image-mode",
                 )
+
+            gr.Markdown("### Prompts")
+            # ── Positive Prompt, with a "(history)" popout ──────────────────
+            # The label itself is the toggle: a gr.Button stripped of button
+            # chrome by #positive-history-toggle CSS, reading as plain label
+            # text until clicked. Clicking opens/closes the recent-prompts
+            # panel (same handler both directions). History is pre-loaded at
+            # build time and re-fetched on every toggle so a just-made
+            # generation shows without a reload.
+            _gen["positive_history_toggle"] = gr.Button(
+                "Positive Prompt (click for history)",
+                elem_id="positive-history-toggle",
+            )
+            _gen["prompt_tb"] = gr.Textbox(
+                show_label=False,
+                placeholder=prompt_ph,
+                lines=2, max_lines=10,
+                value=cfg.get("last_prompt", ""),
+                elem_id="prompt-positive",
+            )
+            _positive_history = configure.get_prompt_history("positive")
+            with gr.Column(visible=False, elem_id="positive-history-panel") as _gen["positive_history_panel"]:
+                _gen["positive_history_btns"] = []
+                for _hist_text in _positive_history:
+                    _gen["positive_history_btns"].append(
+                        gr.Button(_hist_text, visible=False,
+                                 elem_classes=["prompt-history-item"])
+                    )
+            _gen["positive_history_state"] = gr.State(False)
+
+            # ── Negative Prompt, same "(history)" popout pattern ─────────────
+            _gen["negative_history_toggle"] = gr.Button(
+                "Negative Prompt (click for history)",
+                elem_id="negative-history-toggle",
+            )
+            _gen["negative_tb"] = gr.Textbox(
+                show_label=False,
+                placeholder=neg_ph,
+                lines=2, max_lines=10,
+                value=cfg.get("negative_prompt", ""),
+                elem_id="prompt-negative",
+            )
+            _negative_history = configure.get_prompt_history("negative")
+            with gr.Column(visible=False, elem_id="negative-history-panel") as _gen["negative_history_panel"]:
+                _gen["negative_history_btns"] = []
+                for _hist_text in _negative_history:
+                    _gen["negative_history_btns"].append(
+                        gr.Button(_hist_text, visible=False,
+                                 elem_classes=["prompt-history-item"])
+                    )
+            _gen["negative_history_state"] = gr.State(False)
 
             gr.Markdown("#### Submitting Input (check settings)")
             with gr.Row(visible=configured) as _gen["generate_row"]:
