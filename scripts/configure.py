@@ -818,7 +818,109 @@ APP_STATE: Dict[str, Any] = {
     "last_prompt": "",
     "is_building": False,
     "last_batch_elapsed_seconds": 0,  # elapsed seconds of the last completed batch job
+
+    # ── Generate page "Image Edit" state — session-only, NOT persisted ──────
+    # ref_images : the accumulated "Add Image" list. It survives a completed
+    #              generation on purpose; the ONLY thing that empties it is
+    #              the "Clear Images" button. Mirrors the Gradio State that
+    #              carries it into a run (display._add_ref_images /
+    #              _clear_ref_images keep the two in step).
+    # ref_mode   : Use All vs Chain All. Seeded from REF_MODE_DEFAULT at
+    #              startup and then owned by the user for the rest of the
+    #              session — adding more images later must NOT snap it back
+    #              to the default, so nothing writes to this except the
+    #              radio's own change handler.
+    # Neither belongs in configuration.json: both are "what am I doing right
+    # now", not a setting, and a remembered Use All across restarts would
+    # silently reintroduce the multi-reference VRAM spike on the next launch.
+    "ref_images": [],
+    "ref_mode": REF_MODE_DEFAULT,
+
+    # Cached copy of configuration.json's last_image_browse_dir (see the
+    # session-state accessors below). Loaded once at startup, written back
+    # only when the folder actually changes.
+    "last_image_browse_dir": "",
 }
+
+
+# ---------------------------------------------------------------------------
+# Session-state accessors  (the globals above, with the file I/O attached)
+# ---------------------------------------------------------------------------
+
+def init_session_state() -> None:
+    """Prime APP_STATE from disk once, at startup (called by launcher.main()).
+
+    Only last_image_browse_dir needs priming — it is the one piece of this
+    state that persists across runs. Doing it here means the picker's first
+    open costs no JSON read, and it keeps "load at startup" honest rather
+    than lazy-loading on first click.
+    """
+    cfg = load_configuration()
+    saved = cfg.get("last_image_browse_dir", "") or ""
+    if not saved or not Path(saved).is_dir():
+        saved = str(get_pictures_dir())
+    APP_STATE["last_image_browse_dir"] = saved
+    APP_STATE["ref_images"] = []
+    APP_STATE["ref_mode"] = REF_MODE_DEFAULT
+
+
+def get_last_image_dir() -> str:
+    """Folder the "Add Image" picker should open in.
+
+    Reads the global, not the file. Falls back to a lazy load if the process
+    somehow never called init_session_state() (e.g. display.py driven without
+    launcher.py), so the picker still opens in the right place either way.
+    """
+    current = APP_STATE.get("last_image_browse_dir", "")
+    if not current:
+        init_session_state()
+        current = APP_STATE.get("last_image_browse_dir", "")
+    if current and Path(current).is_dir():
+        return current
+    return str(get_pictures_dir())
+
+
+def set_last_image_dir(path: str) -> None:
+    """Remember the folder an image was just added from.
+
+    Writes configuration.json ONLY when the folder actually differs from what
+    is already remembered — adding six images from the same folder is one
+    save at most, not six. The global is updated either way.
+    """
+    if not path:
+        return
+    folder = str(path)
+    if folder == APP_STATE.get("last_image_browse_dir", ""):
+        return
+    APP_STATE["last_image_browse_dir"] = folder
+    try:
+        update_configuration({"last_image_browse_dir": folder})
+    except Exception:
+        # A failed write costs the next session its starting folder and
+        # nothing else, so it must never break the image the user just added.
+        pass
+
+
+def get_ref_images() -> List[str]:
+    """Copy of the accumulated reference-image list (copy, so a caller
+    mutating what it gets back cannot edit session state by accident)."""
+    return list(APP_STATE.get("ref_images") or [])
+
+
+def set_ref_images(paths: List[str]) -> None:
+    APP_STATE["ref_images"] = list(paths or [])
+
+
+def get_ref_mode() -> str:
+    """Current Use All / Chain All selection. REF_MODE_DEFAULT until the user
+    changes it; whatever they chose after that, for the rest of the session."""
+    mode = APP_STATE.get("ref_mode") or REF_MODE_DEFAULT
+    return mode if mode in REF_MODE_CHOICES else REF_MODE_DEFAULT
+
+
+def set_ref_mode(mode: str) -> None:
+    if mode in REF_MODE_CHOICES:
+        APP_STATE["ref_mode"] = mode
 
 # ---------------------------------------------------------------------------
 # Generation phase timing  (transient — not persisted to disk)
@@ -853,6 +955,8 @@ def update_timing_stat(key: str, value: float) -> None:
 # ---------------------------------------------------------------------------
 
 _PROJECT_ROOT: Optional[Path] = None
+# Resolved once per run by get_pictures_dir(); see the note in its docstring.
+_PICTURES_DIR: Optional[Path] = None
 
 
 def _get_project_root() -> Path:
@@ -931,6 +1035,101 @@ def get_images_dir() -> Path:
       images/program_diffusion.jpg - shown while sd.cpp diffusion runs
     """
     return _get_project_root() / "images"
+
+
+def _windows_pictures_dir() -> str:
+    """The logged-in user's real "Pictures" (My Pictures) folder, or "".
+
+    Asked of the shell rather than assumed, because Pictures is a KNOWN
+    FOLDER and users move it: OneDrive relocates it to
+    %USERPROFILE%\\OneDrive\\Pictures, and anyone short on system-drive space
+    routinely repoints it at another drive entirely. Building
+    %USERPROFILE%\\Pictures by hand lands in a folder that either does not
+    exist or is not the one Explorer shows, which is exactly the wrong place
+    to open a picker.
+
+    SHGetKnownFolderPath(FOLDERID_Pictures) returns wherever it actually
+    lives now. Everything is wrapped: on a non-Windows host, or if any of the
+    COM plumbing fails, this returns "" and get_pictures_dir() falls back.
+    """
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD),
+                        ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD),
+                        ("Data4", ctypes.c_byte * 8)]
+
+        # FOLDERID_Pictures, from KnownFolders.h.
+        _FOLDERID_PICTURES = "{33E28130-4E1E-4676-835A-98395C3BC3BB}"
+
+        ole32 = ctypes.windll.ole32
+        shell32 = ctypes.windll.shell32
+        ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_GUID)]
+        shell32.SHGetKnownFolderPath.argtypes = [
+            ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+
+        guid = _GUID()
+        if ole32.CLSIDFromString(_FOLDERID_PICTURES, ctypes.byref(guid)) != 0:
+            return ""
+        out = ctypes.c_wchar_p()
+        # dwFlags 0, hToken None -> current user, no default-path creation.
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
+                                        ctypes.byref(out)) != 0:
+            return ""
+        try:
+            return out.value or ""
+        finally:
+            # The shell allocated this with CoTaskMemAlloc; we own freeing it.
+            ole32.CoTaskMemFree(out)
+    except Exception:
+        return ""
+
+
+def get_pictures_dir() -> Path:
+    """Default starting folder for the Generate page's "Add Image" picker.
+
+    Ladder, first hit wins:
+      1. the shell's FOLDERID_Pictures (handles OneDrive / relocated folders)
+      2. %USERPROFILE%\\Pictures, if it exists
+      3. the user's home folder — always exists, so the picker always opens
+         somewhere real rather than at the process's CWD
+
+    This is only the FIRST-EVER default; once the user picks an image from
+    anywhere else, that folder is remembered in configuration.json under
+    last_image_browse_dir (see get_last_image_dir / set_last_image_dir) and
+    used from then on.
+
+    Mirrored by installer.py's _default_pictures_dir(), which seeds the same
+    value into a fresh configuration.json before scripts/ is importable.
+
+    Cached like _get_project_root(), because _default_configuration() calls
+    this on EVERY load_configuration() and the known-folder lookup is a COM
+    round-trip. The folder cannot move while the program is running.
+    """
+    global _PICTURES_DIR
+    if _PICTURES_DIR is not None:
+        return _PICTURES_DIR
+    _PICTURES_DIR = _resolve_pictures_dir()
+    return _PICTURES_DIR
+
+
+def _resolve_pictures_dir() -> Path:
+    known = _windows_pictures_dir()
+    if known and Path(known).is_dir():
+        return Path(known)
+    profile = os.environ.get("USERPROFILE", "")
+    if profile:
+        candidate = Path(profile) / "Pictures"
+        if candidate.is_dir():
+            return candidate
+    return Path.home()
 
 
 def get_build_dir() -> Path:
@@ -1237,7 +1436,15 @@ def _default_configuration() -> Dict[str, Any]:
         "encoder_model_path":  "",  "encoder_model_name":  "",
         "imagegen_model_path": "",  "imagegen_model_name": "",
         "vae_model_path":      "",  "vae_model_name":      "",
-        "last_model_browse_dir": ".\\models",  # <--- NEW KEY ADDED
+        "last_model_browse_dir": ".\\models",
+        # Starting folder for the Generate page's "Add Image" picker. Unlike
+        # last_model_browse_dir (which sensibly starts at .\models, where this
+        # program's own downloads land) reference images are the user's own
+        # files, so this starts at their Pictures folder — resolved live from
+        # the shell for THIS login rather than hardcoded, since it may be
+        # redirected to OneDrive or another drive. Overwritten with whatever
+        # folder they actually browse to (see set_last_image_dir).
+        "last_image_browse_dir": str(get_pictures_dir()),
         "backend_encoder": cpu_label,
         "backend_imagegen": cpu_label,
         "encoder_threads": dt,

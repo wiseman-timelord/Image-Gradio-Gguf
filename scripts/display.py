@@ -133,6 +133,62 @@ def _browse_file(file_types: Optional[List[Tuple[str, str]]] = None) -> str:
         return ""
 
 
+# Reference-image picker filters. The first (default) entry is built from
+# configure.SUPPORTED_REF_IMAGE_EXTS rather than a second hand-written list,
+# so the picker can never offer a format stb_image cannot decode — or hide one
+# it can. PNG/JPEG get their own entries because they are what people actually
+# have.
+_FILETYPES_IMAGE = [
+    ("Image files", " ".join(f"*{ext}"
+                             for ext in sorted(configure.SUPPORTED_REF_IMAGE_EXTS))),
+    ("PNG",         "*.png"),
+    ("JPEG",        "*.jpg *.jpeg"),
+    ("All files",   "*.*"),
+]
+
+
+def _browse_images() -> List[str]:
+    """Open a native multi-select file dialog and return the chosen paths.
+
+    Same tkinter approach as _browse_file() above, for the same reason: this
+    runs on a Gradio worker thread on the SAME machine as the UI (the server
+    is loopback-only inside the Qt window), so a native dialog is available
+    and is the only way to control where the picker opens. A browser
+    <input type=file> — which is what gr.UploadButton renders — cannot be
+    told a starting directory by any web API, and it copies the chosen files
+    into Gradio's temp folder rather than handing over the real paths.
+
+    Opens in the last folder an image was added from (configuration.json's
+    last_image_browse_dir, cached in configure.APP_STATE), defaulting to the
+    user's Pictures folder on a fresh install. The folder of the LAST file in
+    the selection is written back — with a multi-select they are all from the
+    same folder anyway, and it is the one the dialog was sitting in.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        raw = filedialog.askopenfilenames(
+            title="Add Reference Image(s)",
+            initialdir=configure.get_last_image_dir(),
+            filetypes=_FILETYPES_IMAGE,
+        )
+        # askopenfilenames normally returns a tuple, but some Tk builds hand
+        # back a single brace-quoted string instead; splitlist parses both.
+        if isinstance(raw, str):
+            raw = root.tk.splitlist(raw)
+        root.destroy()
+
+        picked = [str(p) for p in (raw or ()) if p]
+        if picked:
+            configure.set_last_image_dir(str(Path(picked[-1]).parent))
+        return picked
+    except Exception:
+        return []
+
+
 def _open_output_folder() -> str:
     """Open a native Windows Explorer window on .\\output.
 
@@ -681,15 +737,22 @@ def _build_generate_tab_inner() -> None:
             with gr.Column(visible=_flux2_now) as _gen["ref_row"]:
                 gr.Markdown("#### Image Edit (img+txt to img)")
                 # Reference images for image-to-image / editing (sd.cpp -r,
-                # repeatable). "Add Image" opens a file picker and APPENDS to
-                # the list (add, then add again); "Clear Images" empties it. No
-                # drop-zone. The chosen files are listed one per line below and
-                # are cleared automatically when a generation completes.
+                # repeatable). "Add Image" opens a native file picker and
+                # APPENDS to the list (add, then add again); "Clear Images"
+                # empties it. No drop-zone. The chosen files are listed one
+                # per line below.
+                #
+                # The list PERSISTS across generations: finishing a run leaves
+                # it exactly as it was, so the normal "same images, tweak the
+                # prompt, generate again" loop needs no re-picking. Clear
+                # Images is the only thing that empties it. (It used to
+                # self-clear on every completed run, which meant re-browsing
+                # for the same files on every iteration.)
+                #
+                # A native picker rather than gr.UploadButton, because only a
+                # native dialog can be told where to open — see _browse_images.
                 with gr.Row():
-                    _gen["ref_add_btn"] = gr.UploadButton(
-                        "Add Image", file_count="multiple",
-                        file_types=["image"], type="filepath", size="sm",
-                    )
+                    _gen["ref_add_btn"] = gr.Button("Add Image", size="sm")
                     _gen["ref_clear_btn"] = gr.Button("Clear Images", size="sm")
                 # Built visible=True (mounted) on purpose. A Textbox created
                 # visible=False is not placed in the DOM by Gradio 6, so the
@@ -706,7 +769,12 @@ def _build_generate_tab_inner() -> None:
                 )
                 # Accumulated list of reference-image paths (the real input to
                 # generation); the textbox above is just its visible form.
-                _gen["ref_images_state"] = gr.State([])
+                # Seeded from, and mirrored into, configure.APP_STATE so the
+                # accumulated list is readable outside this event graph — see
+                # configure.get_ref_images / set_ref_images. Session-only:
+                # nothing about the current pile of images belongs in
+                # configuration.json.
+                _gen["ref_images_state"] = gr.State(configure.get_ref_images())
                 # Only meaningful once 2+ images are accumulated (nothing to
                 # choose between with 0 or 1), so built hidden and toggled by
                 # _add_ref_images / _clear_ref_images alongside the list itself.
@@ -714,12 +782,23 @@ def _build_generate_tab_inner() -> None:
                 # accumulated image handed to sd.cpp as one multi-reference
                 # edit); "Chain All" instead runs each image through its own
                 # generation in sequence (see do_generate's chain_mode branch)
-                # and is the default, since Use All holds every reference in
-                # VRAM at once and the OOM risk grows with each added image.
+                # and is the STARTUP default, since Use All holds every
+                # reference in VRAM at once and the OOM risk grows with each
+                # added image.
+                #
+                # Startup default only. Once the user picks Use All it stays
+                # picked for the rest of the session — through generations,
+                # through Clear Images, through adding a fresh batch of
+                # images later. Only relaunching the program (or the user
+                # selecting Chain All again) brings the default back. That is
+                # why the value comes from configure.get_ref_mode(), which is
+                # REF_MODE_DEFAULT until the radio's change handler says
+                # otherwise, and why NOTHING below ever writes a value back
+                # into this radio.
                 _gen["ref_mode_radio"] = gr.Radio(
                     label="Multiple Reference Images",
                     choices=configure.REF_MODE_CHOICES,
-                    value=configure.REF_MODE_DEFAULT,
+                    value=configure.get_ref_mode(),
                     visible=False, elem_id="ref-image-mode",
                 )
 
@@ -934,8 +1013,12 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             output_format=output_format,
         )
 
-        # Reference images (Flux.2 -r). gr.UploadButton hands us a path, a
-        # list of paths, or None; normalise to a list of existing paths.
+        # Reference images (Flux.2 -r). The accumulated list arrives from
+        # ref_images_state as a list of real on-disk paths (the native picker
+        # hands over the user's own files, not Gradio temp copies); a lone
+        # string or None are still tolerated, so normalise to a list.
+        # READ ONLY — the list is not emptied here or anywhere downstream; it
+        # survives the run and is cleared only by the "Clear Images" button.
         # inference.generate_image() ignores this entirely for Z-Image and
         # only uses it when the diffuser is Flux.2.
         if ref_images is None:
@@ -1223,26 +1306,39 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         choice to make -- i.e. 2 or more accumulated reference images."""
         return gr.update(visible=count > 1)
 
-    def _add_ref_images(new_files, current):
-        """Append the just-picked file(s) to the accumulated list. gr.UploadButton
-        hands us a path, a list of paths, or None."""
+    def _add_ref_images(current):
+        """Open the native picker and APPEND whatever was chosen to the
+        accumulated list. Cancelling the dialog picks nothing, which leaves
+        the existing list untouched rather than emptying it.
+
+        Only the mode radio's VISIBILITY is touched here — never its value.
+        A user who selected Use All and then adds a third image must still be
+        on Use All (see the radio's construction comment).
+        """
         acc = list(current or [])
-        if new_files:
-            if isinstance(new_files, (list, tuple)):
-                acc.extend(str(f) for f in new_files if f)
-            else:
-                acc.append(str(new_files))
+        acc.extend(_browse_images())
+        configure.set_ref_images(acc)
         return acc, _render_ref_list(acc), _render_ref_mode_visibility(len(acc))
 
     def _clear_ref_images():
-        # Reset the mode back to its default too, so a fresh batch of images
-        # next time doesn't inherit a leftover "Chain All" selection.
-        return ([], _render_ref_list([]),
-                gr.update(visible=False, value=configure.REF_MODE_DEFAULT))
+        """The ONE thing that empties the reference-image list.
 
-    _gen["ref_add_btn"].upload(
+        The mode radio is hidden again (there is nothing left to choose
+        between) but its VALUE is deliberately left alone: a Use All the user
+        selected earlier survives a Clear, so the next batch of images runs
+        the way they last asked for rather than silently reverting.
+        """
+        configure.set_ref_images([])
+        return [], _render_ref_list([]), gr.update(visible=False)
+
+    def _on_ref_mode_change(mode):
+        """Record the user's Use All / Chain All choice in session state, so
+        it is the value everything else reads for the rest of the session."""
+        configure.set_ref_mode(mode)
+
+    _gen["ref_add_btn"].click(
         _add_ref_images,
-        inputs=[_gen["ref_add_btn"], _gen["ref_images_state"]],
+        inputs=[_gen["ref_images_state"]],
         outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
     )
     _gen["ref_clear_btn"].click(
@@ -1250,8 +1346,15 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         inputs=None,
         outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
     )
+    _gen["ref_mode_radio"].change(
+        _on_ref_mode_change,
+        inputs=[_gen["ref_mode_radio"]],
+        outputs=None,
+    )
 
-    _gen_evt = _gen["generate_btn"].click(
+    # No handle kept: the only thing that ever chained off this event was the
+    # post-run reference-image clear, which is gone (see the note below).
+    _gen["generate_btn"].click(
         on_generate_click,
         inputs=[_gen["prompt_tb"], _gen["negative_tb"],
         _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
@@ -1261,14 +1364,11 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
     )
-    # Reference images are consumed at generation time, then cleared once the
-    # run finishes (the requested "disappear on complete response"). Done via
-    # .then so do_generate's yield contract is untouched.
-    _gen_evt.then(
-        _clear_ref_images,
-        inputs=None,
-        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
-    )
+    # NOTE: no .then(_clear_ref_images) here, on purpose. Reference images are
+    # READ at generation time, never consumed — a finished run leaves the list
+    # (and the mode radio) exactly as the user left it, so iterating on the
+    # same images costs nothing but another click on Generate. "Clear Images"
+    # is the only way to empty the list.
 
     _gen["thumbnails_link"].click(
         _open_output_folder,
