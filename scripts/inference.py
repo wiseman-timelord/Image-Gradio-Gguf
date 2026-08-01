@@ -294,8 +294,20 @@ def classify_model(meta: Dict[str, Any]) -> str:
     fmt = str(meta.get("format", ""))
 
     if fmt.startswith("Safetensors"):
-        # ae.safetensors is the only safetensors this program consumes.
-        return "vae" if _matches_any(configure.VAE_NAME_PATTERNS, hay) else "unknown"
+        # VAE first: a file called "sdxl_vae" must not be claimed by the clip
+        # patterns below, and VAE_NAME_PATTERNS is the more specific test.
+        if _matches_any(configure.VAE_NAME_PATTERNS, hay):
+            return "vae"
+        # Split-SDXL text encoders (clip_l / clip_g). These carry no
+        # architecture field, so the filename is the only oracle. Without this
+        # branch they fell through to "unknown" and never appeared in any
+        # picker -- which is what made split-SDXL unusable.
+        if _matches_any(configure.TEXT_ENCODER_NAME_PATTERNS, hay):
+            return "encoder"
+        # A bare SDXL .safetensors is a FULL checkpoint, not an unknown blob.
+        if _matches_any(configure.SD_CLASSIC_NAME_PATTERNS, hay):
+            return "diffusion"
+        return "unknown"
 
     # Encoder before diffusion: the encoder gguf is named after the diffuser
     # it serves ("Qwen3-4b-Z-Image-Turbo-AbliteratedV1"), so testing the
@@ -410,15 +422,49 @@ def check_model_compatibility(cfg: Dict[str, Any]) -> Tuple[bool, str]:
     # ── VAE family ↔ diffuser family ──────────────────────────────────────
     vae_path = cfg.get("vae_model_path", "")
     if vae_path and Path(vae_path).exists() and fam:
-        vfam = configure.vae_family(Path(vae_path).name)
-        if vfam and vfam != fam:
-            want = "flux2_ae.safetensors" if fam == configure.DIFFUSER_FAMILY_FLUX2 \
-                   else "ae.safetensors"
-            have = configure.DIFFUSER_FAMILY_LABELS.get(vfam, vfam)
-            return False, (f"VAE mismatch: {fam_label} needs {want}; "
-                           f"the selected VAE looks like the {have} VAE.")
+        # A SET, not one family: VAEs are shared between families (ae.safetensors
+        # is the Flux.1 autoencoder Z-Image reuses), so only a POSITIVE conflict
+        # -- recognised VAE, recognised diffuser, no overlap -- is an error. An
+        # empty set means the filename identifies nothing and is allowed through.
+        vfams = configure.vae_families(Path(vae_path).name)
+        if vfams and fam not in vfams:
+            have = "/".join(sorted(
+                configure.DIFFUSER_FAMILY_LABELS.get(v, v) for v in vfams))
+            hint = configure.DIFFUSER_VAE_HINTS.get(fam, "")
+            return False, (f"VAE mismatch: {fam_label} cannot use the {have} VAE. "
+                           f"{hint}").strip()
+
+    # ── Split-SDXL text encoders ──────────────────────────────────────────
+    # Every SDXL gguf in circulation is UNet-only, so CLIP-L and CLIP-G must be
+    # supplied separately. Checked as a group so the user is told about both at
+    # once rather than fixing one and being sent back for the other.
+    # SDXL ships in two packagings (see configure.SDXL_UNET_ONLY_SPEC): a
+    # UNet-only quant needing external CLIP-L/CLIP-G, and a full sd.cpp
+    # checkpoint with them inside. Setting exactly ONE of the two clips is the
+    # only unambiguous mistake -- it satisfies neither packaging -- so that is
+    # the one hard failure. Setting neither is valid (full checkpoint) and
+    # setting both is valid (split), with a size-based advisory for each.
+    has_l = _path_ok(cfg.get("clip_l_model_path"))
+    has_g = _path_ok(cfg.get("clip_g_model_path"))
+    if fam == configure.DIFFUSER_FAMILY_SDXL and (has_l != has_g):
+        missing = "CLIP-G" if has_l else "CLIP-L"
+        return False, (
+            f"Split-SDXL needs BOTH text encoders, but {missing} is not set. "
+            f"Set it, or clear the other one if this is a full sd.cpp "
+            f"checkpoint that already contains its encoders.")
 
     return True, ""
+
+
+def _path_ok(value: Any) -> bool:
+    """True when a configured path string points at a file that exists now.
+    Mirrors display._model_path_ok so the UI gate and this check agree."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        return Path(value).exists()
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -713,12 +759,16 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
     if not cli:
         return prompt
 
+    # How much text is USEFUL depends on what reads it downstream: SDXL's CLIP
+    # pair caps out at 77 tokens, while Z-Image and Flux.2 condition through a
+    # Qwen3 LLM that can take a paragraph. See configure.FAMILY_PROMPT_ENHANCE.
+    _enh = configure.prompt_enhance_spec(cfg.get("imagegen_model_path", ""))
+
     template = cfg.get("prompt_template", "{prompt}")
     system_msg = (
         "You are an expert image prompt engineer. Convert the user's "
         "request into a highly detailed, vivid image generation prompt. "
-        "Be descriptive about style, lighting, composition, colors, and "
-        "atmosphere. Respond ONLY with the prompt text."
+        f"{_enh['style']} Respond ONLY with the prompt text."
     )
     full_prompt = template.replace(
         "{prompt}", f"{system_msg}\n\nUser request: {prompt}")
@@ -752,7 +802,7 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
         "-c", str(cfg.get("encoder_ctx_size", 4096)),
         "-t", str(cfg.get("encoder_threads", configure.get_default_threads())),
         "-b", str(cfg.get("encoder_batch_size", 512)),
-        "-n", "256", "--temp", "0.7",
+        "-n", str(_enh["max_tokens"]), "--temp", "0.7",
         "-no-cnv",
         "--no-display-prompt",
         # Encoder flash attention: pass "auto" and let llama.cpp choose. Unlike
@@ -857,6 +907,13 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
                     output = output.replace(marker, "")
                 output = output.strip()
             if output and len(output) > 10:
+                # Trim to the family's budget on a clean boundary. llama.cpp
+                # stops at the -n token count wherever it lands, which left
+                # dangling fragments like "...distractions-total" being sent
+                # to the image model as though deliberate. The 2000-char cap
+                # that used to be here was a flat backstop; the per-family
+                # limit is the real constraint (77 CLIP tokens for SDXL).
+                output = configure.trim_to_budget(output, _enh["max_chars"])
                 encoder_elapsed = time.time() - phase_t0
                 configure.update_timing_stat("encoder_seconds", round(encoder_elapsed, 3))
                 if progress_callback:
@@ -864,7 +921,7 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
                         "Prompt enhanced.", 0.2,
                         {"phase": "encoding", "phase_done": True,
                          "phase_elapsed": encoder_elapsed})
-                return output[:2000]
+                return output
 
             # Non-OOM failure or empty output — no point retrying
             break
@@ -950,11 +1007,6 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
         result["message"] = "Image generation model not found. Configure in Configuration tab."
         return result
 
-    vae_path = cfg.get("vae_model_path", "")
-    if not vae_path or not Path(vae_path).exists():
-        result["message"] = "VAE model (ae.safetensors) not found. Configure in Configuration tab."
-        return result
-
     sd_cli = find_sd_cpp()
     if not sd_cli:
         result["message"] = ("stable-diffusion.cpp not found. "
@@ -974,11 +1026,50 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     # was. Reference images (flux.2 image-to-image / editing, sd.cpp -r) come
     # in as a list of paths on the cfg; empty/absent means plain text-to-image.
     diff_meta = probe_model(diff_path) or {}
-    family = configure.diffuser_family(diff_path, _arch_of(diff_meta))
+    diff_arch = _arch_of(diff_meta)
+    family = configure.diffuser_family(diff_path, diff_arch)
     is_flux2 = family == configure.DIFFUSER_FAMILY_FLUX2
+
+    # The spec decides how this file is driven: which flag carries the model,
+    # which text encoders it needs, whether a VAE is mandatory, and whether an
+    # input image is a -r reference or an -i init image. An unrecognised model
+    # falls back to the Z-Image spec, which is exactly what this code did
+    # before families existed, so nothing that worked before changes.
+    # has_clips decides SDXL packaging: both encoders set -> split (UNet-only
+    # gguf + --clip_l/--clip_g); neither -> full checkpoint driven with -m.
+    _has_clips = bool(cfg.get("clip_l_model_path")) and bool(cfg.get("clip_g_model_path")) \
+        and Path(str(cfg.get("clip_l_model_path"))).exists() \
+        and Path(str(cfg.get("clip_g_model_path"))).exists()
+    spec = (configure.diffuser_spec(diff_path, diff_arch, _has_clips)
+            or configure.DIFFUSER_FAMILY_SPECS[configure.DIFFUSER_FAMILY_ZIMAGE])
+
+    # Echo which SDXL packaging was detected, so the command line below can be
+    # read against it. Informational only -- sdxl_is_unet_only() has already
+    # decided, and the Configuration page shows the same text.
+    if family == configure.DIFFUSER_FAMILY_SDXL:
+        _label = configure.sdxl_packaging_label(str(diff_path), _has_clips)
+        if _label:
+            print(f"[generate] SDXL packaging: {_label}")
+
+    # VAE requirement is per-family, not universal: a full SDXL .safetensors
+    # bundles its own, so demanding one there would block a valid setup.
+    vae_path = cfg.get("vae_model_path", "")
+    has_vae = bool(vae_path) and Path(vae_path).exists()
+    if spec["vae_required"] and not has_vae:
+        fam_lbl = configure.diffuser_family_label(diff_path, diff_arch)
+        result["message"] = (
+            f"{fam_lbl} requires a VAE. "
+            f"{configure.DIFFUSER_VAE_HINTS.get(family, '')}".strip())
+        return result
+
     ref_images = [p for p in (cfg.get("ref_images") or [])
                   if p and Path(str(p)).exists()]
     is_flux2_edit = is_flux2 and bool(ref_images)
+    # "ref" families (Flux.2 Kontext) take EVERY image as a -r reference.
+    # "init" families take exactly ONE as -i; extras are ignored here because
+    # Chain All in display.py already runs them one at a time.
+    init_image = (str(ref_images[0])
+                  if ref_images and spec["img2img"] == "init" else "")
 
     # Refuse formats sd.cpp's stb_image loader cannot decode (WEBP/AVIF/HEIC/
     # TIFF/JP2), with a plain message, rather than letting it fail mid-encode.
@@ -996,11 +1087,20 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     # conditioner via -r, and a flowery expansion of a literal edit instruction
     # ("change the background to a park") fights it rather than helping — and it
     # would cost a whole extra model load per generation for no gain.
+    #
+    # For SDXL the Qwen3 in encoder_model_path has NO conditioning role at all
+    # (SDXL conditions through CLIP-L/CLIP-G, and it is never passed to sd-cli),
+    # so it is purely an optional prompt enhancer there -- allowed when set,
+    # never required. An mmproj projector is excluded because llama-completion
+    # cannot generate text with one.
     enhanced = prompt
     _oom_msg: List[str] = []  # populated by callback if OOM exhausted all retries
+    enc_path = cfg.get("encoder_model_path", "")
     if (not is_flux2_edit
-            and cfg.get("encoder_model_path")
-            and Path(cfg["encoder_model_path"]).exists()):
+            and not init_image
+            and enc_path
+            and Path(enc_path).exists()
+            and not is_mmproj(enc_path)):
         try:
             enhanced = enhance_prompt(
                 prompt, cfg, progress_callback,
@@ -1012,6 +1112,19 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     if _oom_msg:
         result["message"] = _oom_msg[-1]
         return result
+
+    # A hand-typed prompt hits the same downstream limit as an enhanced one --
+    # SDXL's CLIP pair still stops at 77 tokens whether the words came from the
+    # user or from Qwen3. The prompt is NOT truncated here (silently discarding
+    # what someone deliberately typed would be worse than letting the encoder
+    # do it), but it is worth saying so in the console, because the symptom --
+    # the tail of a long prompt being ignored -- otherwise looks like the model
+    # misbehaving.
+    _budget = configure.prompt_enhance_spec(str(diff_path), diff_arch)
+    if len(enhanced) > _budget["max_chars"] * 1.25:
+        print(f"[generate] NOTE: prompt is {len(enhanced)} chars; "
+              f"{configure.diffuser_family_label(diff_path, diff_arch)} reads "
+              f"roughly the first {_budget['max_chars']}. The rest may be ignored.")
 
     # Seed
     seed = cfg.get("imagegen_seed", -1)
@@ -1031,11 +1144,16 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     # Z-Image-Turbo is S3-DiT architecture: it requires --llm pointing at
     # the Qwen3 encoder gguf. Without it sd.cpp cannot find the conditioner
     # tensors (text_encoders.llm.*) and fails at model metadata validation.
-    enc_path = cfg.get("encoder_model_path", "")
+    # sd-cli takes the diffusion weights under ONE of two flags:
+    #   -m                a FULL checkpoint bundling UNet + text encoders + VAE
+    #                     (a full SDXL .safetensors).
+    #   --diffusion-model standalone diffusion weights whose encoders are
+    #                     supplied separately (Z-Image, Flux.2, SDXL gguf).
+    # Passing the wrong one is not a soft failure: sd.cpp looks for a different
+    # tensor set and aborts at model validation. See configure.diffuser_spec.
     args = [
         str(sd_cli),
-        "--diffusion-model", str(diff_path),
-        "--vae", str(vae_path),
+        spec["model_flag"], str(diff_path),
         "-p", enhanced, "-o", str(output_path),
         "-H", str(int(cfg.get("imagegen_height", 512))),
         "-W", str(int(cfg.get("imagegen_width", 512))),
@@ -1048,18 +1166,34 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
         "-t", str(int(cfg.get("imagegen_threads", configure.get_default_threads()))),
     ]
 
-    # Pass the Qwen3 encoder as the LLM text encoder for Z-Image-Turbo.
-    # This is mandatory — the diffusion gguf has no bundled text encoder.
-    # Last-resort guard: never hand sd.cpp a vision projector as --llm, and
-    # never emit --mmproj at all, so a projector cannot load by any route even
-    # if one slipped past the earlier checks.
-    if enc_path and is_mmproj(enc_path):
-        raise ValueError(
-            "Refusing to run: the configured encoder is an mmproj vision "
-            "projector, not a text encoder. Reselect the main model .gguf in "
-            "Configuration.")
-    if enc_path and Path(enc_path).exists():
-        args.extend(["--llm", enc_path])
+    # VAE is emitted on PRESENCE, not on family: mandatory for Z-Image, Flux.2
+    # and split SDXL, optional-but-recommended for a full SDXL checkpoint.
+    if has_vae:
+        args.extend(["--vae", str(vae_path)])
+
+    # Text encoders, per the family's capability table entry.
+    #   --llm             Qwen3 conditioner (Z-Image, Flux.2)
+    #   --clip_l/--clip_g the split-SDXL pair
+    # A full SDXL checkpoint declares an empty tuple and gets neither, because
+    # its encoders are already inside the file.
+    #
+    # Last-resort guard retained: never hand sd.cpp a vision projector as --llm,
+    # and never emit --mmproj at all, so a projector cannot load by any route
+    # even if one slipped past the earlier checks.
+    if "llm" in spec["text_encoders"]:
+        if enc_path and is_mmproj(enc_path):
+            raise ValueError(
+                "Refusing to run: the configured encoder is an mmproj vision "
+                "projector, not a text encoder. Reselect the main model .gguf in "
+                "Configuration.")
+        if enc_path and Path(enc_path).exists():
+            args.extend(["--llm", enc_path])
+    for _slot, _flag, _key in (("clip_l", "--clip_l", "clip_l_model_path"),
+                               ("clip_g", "--clip_g", "clip_g_model_path")):
+        if _slot in spec["text_encoders"]:
+            _p = cfg.get(_key, "")
+            if _p and Path(_p).exists():
+                args.extend([_flag, str(_p)])
 
     neg = cfg.get("negative_prompt", "")
     if neg:
@@ -1093,14 +1227,20 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
 
     if placement["use_vulkan_backend"] and vk_dev >= 0:
         dev = f"vulkan{vk_dev}"
-        if is_flux2:
-            # Flux.2's Qwen3 text encoder (4-8B, several GB) is far too large to
-            # sit on the GPU beside the DiT on consumer VRAM, and conditioning
-            # is a one-shot pass, so it ALWAYS goes to CPU for flux.2 — the DiT
-            # stays resident on the GPU. This automatic encoder/DiT split (not
-            # the placement dropdown) is what lets the 9B fit AND run at GPU
-            # speed instead of streaming every step. (Answers "automate the
-            # encoder like we did flash attention".)
+        if spec["encoder_to_cpu"]:
+            # Families whose text encoder is too big to share the card with the
+            # diffusion model force te=cpu regardless of the placement
+            # dropdown. Currently that is Flux.2 alone: its Qwen3 conditioner
+            # (4-8B, several GB) cannot sit beside the DiT on consumer VRAM,
+            # and conditioning is a one-shot pass, so the CPU cost is paid once
+            # per image while the DiT stays resident on the GPU. This automatic
+            # split (not the dropdown) is what lets the 9B fit AND run at GPU
+            # speed instead of streaming every step.
+            #
+            # SDXL sets this False on purpose: CLIP-L and CLIP-G together are
+            # only ~1.5GB, so they fit alongside the UNet and forcing them to
+            # CPU would cost speed for no VRAM benefit. The placement dropdown
+            # still governs there, via the branch below.
             assign = f"diffusion={dev},te=cpu,vae=cpu"
         elif placement["split_to_cpu"]:
             # Diffusion on the GPU; Qwen3 conditioner (~3.6GB) and VAE stay in
@@ -1132,10 +1272,28 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     # underscore: "zImageTurboAnime_v10", "smoothmixUltimate_zimageTurboV10",
     # "eventHorizon_zitV10", "perfeczion_10BF16" and both darkBeast files all
     # got --clip-skip 2 appended to a model that has no CLIP.
+    # The family spec is now the authority. is_sd_classic_model() is kept for
+    # the UNRECOGNISED-file case: a checkpoint whose family we could not name
+    # but which looks SD-classic should still get its clip-skip.
     is_sd_classic = is_sd_classic_model(str(diff_path))
     clip_skip = int(cfg.get("imagegen_clip_skip", 2))
-    if clip_skip > 1 and is_sd_classic:
+    if clip_skip > 1 and (spec["clip_skip"] or (family is None and is_sd_classic)):
         args.extend(["--clip-skip", str(clip_skip)])
+
+    # ------------------------------------------------------------------
+    # img2img, for every family that uses the standard init-image path.
+    #
+    # NOTE this is -i + --strength, NOT a mode switch. sd.cpp has no "img2img"
+    # mode: -M/--mode is one of [img_gen, vid_gen, upscale, convert, metadata],
+    # and img2img is plain img_gen with an init image supplied. Flux.2 is
+    # excluded because it uses -r reference conditioning instead (below).
+    #
+    # strength is the denoise fraction: 0.0 returns the init image untouched,
+    # 1.0 ignores it entirely. sd.cpp's own default is 0.75.
+    # ------------------------------------------------------------------
+    if init_image:
+        args.extend(["-i", init_image,
+                     "--strength", str(float(cfg.get("imagegen_strength", 0.75)))])
 
     # ------------------------------------------------------------------
     # Flux.2-Klein specifics. Z-Image needs none of this, so it is all gated
@@ -1154,7 +1312,31 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     #                     empirically beats plain euler on this build/hardware.
     # See stable-diffusion.cpp docs/flux2.md.
     # ------------------------------------------------------------------
-    if is_flux2:
+    if family == configure.DIFFUSER_FAMILY_SDXL:
+        # The SDXL VAE overflows fp16 and decodes to a black image on some
+        # builds. There are two independent fixes and they must not stack:
+        # madebyollin's fp16-fix VAE, or letting sd.cpp rescale the conv
+        # activations. Apply the flag only when the loaded VAE is not already
+        # the fixed one.
+        _vae_name = Path(vae_path).name.lower() if has_vae else ""
+        if "fp16-fix" not in _vae_name and "fp16fix" not in _vae_name:
+            args.append("--force-sdxl-vae-conv-scale")
+
+        # v-prediction finetunes (NoobAI-vPred, wai-*-vpred*). The GGUF
+        # conversion drops whatever marked the checkpoint as v-pred, so sd.cpp
+        # assumes eps and the output comes out washed out or structurally
+        # wrong. "Auto" infers it from the filename; the user can force it.
+        _pred = configure.sdxl_prediction_override(
+            str(diff_path), cfg.get("imagegen_prediction", configure.PREDICTION_AUTO))
+        if _pred:
+            args.extend(["--prediction", _pred])
+
+        # SDXL is 1024-native at ~1MP. Above that the VAE decode is the peak
+        # allocation, so tile it -- same reasoning as the Flux.2 branch.
+        if int(cfg.get("imagegen_width", 512)) * int(cfg.get("imagegen_height", 512)) > 1024 * 1024:
+            args.append("--vae-tiling")
+
+    elif is_flux2:
         # --offload-to-cpu only when the DiT + its compute buffer would not fit
         # the GPU (auto, resolution-aware). Forcing it unconditionally streamed
         # ~5.6GB every step for the 9B and left the GPU idle at ~0% — glacial.
@@ -1199,7 +1381,8 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
             _sm = "?"
         print(f"[generate] sd-cli: sampler={_sm}  "
               f"steps={cfg.get('imagegen_steps')}  cfg={cfg.get('imagegen_cfg_scale')}  "
-              f"flux2={is_flux2}  fa={'--diffusion-fa' in args}  "
+              f"family={family or 'unknown'}  mode={'img2img' if init_image else 'txt2img'}  "
+              f"fa={'--diffusion-fa' in args}  "
               f"offload={'--offload-to-cpu' in args}")
         print("[generate] full command: " + " ".join(str(a) for a in args))
         process = subprocess.Popen(

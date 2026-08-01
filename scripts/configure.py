@@ -231,6 +231,7 @@ DIFFUSER_PLACEMENT_CHOICES: List[str] = [
 # ---------------------------------------------------------------------------
 DIFFUSER_FAMILY_ZIMAGE = "z-image"
 DIFFUSER_FAMILY_FLUX2  = "flux2"
+DIFFUSER_FAMILY_SDXL   = "sdxl"
 
 # Reference-image input formats sd.cpp can decode. sd.cpp loads -r images via
 # stb_image, which handles PNG, JPEG (baseline+progressive), BMP (non-RLE),
@@ -280,6 +281,10 @@ ENCODER_DIM_QWEN3_8B = 4096
 # or `flux2`; Z-Image and its finetunes report `lumina2`.
 DIFFUSER_FLUX2_ARCH:  List[str] = ["flux2", "flux"]
 DIFFUSER_ZIMAGE_ARCH: List[str] = ["lumina2"]
+# SDXL and the SD-classic checkpoints. Unambiguous: nothing else reports these,
+# so arch alone settles the family and no filename test is needed when the GGUF
+# metadata is readable.
+DIFFUSER_SDXL_ARCH:   List[str] = ["sdxl", "sd1", "sd2"]
 
 # Filename/folder patterns (re.search, lowercased) for when arch is unreadable.
 # Flux2 is checked FIRST: a "flux-2-klein" name must not fall through to the
@@ -322,6 +327,7 @@ VAE_FLUX2_NAME_PATTERNS: List[str] = [
 DIFFUSER_FAMILY_LABELS: Dict[str, str] = {
     DIFFUSER_FAMILY_ZIMAGE: "Z-Image-Turbo",
     DIFFUSER_FAMILY_FLUX2:  "Flux.2-Klein",
+    DIFFUSER_FAMILY_SDXL:   "SDXL",
 }
 
 # What each family's VAE box should say it wants, shown as the box's info hint.
@@ -329,7 +335,124 @@ DIFFUSER_VAE_HINTS: Dict[str, str] = {
     DIFFUSER_FAMILY_ZIMAGE: "Z-Image expects ae.safetensors (the Flux.1 VAE).",
     DIFFUSER_FAMILY_FLUX2:  ("Flux.2 expects flux2_ae "
                              "(often downloaded as diffusion_pytorch_model.safetensors)."),
+    DIFFUSER_FAMILY_SDXL:   ("SDXL expects an SDXL VAE. sdxl_vae-fp16-fix "
+                             "avoids black outputs; xlVAEC_c91 gives richer colour."),
 }
+
+
+# ---------------------------------------------------------------------------
+# Per-family capability matrix -- the single source of truth for how each
+# family is driven on the sd-cli command line. Adding a family means adding an
+# entry here plus the matching branch in inference.generate_image().
+#
+#   model_flag     : "-m" for a FULL checkpoint bundling UNet + text encoders +
+#                    VAE; "--diffusion-model" for standalone diffusion weights
+#                    whose encoders must be supplied separately.
+#   text_encoders  : which encoder flags this family needs.
+#                      "llm"    -> --llm <qwen3 gguf>     (Z-Image, Flux.2)
+#                      "clip_l" -> --clip_l <safetensors> (split SDXL)
+#                      "clip_g" -> --clip_g <safetensors> (split SDXL)
+#                    An EMPTY tuple means the encoders live inside the -m
+#                    checkpoint and no flag is passed.
+#   vae_required   : whether a run is refused outright without a --vae.
+#   clip_skip      : whether --clip-skip means anything (CLIP-conditioned only).
+#   img2img        : "init" -> -i <img> + --strength  (standard img2img)
+#                    "ref"  -> -r <img>, repeatable   (Flux Kontext editing)
+#   encoder_to_cpu : force te=cpu in the backend assignment regardless of the
+#                    placement dropdown, for encoders too big to share the card.
+# ---------------------------------------------------------------------------
+DIFFUSER_FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
+    DIFFUSER_FAMILY_ZIMAGE: {
+        "model_flag":     "--diffusion-model",
+        "text_encoders":  ("llm",),
+        "vae_required":   True,
+        "clip_skip":      False,
+        # None, not "init": this program has always driven Z-Image as
+        # text-to-image only, and the input-image column has never been shown
+        # for it. sd.cpp would accept -i here, so enabling img2img later is a
+        # one-word change to "init" -- but that is a feature addition, not part
+        # of SDXL support, so the behaviour is left exactly as it was.
+        "img2img":        None,
+        "encoder_to_cpu": False,
+    },
+    DIFFUSER_FAMILY_FLUX2: {
+        "model_flag":     "--diffusion-model",
+        "text_encoders":  ("llm",),
+        "vae_required":   True,
+        "clip_skip":      False,
+        "img2img":        "ref",
+        "encoder_to_cpu": True,
+    },
+    # SDXL as a FULL .safetensors checkpoint (sd_xl_base_1.0.safetensors and
+    # the CivitAI finetunes in their original form). One file carries the UNet,
+    # both CLIP encoders and a VAE, so nothing external is required.
+    DIFFUSER_FAMILY_SDXL: {
+        "model_flag":     "-m",
+        "text_encoders":  (),
+        "vae_required":   False,
+        "clip_skip":      True,
+        "img2img":        "init",
+        "encoder_to_cpu": False,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# SDXL comes in TWO packagings that take DIFFERENT command lines. Both use the
+# .gguf extension, so the file extension cannot tell them apart -- there are
+# two separate quantizer ecosystems producing SDXL ggufs:
+#
+#   UNET-ONLY  (city96 / ComfyUI-GGUF lineage: hum-ma, Old-Fisherman,
+#              silveroxides, and the WAI / illustrious / pony finetune repos)
+#              The quantizers extract the UNet, quantise that alone with
+#              city96's lcpp.patch, and ship clip_l / clip_g / vae alongside as
+#              separate .safetensors. Old-Fisherman's card states it outright:
+#              "Due to the steps required to extract UNet and Clip Encoders and
+#              convert the UNet model to a GGUF quantized model".
+#              -> --diffusion-model + --clip_l + --clip_g + --vae
+#              Markers: general.architecture = "sdxl" IS present, and the file
+#              is small -- hum-ma's Q4_0 is 1.49GB, a bare UNet.
+#
+#   FULL       (stable-diffusion.cpp / llama-box lineage: OlegSkutte, gpustack)
+#              One file bundling the UNet, BOTH CLIP encoders and the VAE, made
+#              by converting with sd.cpp itself. gpustack's card tabulates the
+#              CLIP-L / CLIP-G / VAE quantizations packed inside.
+#              -> -m, nothing external needed
+#              Markers: no general.architecture key, and much larger --
+#              gpustack Q4_0 is 3.94GB, OlegSkutte Q8_0 is 4.1GB.
+#
+# The DECIDER is whether the user has configured CLIP-L and CLIP-G, not a guess
+# about the file. That is deterministic, needs no size thresholds (which would
+# overlap across quantizations -- a UNet-only Q8_0 and a full Q4_0 are close in
+# size), and it matches intent: supplying the split encoders IS the statement
+# that the model is the split kind. File size is used only for the advisory
+# label in sdxl_packaging_label(); sdxl_is_unet_only() is what decides.
+# ---------------------------------------------------------------------------
+SDXL_UNET_ONLY_SPEC: Dict[str, Any] = {
+    "model_flag":     "--diffusion-model",
+    "text_encoders":  ("clip_l", "clip_g"),
+    "vae_required":   True,     # nothing else carries a VAE in this packaging
+    "clip_skip":      True,
+    "img2img":        "init",
+    "encoder_to_cpu": False,    # CLIP-L + CLIP-G together are ~1.6GB; they fit
+}
+
+# A bare UNet at Q4_0 is ~1.5GB; a FULL checkpoint starts around 3.9GB because
+# the fp16 CLIP-G alone adds 1.4GB. See sdxl_is_unet_only().
+SDXL_FULL_CHECKPOINT_MIN_BYTES = 3_500_000_000
+
+
+def sdxl_packaging_label(path: str, has_clips: bool = False) -> str:
+    """One line describing how this SDXL file will be driven, for the
+    Configuration page. Empty when the file is not SDXL or not on disk."""
+    if not path or not Path(str(path)).exists():
+        return ""
+    if diffuser_family(path) != DIFFUSER_FAMILY_SDXL:
+        return ""
+    if sdxl_is_unet_only(path, has_clips):
+        return ("This model contains the UNet only, so CLIP-L and CLIP-G must "
+                "be supplied separately.")
+    return ("This model already contains its own CLIP-L, CLIP-G and VAE, so no "
+            "separate CLIP files are needed.")
 
 # Per-family generation defaults for the distilled (fast) and base variants.
 # Used by display.py to seed the correct Settings panel and by inference.py as
@@ -342,27 +465,177 @@ FLUX2_BASE_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def normalize_model_name(name: str) -> str:
+    """Lower-cased final path component with separators turned into spaces.
+
+    Model filenames separate words with underscores, dots and dashes --
+    sd_xl_turbo_1.0.q8_0.gguf, noobaiXL_vPred10.gguf, juggernautXL_v9.safetensors.
+    Regex \b does NOT fire next to an underscore, because underscore is a word
+    character, so a pattern like \bturbo\b silently fails to match
+    "sd_xl_turbo_1.0" -- which would have run SDXL-Turbo at the 30-step,
+    cfg-7 base profile instead of its intended 1 step at cfg 1.0.
+
+    Normalizing here fixes every \b-anchored pattern at once instead of
+    rewriting each one, and is safe for the separator-tolerant patterns too:
+    their character classes are written [-_. ] and already include a space.
+    """
+    return re.sub(r"[-_.]+", " ", Path(str(name)).name.lower()).strip()
+
+
+# ---------------------------------------------------------------------------
+# Manual family override.
+#
+# Auto-detection has two inputs -- general.architecture and the filename -- and
+# there is a real class of model where BOTH come up empty:
+#
+#   * sd.cpp-native full checkpoints carry no general.architecture key at all
+#     (unlike the city96/ComfyUI UNet-only quants, which do say "sdxl"), and
+#   * plenty of SDXL finetunes are named with no "xl" or "sdxl" token anywhere
+#     -- artiwaifu-diffusion-v1.q8_0.gguf being an SDXL 1.0 finetune whose name
+#     says neither.
+#
+# Such a model resolves to None and falls back to the Z-Image command line,
+# which is silently wrong. Rather than keep widening the filename patterns (an
+# endless game, and one that risks false positives on the other families), the
+# user can state the answer outright. Auto keeps the existing behaviour.
+# ---------------------------------------------------------------------------
+# The two SDXL entries also pin the PACKAGING, because that is the other thing
+# auto-detection can get wrong and the two questions are answered by the same
+# dropdown from the user's point of view ("what is this file?"):
+#   full checkpoint -> encoders are inside; -m; CLIP boxes hidden
+#   UNet-only       -> encoders are external; --diffusion-model + --clip_l/_g
+FAMILY_OVERRIDE_AUTO = "Auto"
+FAMILY_OVERRIDE_SDXL_FULL  = "SDXL (all-in-one file)"
+FAMILY_OVERRIDE_SDXL_SPLIT = "SDXL (needs CLIP files)"
+FAMILY_OVERRIDE_CHOICES: List[str] = [
+    FAMILY_OVERRIDE_AUTO, "Z-Image", "Flux.2",
+    FAMILY_OVERRIDE_SDXL_FULL, FAMILY_OVERRIDE_SDXL_SPLIT,
+]
+_FAMILY_OVERRIDE_MAP: Dict[str, str] = {
+    "z-image": DIFFUSER_FAMILY_ZIMAGE,
+    "flux.2":  DIFFUSER_FAMILY_FLUX2,
+    "sdxl":    DIFFUSER_FAMILY_SDXL,
+    FAMILY_OVERRIDE_SDXL_FULL.lower():  DIFFUSER_FAMILY_SDXL,
+    FAMILY_OVERRIDE_SDXL_SPLIT.lower(): DIFFUSER_FAMILY_SDXL,
+}
+
+# Packaging forced by the override, or None to auto-detect. Separate from
+# _family_override because "Z-Image" says nothing about SDXL packaging.
+_packaging_override: Optional[bool] = None   # True = UNet-only, False = full
+
+# Set from load_configuration() so every diffuser_family() caller honours the
+# override without threading an extra argument through a dozen call sites.
+_family_override: Optional[str] = None
+
+
+def set_family_override(value: str) -> None:
+    """Record the user's Model Family choice. "" or "Auto" restores detection."""
+    global _family_override, _packaging_override
+    key = str(value or "").strip().lower()
+    _family_override = _FAMILY_OVERRIDE_MAP.get(key)
+    if key == FAMILY_OVERRIDE_SDXL_SPLIT.lower():
+        _packaging_override = True
+    elif key == FAMILY_OVERRIDE_SDXL_FULL.lower():
+        _packaging_override = False
+    else:
+        _packaging_override = None
+
+
+def get_family_override() -> Optional[str]:
+    return _family_override
+
+
 def diffuser_family(name: str, arch: str = "") -> Optional[str]:
     """Return DIFFUSER_FAMILY_FLUX2 / DIFFUSER_FAMILY_ZIMAGE / None.
 
     Architecture metadata wins when present (same policy as classify_model());
-    filename+folder patterns are the fallback. Flux2 is tested before Z-Image.
+    the FILENAME is the fallback. Flux2 is tested before Z-Image.
     `name` may be a bare filename or a full path; matching is case-insensitive.
+
+    Only the final path component is matched, never the directories above it.
+    Folder names are not evidence about a model and actively mislead: a user
+    who keeps everything in a folder called "SDXL-models-GGUF" (which is what
+    hum-ma's repo unzips to) would otherwise have every model inside it read as
+    SDXL -- including a Z-Image gguf parked in the same place, which would then
+    be driven with --clip-skip and an input-image panel it cannot use.
     """
+    # An explicit user choice beats both metadata and filename: it exists
+    # precisely for the models where those two disagree or say nothing.
+    if _family_override:
+        return _family_override
+
     a = str(arch).strip().lower()
     if a:
         if a in DIFFUSER_FLUX2_ARCH:
             return DIFFUSER_FAMILY_FLUX2
         if a in DIFFUSER_ZIMAGE_ARCH:
             return DIFFUSER_FAMILY_ZIMAGE
-    low = str(name).lower()
+        if a in DIFFUSER_SDXL_ARCH:
+            return DIFFUSER_FAMILY_SDXL
+    low = normalize_model_name(name)
     for pat in DIFFUSER_FLUX2_NAME_PATTERNS:
         if re.search(pat, low):
             return DIFFUSER_FAMILY_FLUX2
+    # SDXL MUST be tested before Z-Image. DIFFUSER_ZIMAGE_NAME_PATTERNS ends
+    # with a bare "turbo", which would otherwise claim sdxl-turbo (and every
+    # other *-turbo SDXL distillation) for the Z-Image bucket.
+    for pat in DIFFUSER_SDXL_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_SDXL
     for pat in DIFFUSER_ZIMAGE_NAME_PATTERNS:
         if re.search(pat, low):
             return DIFFUSER_FAMILY_ZIMAGE
     return None
+
+
+def sdxl_is_unet_only(path: str, has_clips: bool = False) -> bool:
+    """True when an SDXL file needs CLIP-L/CLIP-G supplied separately.
+
+    FILE SIZE is the signal, because it is a property of the file rather than
+    of what the user happens to have configured. The two ecosystems are far
+    apart: a city96/ComfyUI UNet-only quant is ~1.5GB at Q4_0, while an
+    sd.cpp-native full checkpoint starts around 3.9GB -- the fp16 CLIP-G inside
+    it alone adds 1.4GB. Nothing in the metadata distinguishes them (the
+    UNet-only files say general.architecture=sdxl, the full ones say nothing),
+    so size is the best available evidence and the gap is wide enough to be
+    reliable across quantizations.
+
+    A .safetensors is assumed to be a full checkpoint: that is what SDXL
+    checkpoints are, and the UNet-only ecosystem publishes GGUF only.
+
+    Order of authority: explicit user override, then size, then -- only when
+    the file cannot be measured -- whether clips happen to be configured.
+    """
+    if _packaging_override is not None:
+        return _packaging_override
+    if not str(path).lower().endswith(".gguf"):
+        return False
+    try:
+        return Path(path).stat().st_size < SDXL_FULL_CHECKPOINT_MIN_BYTES
+    except OSError:
+        return has_clips
+
+
+def diffuser_spec(name: str, arch: str = "",
+                  has_clips: bool = False) -> Optional[Dict[str, Any]]:
+    """The command-line spec for a diffuser, or None if the family is unknown.
+
+    For SDXL the answer depends on PACKAGING rather than family alone, and both
+    packagings use the .gguf extension -- so has_clips (whether the user has
+    configured CLIP-L and CLIP-G) is what selects between them. Supplying the
+    split encoders is the user's statement that this is the split kind;
+    supplying none means the encoders are expected to be inside the file.
+    See the SDXL_UNET_ONLY_SPEC block above for the two ecosystems.
+
+    None means "cannot tell" -- callers fall back to the Z-Image-style command
+    line, which is what this program did before families existed.
+    """
+    fam = diffuser_family(name, arch)
+    if not fam:
+        return None
+    if fam == DIFFUSER_FAMILY_SDXL and sdxl_is_unet_only(name, has_clips):
+        return SDXL_UNET_ONLY_SPEC
+    return DIFFUSER_FAMILY_SPECS.get(fam)
 
 
 def diffuser_family_label(name: str, arch: str = "") -> str:
@@ -423,17 +696,39 @@ def encoder_dim_from_spec(name: str) -> Optional[int]:
     return None
 
 
-def vae_family(name: str) -> Optional[str]:
-    """Which family a VAE filename belongs to, or None if it identifies nothing
-    (e.g. flux2's generic diffusion_pytorch_model.safetensors)."""
-    low = str(name).lower()
+def vae_families(name: str) -> set:
+    """The SET of diffuser families a VAE filename is valid for.
+
+    A set rather than a single family because VAEs are shared: ae.safetensors
+    is the Flux.1 autoencoder that Z-Image reuses verbatim, so a one-family
+    answer would make correct pairings look like mismatches as soon as another
+    family that uses the same file is added. An EMPTY set means the name
+    identifies nothing (e.g. Flux.2's generic
+    diffusion_pytorch_model.safetensors) -- callers treat that as "cannot
+    tell" and allow it through, never as an error.
+
+    Order matters: the SDXL patterns are tested before the Z-Image one because
+    "sdxl_vae" would otherwise fall through to the boundaried bare-"ae" test.
+    """
+    low = normalize_model_name(name)
     for pat in VAE_FLUX2_NAME_PATTERNS:
         if re.search(pat, low):
-            return DIFFUSER_FAMILY_FLUX2
+            return {DIFFUSER_FAMILY_FLUX2}
+    for pat in VAE_SDXL_NAME_PATTERNS:
+        if re.search(pat, low):
+            return {DIFFUSER_FAMILY_SDXL}
     for pat in VAE_ZIMAGE_NAME_PATTERNS:
         if re.search(pat, low):
-            return DIFFUSER_FAMILY_ZIMAGE
-    return None
+            return {DIFFUSER_FAMILY_ZIMAGE}
+    return set()
+
+
+def vae_family(name: str) -> Optional[str]:
+    """Single-family form of vae_families(), for the display.py callers that
+    want one answer. Returns None when the name identifies nothing OR when it
+    is valid for more than one family (i.e. "no single right answer")."""
+    fams = vae_families(name)
+    return next(iter(fams)) if len(fams) == 1 else None
 
 
 def flux2_flash_attn_for(cfg: Dict[str, Any]) -> bool:
@@ -598,12 +893,215 @@ SD_CLASSIC_NAME_PATTERNS: List[str] = [
     r"\bsd[-_. ]?2[-_. ]?[01]\b",
     r"\bsd[-_. ]?21\b",
     r"sd[-_. ]?xl",
+    # The full "stable-diffusion-xl" spelling, which is how the official
+    # checkpoints and most GGUF conversions of them are named
+    # (stable-diffusion-xl-base-1.0-Q4_0.gguf). It is NOT caught by the
+    # "sd?xl" pattern above, nor by the "...XL" suffix pattern below, because
+    # the xl there is preceded by a hyphen rather than an alphanumeric.
+    r"diffusion[-_. ]?xl",
     r"illustrious",
-    r"\bpony\b",
+    # No trailing \b: the finetunes are named ponyDiffusionV6XL, ponyRealism
+    # and so on, where "pony" runs straight into the next word and a closing
+    # boundary can never match.
+    r"\bpony",
     r"noobai",
+    # The "...XL" naming convention that most SDXL finetunes follow --
+    # juggernautXL, dreamshaperXL, realvisXL, animagineXL, ponyDiffusionV6XL,
+    # and the separator-using variants like zavychroma5-xl. The separator is
+    # optional so both "juggernautXL" and "zavychroma5-xl" match, but there
+    # must be SOMETHING before the xl -- a bare leading "xl" is too weak a
+    # signal on its own. The trailing test is an explicit non-alphanumeric-or-
+    # end rather than \\b, for the same reason as VPRED_NAME_PATTERN: underscore
+    # is a word character, so \\b would fail on juggernautXL_v9, which is the
+    # single most common way these are named.
+    r"[a-z0-9][-_. ]?xl(?:[^a-z0-9]|$)",
 ]
 
 SD_CLASSIC_ARCHITECTURES: List[str] = ["sd1", "sd2", "sdxl"]
+
+# The SDXL family name-fallback reuses the SD-classic token set rather than
+# keeping a second copy: the models that want --clip-skip and the models that
+# ARE SDXL are the same set, so two lists would only drift apart. Defined here
+# rather than beside the other DIFFUSER_*_NAME_PATTERNS because it depends on
+# SD_CLASSIC_NAME_PATTERNS, which is defined above; diffuser_family() resolves
+# the name at call time, so the ordering within this module is not a problem.
+DIFFUSER_SDXL_NAME_PATTERNS: List[str] = SD_CLASSIC_NAME_PATTERNS
+
+# SDXL VAE filenames. Checked before the bare-"ae" Z-Image pattern in
+# vae_families(). xlVAEC is the improved community VAE hum-ma ships alongside
+# their GGUF quants and recommends over the base one.
+VAE_SDXL_NAME_PATTERNS: List[str] = [
+    r"sdxl.*?vae",
+    r"vae.*?sdxl",
+    r"sd[-_. ]?xl[-_. ]?vae",
+    r"xlvae",
+]
+
+# Step-DISTILLED SDXL derivatives. These behave like Z-Image-Turbo and Klein
+# distilled -- a handful of steps at cfg near 1.0 -- and NOT like SDXL base
+# (30 steps, cfg 7). Running one at the base defaults produces burnt,
+# over-saturated output, which is the most common "this model is broken"
+# report for the class. "dmd2" is Distribution Matching Distillation v2, which
+# several community finetunes are built on and which is named only in the
+# filename -- there is no metadata flag for any of these.
+SDXL_DISTILLED_NAME_PATTERNS: List[str] = [
+    r"\bturbo\b",
+    r"\blightning\b",
+    r"\bhyper\b",
+    r"\bdmd2?\b",
+    r"\blcm\b",
+]
+
+
+def is_sdxl_distilled_variant(name: str) -> bool:
+    """True for Turbo / Lightning / Hyper / DMD2 / LCM SDXL derivatives, which
+    take few-step, low-cfg settings instead of the SDXL base defaults.
+
+    Uses the normalized name so that sd_xl_turbo_1.0.q8_0.gguf -- where the
+    word "turbo" sits between two underscores -- is recognised."""
+    low = normalize_model_name(name)
+    return any(re.search(p, low) for p in SDXL_DISTILLED_NAME_PATTERNS)
+
+
+# v-prediction override. The GGUF conversion drops whatever marked a checkpoint
+# as v-prediction (Old-Fisherman's card notes ComfyUI needs a custom node to
+# force it back), so sd.cpp assumes eps and the output comes out washed out or
+# structurally wrong. The filename is the only surviving signal. "Auto" applies
+# the flag when the name says vpred and otherwise lets sd.cpp decide.
+#
+# The leading test is (?:^|[^a-z0-9]) rather than \b because underscore IS a
+# word character: \bv[-_]?pred cannot match noobaiXL_vPred10, which is exactly
+# how these files are usually named.
+# ---------------------------------------------------------------------------
+# Prompt-enhancement budget, per family.
+#
+# The enhancer is a Qwen3 gguf run through llama.cpp that rewrites the user's
+# prompt before sd-cli sees it. How much text is USEFUL depends entirely on
+# what will read it downstream:
+#
+#   SDXL      conditions through CLIP-L + CLIP-G, whose context is 77 tokens.
+#             Anything past that is chunked at best and dropped at worst, so a
+#             200-word cinematic paragraph mostly evaporates -- and what
+#             survives is the enhancer's scene-setting preamble rather than the
+#             user's actual subject. SDXL also responds better to dense
+#             comma-separated keywords than to flowing prose. 77 CLIP tokens is
+#             roughly 55-60 English words; max_tokens is the llama.cpp -n
+#             budget, which is a different tokenizer, so it is set with slack
+#             and the word count is enforced in the system prompt as well.
+#
+#   Z-Image   condition through a Qwen3 LLM with a real context window, so long
+#   Flux.2    descriptive prose genuinely helps and is what these were tuned
+#             for. Keep the original generous budget.
+#
+# max_chars is a final backstop applied after generation: a model that ignores
+# the word-count instruction still cannot overflow the downstream encoder.
+# ---------------------------------------------------------------------------
+PROMPT_ENHANCE_DEFAULTS: Dict[str, Any] = {
+    "max_tokens": 256,
+    "max_chars":  1200,
+    "style": ("Be descriptive about style, lighting, composition, colors, and "
+              "atmosphere."),
+}
+
+FAMILY_PROMPT_ENHANCE: Dict[str, Dict[str, Any]] = {
+    DIFFUSER_FAMILY_SDXL: {
+        "max_tokens": 96,
+        "max_chars":  320,
+        "style": ("Write at most 55 words as a dense, comma-separated list of "
+                  "visual keywords covering subject, setting, lighting and "
+                  "style. Put the main subject FIRST. No sentences, no "
+                  "narration, no preamble."),
+    },
+    DIFFUSER_FAMILY_ZIMAGE: dict(PROMPT_ENHANCE_DEFAULTS),
+    DIFFUSER_FAMILY_FLUX2:  dict(PROMPT_ENHANCE_DEFAULTS),
+}
+
+
+def prompt_enhance_spec(diff_path: str, diff_arch: str = "") -> Dict[str, Any]:
+    """Enhancement budget for the diffuser in use. Unknown models get the
+    permissive default, matching how they are treated everywhere else."""
+    fam = diffuser_family(diff_path, diff_arch) if diff_path else None
+    return FAMILY_PROMPT_ENHANCE.get(fam, PROMPT_ENHANCE_DEFAULTS)
+
+
+def trim_to_budget(text: str, max_chars: int) -> str:
+    """Clean up an enhancer's output: cut it to max_chars, and drop a trailing
+    fragment left behind when llama.cpp stopped at its -n token budget.
+
+    TWO separate problems, both seen in practice:
+
+      1. Too long. Cut to max_chars on a clause boundary, never mid-word.
+
+      2. Truncated mid-thought, but still UNDER max_chars -- which is the
+         common case once -n is small. The observed example ended
+         "...No other people, animals, or distractions-total", where "total"
+         is the start of a word the model never finished. Length-trimming
+         alone does nothing here because the text already fits.
+
+    For (2) the tell is that the text does not end on sentence punctuation.
+    Prose that was allowed to finish ends with . ! or ? -- prose that was cut
+    off does not. So when the ending is unterminated, fall back to the last
+    complete clause. A keyword list (SDXL style) legitimately ends without a
+    full stop, and there the same rule just drops the final partial keyword,
+    which is the desired behaviour too.
+
+    Both steps refuse a break point that would discard more than half the
+    text, so a stray early comma cannot gut a whole prompt.
+    """
+    t = " ".join(str(text).split())
+    if not t:
+        return t
+
+    def _cut_back(s: str, floor: int) -> str:
+        """Trim s back to the last sentence end, else the last clause end,
+        keeping at least `floor` characters. Returns s unchanged if no
+        acceptable break point exists."""
+        for seps, keep in ((".!?", True), (",;:", False), (" ", False)):
+            idx = max(s.rfind(c) for c in seps)
+            if idx > floor:
+                return s[:idx + 1] if keep else s[:idx].rstrip(" ,;:-—–")
+        return s
+
+    # (1) length
+    if len(t) > max_chars:
+        t = _cut_back(t[:max_chars], max_chars * 0.5)
+
+    # (2) unterminated tail -- but ONLY when the output came close to the
+    # budget. llama.cpp truncates when it hits -n, which produces text at or
+    # near the cap; an output well short of it stopped because the model was
+    # finished, and its last word is a real one. Without this proportion test
+    # the rule would eat the final word of every short, complete prompt --
+    # "a man walking his dog on a meadow" would lose "meadow", and a finished
+    # keyword list would lose its last keyword.
+    if t and t[-1] not in ".!?" and len(t) >= max_chars * 0.6:
+        t = _cut_back(t, len(t) * 0.5)
+
+    return t.strip()
+
+
+PREDICTION_AUTO = "Auto"
+PREDICTION_CHOICES: List[str] = [PREDICTION_AUTO, "eps", "v", "edm_v"]
+VPRED_NAME_PATTERN = r"(?:^|[^a-z0-9])v[-_]?pred"
+
+
+def sdxl_prediction_override(name: str, setting: str = PREDICTION_AUTO) -> str:
+    """The value for sd-cli --prediction, or "" to omit the flag entirely."""
+    s = (setting or PREDICTION_AUTO).strip()
+    if s and s != PREDICTION_AUTO:
+        return s
+    return "v" if re.search(VPRED_NAME_PATTERN, normalize_model_name(name)) else ""
+
+
+# Safetensors text encoders (the split-SDXL clip_l / clip_g pair). These carry
+# no architecture field at all, so the filename is the only oracle available.
+# Consumed by inference.classify_model() so they land in the encoder bin rather
+# than "unknown", which is what kept them out of every picker.
+TEXT_ENCODER_NAME_PATTERNS: List[str] = [
+    r"\bclip[-_. ]?[lg]\b",
+    r"clip_[lg]",
+    r"\bt5[-_. ]?xxl\b",
+    r"\bumt5\b",
+]
 
 # Quantization tokens recognised in filenames by
 # inference.get_quantization_label(), longest-first at match time so that
@@ -630,7 +1128,15 @@ QUANT_TOKENS: List[str] = [
 SAMPLER_MAP: Dict[str, str] = {
     "euler_a": "euler_a", "euler": "euler", "heun": "heun",
     "dpm2": "dpm2", "dpm++2s_a": "dpm++2s_a", "dpm++2m": "dpm++2m",
-    "dpm++2mv2": "dpm++2mv2", "lcm": "lcm", "ddim": "ddim", "plms": "plms",
+    "dpm++2mv2": "dpm++2mv2", "lcm": "lcm",
+    # sd.cpp's sampler list has no plain "ddim" and no "plms" at all -- the
+    # accepted values are euler, euler_a, heun, dpm2, dpm++2s_a, dpm++2m,
+    # dpm++2mv2, ipndm, ipndm_v, lcm, ddim_trailing, tcd, res_multistep,
+    # res_2s, er_sde, euler_cfg_pp, euler_a_cfg_pp. Selecting the old "ddim"
+    # or "plms" handed sd-cli a value it rejects, so "ddim" now maps to the
+    # real flag and "plms" is gone.
+    "ddim": "ddim_trailing", "ddim_trailing": "ddim_trailing",
+    "ipndm": "ipndm", "tcd": "tcd", "res_multistep": "res_multistep",
 }
 # sd.cpp silently rounds width/height up to the nearest multiple of 64
 # internally (latent-space alignment requirement of the VAE/DiT). Any value
@@ -656,9 +1162,18 @@ IMAGE_SIZES       = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
 FLUX2_IMAGE_SIZES  = [512, 768, 1024, 1280, 1536, 1792, 2048]
 ZIMAGE_IMAGE_SIZES = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
 
+# SDXL was trained at roughly 1MP across a set of aspect buckets, with
+# 1024x1024 native. The off-square bucket sizes here (832/896/1152/1216/1344)
+# are all multiples of 64, so sd.cpp will not silently round them (see the
+# IMAGE_SIZES note above). Below 512 SDXL degrades badly -- it is not an SD1.5
+# and does not tolerate 256 -- so the floor is 512.
+SDXL_IMAGE_SIZES = [512, 768, 832, 896, 1024, 1152, 1216, 1344, 1536]
+
 FAMILY_IMAGE_SIZES: Dict[str, List[int]] = {
     "flux2_distilled": FLUX2_IMAGE_SIZES,
     "flux2_base":      FLUX2_IMAGE_SIZES,
+    "sdxl_base":       SDXL_IMAGE_SIZES,
+    "sdxl_distilled":  SDXL_IMAGE_SIZES,
     "z-image":         ZIMAGE_IMAGE_SIZES,
     "none":            IMAGE_SIZES,
 }
@@ -709,6 +1224,21 @@ FAMILY_STEP_CFG = {
         "steps":  ([4, 6, 8, 10, 12], 8),
         "cfg":    (1.0, 4.0, 0.5, 1.0),
     },
+    # SDXL base and ordinary (non-distilled) finetunes: a conventional
+    # classifier-free-guidance model, unlike everything else this program
+    # drives. 25-30 steps at cfg 6-8 is the standard band, and the negative
+    # prompt actually does something here because cfg is above 1.0.
+    "sdxl_base": {
+        "steps":  ([20, 24, 28, 30, 32, 40], 30),
+        "cfg":    (1.0, 12.0, 0.5, 7.0),
+    },
+    # Distilled SDXL: Turbo, Lightning, Hyper, DMD2, LCM. Step-distilled the
+    # same way Klein and Z-Image-Turbo are, and wanting the same treatment --
+    # a few steps at cfg near 1.0. See is_sdxl_distilled_variant().
+    "sdxl_distilled": {
+        "steps":  ([1, 2, 4, 6, 8], 6),
+        "cfg":    (1.0, 3.0, 0.5, 1.5),
+    },
     # No diffuser chosen yet: keep the permissive superset.
     "none": {
         "steps":  (STEP_CHOICES, 8),
@@ -723,6 +1253,8 @@ def family_step_cfg_key(diff_path: str, diff_arch: str = "") -> str:
     fam = diffuser_family(diff_path, diff_arch) if diff_path else None
     if fam == DIFFUSER_FAMILY_FLUX2:
         return "flux2_base" if is_flux2_base_variant(diff_path) else "flux2_distilled"
+    if fam == DIFFUSER_FAMILY_SDXL:
+        return "sdxl_distilled" if is_sdxl_distilled_variant(diff_path) else "sdxl_base"
     if fam == DIFFUSER_FAMILY_ZIMAGE:
         return "z-image"
     return "none"
@@ -1436,6 +1968,26 @@ def _default_configuration() -> Dict[str, Any]:
         "encoder_model_path":  "",  "encoder_model_name":  "",
         "imagegen_model_path": "",  "imagegen_model_name": "",
         "vae_model_path":      "",  "vae_model_name":      "",
+        # Split-SDXL text encoders. Every SDXL gguf in circulation is UNet-only
+        # and needs these two supplied separately; a full SDXL .safetensors
+        # carries its own and leaves them blank. Unused by Z-Image and Flux.2,
+        # which condition through the Qwen3 encoder_model_path instead.
+        "clip_l_model_path":   "",  "clip_l_model_name":   "",
+        "clip_g_model_path":   "",  "clip_g_model_name":   "",
+        # img2img denoise strength: 0.0 returns the init image untouched, 1.0
+        # ignores it entirely. sd.cpp's own default is 0.75.
+        "imagegen_strength": 0.75,
+        # v-prediction override for SDXL finetunes; see sdxl_prediction_override.
+        "imagegen_prediction": PREDICTION_AUTO,
+        # Manual model-family override for files auto-detection cannot place;
+        # see FAMILY_OVERRIDE_CHOICES.
+        "imagegen_family_override": FAMILY_OVERRIDE_AUTO,
+        # The family_step_cfg_key() the saved steps/cfg/size values belong to.
+        # Steps and CFG mean different things per family -- cfg 1.5 is correct
+        # for a distilled model and badly wrong for SDXL base, which wants ~7 --
+        # so the Generation page needs to know whether the current values were
+        # chosen FOR the current family or inherited from a different one.
+        "imagegen_last_family": "",
         "last_model_browse_dir": ".\\models",
         # Starting folder for the Generate page's "Add Image" picker. Unlike
         # last_model_browse_dir (which sensibly starts at .\models, where this
@@ -1549,7 +2101,12 @@ def load_configuration() -> Dict[str, Any]:
     """Load data/configuration.json, migrating a pre-split persistent.json
     into place first if that is all that exists."""
     _migrate_legacy_persistent()
-    return _load_json_with_defaults(get_configuration_path(), _default_configuration())
+    cfg = _load_json_with_defaults(get_configuration_path(), _default_configuration())
+    # Refresh the module-level family override on every load, so that
+    # diffuser_family() -- called from a dozen places that only have a path --
+    # sees the user's current choice without an extra argument everywhere.
+    set_family_override(cfg.get("imagegen_family_override", FAMILY_OVERRIDE_AUTO))
+    return cfg
 
 
 def save_configuration(data: Dict[str, Any]) -> None:

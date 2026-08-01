@@ -18,6 +18,7 @@ time. Nothing here assumes a GPU count or a particular device index.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -238,7 +239,12 @@ def _vae_name_matches_family(filename: str, family: Optional[str]) -> bool:
     """
     low = filename.lower()
     if family == configure.DIFFUSER_FAMILY_FLUX2:
-        return configure.vae_family(low) == configure.DIFFUSER_FAMILY_FLUX2
+        return configure.DIFFUSER_FAMILY_FLUX2 in configure.vae_families(low)
+    if family == configure.DIFFUSER_FAMILY_SDXL:
+        # SDXL has no single canonical VAE filename the way Z-Image has
+        # ae.safetensors: sdxl_vae-fp16-fix, xlVAEC_c91 and various finetune
+        # VAEs are all legitimate, so membership of the SDXL set is the test.
+        return configure.DIFFUSER_FAMILY_SDXL in configure.vae_families(low)
     # z-image or unknown -> the exact ae.safetensors filename
     return low == "ae.safetensors"
 
@@ -303,6 +309,87 @@ def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
     except OSError:
         pass
     return "", ""
+
+
+def _detect_clip(diff_path_str: str, which: str) -> Tuple[str, str]:
+    """Find clip_l / clip_g next to the diffusion model, returning
+    (path, name) or ("", ""). `which` is "l" or "g".
+
+    Same bounded search as _detect_vae: the model's own folder first, then up
+    to 4 levels upward stopping at the models root, then the models root and
+    everything beneath it. The quantizers ship these alongside the UNet (hum-ma
+    puts them in a clip/ subfolder), so the recursive sweep of the models root
+    is what catches that layout.
+
+    Matching is by filename because these carry no metadata to key off. The
+    patterns are deliberately narrow -- an underscore/dash/dot separated
+    "clip" followed by the single letter -- so that clip_g never matches a
+    request for clip_l, which a looser substring test would do.
+    """
+    if not diff_path_str:
+        return "", ""
+    p = Path(diff_path_str).expanduser()
+    letter = which.lower()
+    pat = re.compile(rf"(^|[^a-z0-9])clip[-_. ]?{letter}([^a-z0-9]|$)", re.I)
+
+    def _scan(folder: Path) -> Optional[Path]:
+        try:
+            if not folder.is_dir():
+                return None
+            for f in sorted(folder.iterdir()):
+                if f.is_file() and f.name.lower().endswith(".safetensors") \
+                        and pat.search(f.stem):
+                    return f
+        except OSError:
+            pass
+        return None
+
+    models_dir = configure.get_models_dir().resolve()
+    current = p.parent.resolve()
+    for _ in range(5):
+        hit = _scan(current)
+        if hit:
+            return str(hit), hit.name
+        if current == models_dir or current == current.parent:
+            break
+        current = current.parent
+
+    hit = _scan(models_dir)
+    if hit:
+        return str(hit), hit.name
+    try:
+        for f in sorted(models_dir.rglob("*.safetensors")):
+            if f.is_file() and pat.search(f.stem):
+                return str(f), f.name
+    except OSError:
+        pass
+    return "", ""
+
+
+def _resolve_clips(diff_path_str: str, cur_l_path: str, cur_g_path: str) -> tuple:
+    """Decide what the CLIP-L/CLIP-G boxes hold after the diffuser changes.
+
+    Returns (l_path, l_name, g_path, g_name) as values or gr.update()s.
+
+    Only SDXL uses these, so switching TO any other family blanks them -- they
+    would otherwise sit there stale and get passed to a diffuser that has no
+    --clip_l flag. Within SDXL: auto-detect if found, keep what is already set
+    if it still exists on disk, else blank. Same three rules as _resolve_vae.
+    """
+    fam = configure.diffuser_family(diff_path_str) if diff_path_str else None
+    if fam != configure.DIFFUSER_FAMILY_SDXL:
+        return "", "", "", ""
+
+    out = []
+    for which, cur in (("l", cur_l_path), ("g", cur_g_path)):
+        path, name = _detect_clip(diff_path_str, which)
+        if path:
+            out.extend([path, name])
+        elif cur and Path(cur).expanduser().exists():
+            out.extend([gr.update(), gr.update()])
+        else:
+            out.extend(["", ""])
+    return tuple(out)
 
 
 def _resolve_vae(diff_path_str: str, current_vae_path: str,
@@ -469,6 +556,84 @@ def _idle_preview_image() -> Optional[str]:
 _gen: Dict[str, Any] = {}
 
 
+# SDXL's text encoders are FIXED by architecture: CLIP-L (OpenCLIP ViT-L/14,
+# 768-dim) and CLIP-G (ViT-bigG/14, 1280-dim), concatenated to the 2048-dim
+# vector the UNet's cross-attention was trained against. A Qwen3 or T5 gguf
+# cannot stand in for them -- wrong architecture, wrong dimensions. So for SDXL
+# the left-hand Encoder slot has NO conditioning role at all; it is only an
+# optional prompt enhancer (a Qwen3 run through llama.cpp that rewrites the
+# prompt text before sd-cli ever sees it). Z-Image and Flux.2 are the opposite:
+# there the Encoder IS the conditioner and is mandatory.
+_ENC_LABEL_CONDITIONER = "Encoder Name"
+_ENC_LABEL_ENHANCER    = "Encoder Name (optional)"
+_ENC_INFO_CONDITIONER  = "Qwen3 text encoder — required; conditions the diffuser."
+_ENC_INFO_ENHANCER     = ("Optional for SDXL — used only to expand the prompt. "
+                          "SDXL conditions through CLIP-L/CLIP-G instead.")
+
+
+def _clips_needed(diff_path: str) -> bool:
+    """Whether CLIP-L/CLIP-G must be supplied for this diffuser.
+
+    Depends on the DIFFUSION FILE's packaging, and on nothing else. In
+    particular it has no connection to the Encoder slot: that runs a Qwen3
+    through llama.cpp to rewrite the prompt text and is never passed to
+    sd-cli, so setting or clearing it changes nothing here. What matters is
+    whether the model file carries its own text encoders -- an sd.cpp-native
+    full checkpoint does, a city96 UNet-only quant does not."""
+    if not diff_path:
+        return False
+    if configure.diffuser_family(diff_path) != configure.DIFFUSER_FAMILY_SDXL:
+        return False
+    return configure.sdxl_is_unet_only(diff_path)
+
+
+def _encoder_slot_updates(diff_path: str) -> tuple:
+    """UI updates for the encoder/CLIP slots when the diffuser changes.
+
+    Returns (encoder box, clip_l box, clip_l button, clip_g box, clip_g button,
+    packaging status). The CLIP rows appear only when the chosen model actually
+    needs them, so a self-contained checkpoint does not present two boxes that
+    would be ignored. The Encoder box is relabelled rather than hidden for
+    SDXL, since it stays useful there as a prompt enhancer."""
+    is_sdxl = (configure.diffuser_family(diff_path) ==
+               configure.DIFFUSER_FAMILY_SDXL) if diff_path else False
+    needs_clips = _clips_needed(diff_path)
+    enc = gr.update(
+        label=_ENC_LABEL_ENHANCER if is_sdxl else _ENC_LABEL_CONDITIONER,
+        info=_ENC_INFO_ENHANCER if is_sdxl else _ENC_INFO_CONDITIONER,
+    )
+    vis = gr.update(visible=needs_clips)
+    label = configure.sdxl_packaging_label(diff_path)
+    status = gr.update(value=label, visible=bool(label))
+    return (enc, vis, vis, vis, vis, status)
+
+
+def _has_split_clips(c: Optional[Dict[str, Any]] = None) -> bool:
+    """True when BOTH split-SDXL text encoders are configured and on disk.
+    This is what selects SDXL packaging -- see configure.diffuser_spec."""
+    c = c if c is not None else configure.load_configuration()
+    return (_model_path_ok(c.get("clip_l_model_path"))
+            and _model_path_ok(c.get("clip_g_model_path")))
+
+
+def _family_takes_input_image(diff_path: str) -> bool:
+    """True when the diffuser can accept an input image at all, by either
+    route (Flux.2's -r references or SDXL's -i init image). Drives whether the
+    whole input-image column is on screen."""
+    spec = (configure.diffuser_spec(diff_path, "", _has_split_clips())
+            if diff_path else None)
+    return bool(spec and spec.get("img2img"))
+
+
+def _family_uses_init_image(diff_path: str) -> bool:
+    """True when the diffuser uses the standard -i + --strength img2img path
+    (SDXL) rather than -r reference conditioning (Flux.2). Drives the Denoise
+    Strength slider, which has no meaning on the -r path."""
+    spec = (configure.diffuser_spec(diff_path, "", _has_split_clips())
+            if diff_path else None)
+    return bool(spec and spec.get("img2img") == "init")
+
+
 def _model_path_ok(value: Any) -> bool:
     """True when a saved model-path value points at a file that is on disk now.
 
@@ -504,10 +669,31 @@ def _missing_models() -> List[str]:
     a path typed but not saved is not yet a path this program will run with.
     """
     c = configure.load_configuration()
-    labels = [("encoder_model_path", "Encoder"),
-              ("imagegen_model_path", "Diffusion"),
-              ("vae_model_path", "VAE")]
-    return [label for key, label in labels if not _model_path_ok(c.get(key))]
+    diff = c.get("imagegen_model_path", "")
+    diff_ok = _model_path_ok(diff)
+
+    # Which files this run needs depends on the diffuser. Until one is chosen
+    # (or when it is unrecognised) fall back to the Z-Image spec, which is the
+    # three-file set this program required before families existed.
+    spec = ((configure.diffuser_spec(diff, "", _has_split_clips(c)) if diff_ok else None)
+            or configure.DIFFUSER_FAMILY_SPECS[configure.DIFFUSER_FAMILY_ZIMAGE])
+
+    missing: List[str] = []
+    if not diff_ok:
+        missing.append("Diffusion")
+    if "llm" in spec["text_encoders"] and not _model_path_ok(c.get("encoder_model_path")):
+        missing.append("Encoder")
+    # Split-SDXL only: a full SDXL .safetensors bundles these and declares no
+    # encoder slots, so it never asks for them.
+    if "clip_l" in spec["text_encoders"] and not _model_path_ok(c.get("clip_l_model_path")):
+        missing.append("CLIP-L")
+    if "clip_g" in spec["text_encoders"] and not _model_path_ok(c.get("clip_g_model_path")):
+        missing.append("CLIP-G")
+    # Not universal: a full SDXL checkpoint carries its own VAE, so demanding
+    # one there would hide the Generate button on a perfectly valid setup.
+    if spec["vae_required"] and not _model_path_ok(c.get("vae_model_path")):
+        missing.append("VAE")
+    return missing
 
 
 def _models_configured() -> bool:
@@ -561,12 +747,25 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
     new family is KEPT (no clobbering a deliberate choice); only an out-of-range
     value is snapped to the family default. Returned in the generate_tab.select
     outputs order.
+
+    That "keep what is valid" rule applies WITHIN a family only. On a change of
+    family the values are snapped to the new family's defaults even when they
+    would pass the range test, because the same number means different things
+    to different families: cfg 1.5 is correct for a distilled model and badly
+    wrong for SDXL base (which wants ~7), yet 1.5 sits inside SDXL's 1.0-12.0
+    range and would survive as a silently bad setting. Steps behave the same
+    way -- 8 is a full run for Z-Image and a quarter of one for SDXL base.
     """
     c = configure.load_configuration()
     diff = c.get("imagegen_model_path", "")
     fam_label = configure.diffuser_family_label(diff)
-    is_flux2 = (configure.diffuser_family(diff)
-                == configure.DIFFUSER_FAMILY_FLUX2)
+    # The input-image column is shown for any family that can take one (Flux.2
+    # -r, SDXL -i); the strength slider only for the -i path.
+    takes_image = _family_takes_input_image(diff)
+    uses_init = _family_uses_init_image(diff)
+    # Only "ref" families (Flux.2) can consume more than one input image.
+    _spec_now = configure.diffuser_spec(diff) if diff else None
+    takes_multi = bool(_spec_now and _spec_now.get("img2img") == "ref")
     ok, msg = inference.check_model_compatibility(c)
     status = gr.update() if ok else gr.update(value="⚠ " + msg)
     # Sampler is NOT touched by family selection — euler_a is the default for
@@ -578,18 +777,29 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
     step_choices, step_default = spec["steps"]
     cfg_min, cfg_max, cfg_step, cfg_default = spec["cfg"]
 
+    # Has the family changed since these values were last saved? If so, the
+    # numbers came from a different model class and are not evidence of intent.
+    fam_key = configure.family_step_cfg_key(diff)
+    family_changed = fam_key != c.get("imagegen_last_family", "")
+    if family_changed:
+        try:
+            configure.update_configuration({"imagegen_last_family": fam_key})
+        except Exception:
+            pass      # a failed write only costs one extra snap next time
+
     try:
         cs = int(cur_steps)
     except (TypeError, ValueError):
         cs = None
-    step_val = cs if cs in step_choices else step_default
+    step_val = step_default if family_changed else (cs if cs in step_choices else step_default)
     steps_upd = gr.update(choices=step_choices, value=step_val)
 
     try:
         cc = float(cur_cfg)
     except (TypeError, ValueError):
         cc = None
-    cfg_val = cc if (cc is not None and cfg_min <= cc <= cfg_max) else cfg_default
+    cfg_val = (cfg_default if family_changed
+               else (cc if (cc is not None and cfg_min <= cc <= cfg_max) else cfg_default))
     cfg_upd = gr.update(minimum=cfg_min, maximum=cfg_max, step=cfg_step, value=cfg_val)
 
     # Width / height: swap to the family's allowed sizes, keeping a valid current
@@ -600,19 +810,36 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
             cv = int(cur)
         except (TypeError, ValueError):
             cv = None
+        if family_changed:
+            # Always drop back to 512x512 on a model switch. SDXL's NATIVE
+            # resolution is 1024 and it does look better there, but defaulting
+            # to it means every switch risks an immediate OOM on a small card:
+            # 1024 roughly quadruples the compute buffer versus 512. A
+            # conservative default that always runs beats a better-looking one
+            # that sometimes cannot, so the user raises it deliberately once
+            # they know the model loads.
+            return gr.update(choices=sizes,
+                             value=(512 if 512 in sizes else min(sizes)))
         return gr.update(choices=sizes, value=(cv if cv in sizes else 768))
     width_upd = _size_upd(cur_width)
     height_upd = _size_upd(cur_height)
 
     return (
         gr.update(value=f"### Settings ({fam_label})"),
-        gr.update(visible=is_flux2),
+        gr.update(visible=takes_image),
         status,
         sampler_upd,
         steps_upd,
         cfg_upd,
         width_upd,
         height_upd,
+        # Strength also requires an image to be loaded, not merely a family
+        # that could accept one.
+        gr.update(visible=bool(uses_init and configure.get_ref_images())),
+        # The mode radio depends on the FAMILY as well as the image count, so
+        # it is re-synced here: switching from Flux.2 to SDXL on the
+        # Configuration page must retract it even though no image changed.
+        gr.update(visible=bool(takes_multi and len(configure.get_ref_images()) > 1)),
     )
 
 
@@ -690,10 +917,13 @@ def _build_generate_tab_inner() -> None:
             # Whole column shown ONLY when the diffuser is Flux.2. When hidden
             # it occupies no height, so on a Z-Image model column 2 opens on
             # "### Prompts" exactly as it did before this block moved up.
-            _flux2_now = (configure.diffuser_family(cfg.get("imagegen_model_path", ""))
-                          == configure.DIFFUSER_FAMILY_FLUX2)
-            with gr.Column(visible=_flux2_now) as _gen["ref_row"]:
-                gr.Markdown("#### Image Edit (img+txt to img)")
+            # Shown for every family that can take an input image at all:
+            # Flux.2 (multi-reference editing, -r) and SDXL (standard img2img,
+            # -i + --strength). Hidden for Z-Image, which is text-to-image only.
+            _img_in_now = _family_takes_input_image(cfg.get("imagegen_model_path", ""))
+            _init_now = _family_uses_init_image(cfg.get("imagegen_model_path", ""))
+            with gr.Column(visible=_img_in_now) as _gen["ref_row"]:
+                gr.Markdown("#### Input Image (img+txt to img)")
                 # Reference images for image-to-image / editing (sd.cpp -r,
                 # repeatable). "Add Image" opens a native file picker and
                 # APPENDS to the list (add, then add again); "Clear Images"
@@ -759,8 +989,26 @@ def _build_generate_tab_inner() -> None:
                     value=configure.get_ref_mode(),
                     visible=False, elem_id="ref-image-mode",
                 )
+                # img2img denoise strength. Only meaningful for families that
+                # use -i (SDXL); Flux.2 conditions through -r instead and has
+                # no strength control, so this is hidden there. 0.0 returns the
+                # input untouched, 1.0 ignores it; sd.cpp's default is 0.75.
+                # 0.3-0.5 keeps composition and restyles, 0.7-0.9 reinvents.
+                _gen["strength_sld"] = gr.Slider(
+                    label="Denoise Strength",
+                    minimum=0.0, maximum=1.0, step=0.05,
+                    value=float(cfg.get("imagegen_strength", 0.75)),
+                    # Needs BOTH an -i-path family and at least one image
+                    # already in the list; an empty list leaves nothing for a
+                    # denoise fraction to apply to.
+                    visible=bool(_init_now and configure.get_ref_images()),
+                    info="Lower keeps more of the input image; higher redraws it.",
+                )
 
-            gr.Markdown("### Prompts")
+            # No "### Prompts" heading here: the two textboxes below are
+            # already labelled Positive Prompt and Negative Prompt, so a
+            # heading only repeats them and costs vertical space in the
+            # centre column, which is the most crowded of the three.
             # ── Positive Prompt, with a "(history)" popout ──────────────────
             # The label itself is the toggle: a gr.Button stripped of button
             # chrome by #positive-history-toggle CSS, reading as plain label
@@ -946,7 +1194,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
     def do_generate(prompt, negative, width, height, steps, sampler,
     cfg_scale, seed, batch, output_format, quality_preset, ref_images=None,
-    ref_mode=None):
+    ref_mode=None, strength=None):
         """
         Generator: yields (preview_img, gallery, status, btn_update) tuples
         so the preview box can switch between program_encoding.jpg /
@@ -1021,6 +1269,11 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             negative_prompt=negative,
             output_format=output_format,
         )
+        # img2img denoise strength, from the Generate page slider. Falls back
+        # to the saved value (then sd.cpp's own 0.75) when the slider is
+        # hidden, which is every family that does not use the -i path.
+        if strength is not None:
+            base_gen_cfg["imagegen_strength"] = float(strength)
 
         # Reference images (Flux.2 -r). The accumulated list arrives from
         # ref_images_state as a list of real on-disk paths (the native picker
@@ -1042,6 +1295,23 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # as Use All. Each chain "link" is a single-image list, run through
         # its own call to inference.generate_image(); Use All (or the
         # collapsed case) is one run carrying the whole list.
+        # Families on the -i path consume exactly ONE input image per run:
+        # sd-cli has a single --init-img and no way to take a second. So the
+        # extra images are dropped rather than chained.
+        #
+        # Chaining them looked reasonable but was wrong: it turned each image
+        # into its own generation, and each generation still honours Batch
+        # Count -- so two images at a batch of 2 quietly produced FOUR images
+        # instead of the two the user asked for. Batch Count is the control
+        # that decides how many images come out; nothing else may multiply it.
+        _init_family = _family_uses_init_image(c.get("imagegen_model_path", ""))
+        if _init_family and len(_refs) > 1:
+            print(f"[generate] NOTE: this model takes one input image; using "
+                  f"{Path(_refs[0]).name} and ignoring {len(_refs) - 1} other(s).")
+            _refs = _refs[:1]
+
+        # Chain only when the user asked for it, and only where more than one
+        # image can actually be used.
         chain_mode = (ref_mode == configure.REF_MODE_CHAIN_ALL) and len(_refs) > 1
         ref_batches: List[List[str]] = ([[r] for r in _refs] if chain_mode
                                         else [_refs])
@@ -1281,7 +1551,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
     def on_generate_click(prompt, negative, width, height, steps, sampler,
     cfg_scale, seed, batch, output_format, quality_preset, ref_images=None,
-    ref_mode=None):
+    ref_mode=None, strength=None):
         """Dispatch a click on the single dynamic button. The button reads
         "Generate" when idle and starts a run (delegating to the do_generate
         generator, which yields its own button-state updates). While a run
@@ -1294,7 +1564,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         automatically from the selected GPU's fp16 capability — no input
         here."""
         yield from do_generate(prompt, negative, width, height, steps, sampler,
-    cfg_scale, seed, batch, output_format, quality_preset, ref_images, ref_mode)
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images, ref_mode,
+    strength)
 
     # ── Reference-image Add / Clear handlers ────────────────────────────────
     def _render_ref_list(paths: List[str]) -> Any:
@@ -1310,10 +1581,32 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         names = "\n".join(Path(p).name for p in (paths or []))
         return gr.update(value=names)
 
+    def _render_strength_visibility(count: int) -> Any:
+        """Denoise Strength is meaningful only when there is actually an input
+        image to denoise FROM, and only on the -i img2img path.
+
+        Flux.2 is excluded on purpose even though it accepts input images: it
+        conditions through -r reference images (Kontext-style editing), which
+        sd-cli drives with no strength parameter at all, so the slider would
+        imply a control that does nothing."""
+        c = configure.load_configuration()
+        uses_init = _family_uses_init_image(c.get("imagegen_model_path", ""))
+        return gr.update(visible=bool(uses_init and count > 0))
+
     def _render_ref_mode_visibility(count: int) -> Any:
-        """Show the Use All / Chain All switch only once there is an actual
-        choice to make -- i.e. 2 or more accumulated reference images."""
-        return gr.update(visible=count > 1)
+        """Show the Use All / Chain All switch only when there is a real choice.
+
+        TWO conditions, not one. There must be 2+ accumulated images, AND the
+        diffuser must be able to consume more than one -- which only the "ref"
+        families can. Flux.2 conditions on every image at once through
+        repeatable -r flags; SDXL takes a single -i init image and has no way
+        to accept a second, so offering "Use All" there promises something
+        sd-cli cannot do. Hiding it is what stops the mode from silently
+        turning into a chained run that multiplies the batch count."""
+        c = configure.load_configuration()
+        spec = configure.diffuser_spec(c.get("imagegen_model_path", ""))
+        multi = bool(spec and spec.get("img2img") == "ref")
+        return gr.update(visible=bool(multi and count > 1))
 
     def _add_ref_images(current):
         """Open the native picker and APPEND whatever was chosen to the
@@ -1327,7 +1620,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         acc = list(current or [])
         acc.extend(_browse_images())
         configure.set_ref_images(acc)
-        return acc, _render_ref_list(acc), _render_ref_mode_visibility(len(acc))
+        return (acc, _render_ref_list(acc), _render_ref_mode_visibility(len(acc)),
+                _render_strength_visibility(len(acc)))
 
     def _clear_ref_images():
         """The ONE thing that empties the reference-image list.
@@ -1338,7 +1632,20 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         the way they last asked for rather than silently reverting.
         """
         configure.set_ref_images([])
-        return [], _render_ref_list([]), gr.update(visible=False)
+        return [], _render_ref_list([]), gr.update(visible=False), gr.update(visible=False)
+
+    def _resync_ref_widgets() -> tuple:
+        """Recompute the reference-image widgets from the authoritative list.
+
+        Used when the Generate tab is selected, because the diffuser may have
+        been changed on the Configuration page in between -- and the radio's
+        visibility depends on the FAMILY as well as the image count, so it can
+        go stale without the image list changing at all. Returns
+        (list, mode radio, strength)."""
+        imgs = configure.get_ref_images()
+        return (_render_ref_list(imgs),
+                _render_ref_mode_visibility(len(imgs)),
+                _render_strength_visibility(len(imgs)))
 
     def _on_ref_mode_change(mode):
         """Record the user's Use All / Chain All choice in session state, so
@@ -1348,13 +1655,35 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     _gen["ref_add_btn"].click(
         _add_ref_images,
         inputs=[_gen["ref_images_state"]],
-        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"],
+                 _gen["strength_sld"]],
     )
     _gen["ref_clear_btn"].click(
         _clear_ref_images,
         inputs=None,
-        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"]],
+        outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"],
+                 _gen["strength_sld"]],
     )
+    # ── Belt-and-braces sync ─────────────────────────────────────────────
+    # The two widgets whose visibility depends on the image list are also
+    # driven off the list STATE itself, not only off the Add/Clear buttons.
+    #
+    # Hanging them on the buttons alone means every future code path that
+    # touches the list has to remember to return their updates too, and a
+    # path that forgets leaves a stale slider on screen until something else
+    # happens to redraw it (switching tabs, for instance). Deriving from the
+    # state makes the list the single source of truth: whatever changes it,
+    # for whatever reason, these follow.
+    def _on_ref_images_changed(imgs):
+        n = len(imgs or [])
+        return _render_ref_mode_visibility(n), _render_strength_visibility(n)
+
+    _gen["ref_images_state"].change(
+        _on_ref_images_changed,
+        inputs=[_gen["ref_images_state"]],
+        outputs=[_gen["ref_mode_radio"], _gen["strength_sld"]],
+    )
+
     _gen["ref_mode_radio"].change(
         _on_ref_mode_change,
         inputs=[_gen["ref_mode_radio"]],
@@ -1369,7 +1698,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
         _gen["sampler_dd"], _gen["cfg_scale_sld"],
         _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"],
-        _gen["preset_dd"], _gen["ref_images_state"], _gen["ref_mode_radio"]],
+        _gen["preset_dd"], _gen["ref_images_state"], _gen["ref_mode_radio"],
+        _gen["strength_sld"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
     )
@@ -1431,7 +1761,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 _gen["width_dd"], _gen["height_dd"]],
         outputs=[_gen["settings_header"], _gen["ref_row"], status_box,
                  _gen["sampler_dd"], _gen["steps_dd"], _gen["cfg_scale_sld"],
-                 _gen["width_dd"], _gen["height_dd"]],
+                 _gen["width_dd"], _gen["height_dd"], _gen["strength_sld"],
+                 _gen["ref_mode_radio"]],
     )
 
     _gen["prompt_tb"].focus(
@@ -1569,19 +1900,30 @@ def _build_config_tab_inner() -> None:
     _cfg_w["enc_path_tb"]  = gr.Textbox(value=cfg.get("encoder_model_path", ""),  visible=False)
     _cfg_w["diff_path_tb"] = gr.Textbox(value=cfg.get("imagegen_model_path", ""), visible=False)
     _cfg_w["vae_path_tb"]  = gr.Textbox(value=cfg.get("vae_model_path", ""),      visible=False)
+    # Split-SDXL text encoders. Every SDXL gguf in circulation is UNet-only and
+    # needs these supplied separately; Z-Image, Flux.2 and full SDXL
+    # .safetensors checkpoints all leave them blank.
+    _cfg_w["clip_l_path_tb"] = gr.Textbox(value=cfg.get("clip_l_model_path", ""), visible=False)
+    _cfg_w["clip_g_path_tb"] = gr.Textbox(value=cfg.get("clip_g_model_path", ""), visible=False)
+
+    # Whether the currently-saved diffuser is SDXL decides two things on this
+    # page: whether the CLIP-L/CLIP-G rows are shown at all, and whether the
+    # Encoder box is presented as a required conditioner or an optional prompt
+    # enhancer. Recomputed on every diffusion-model pick, below.
+    _cfg_is_sdxl = (configure.diffuser_family(cfg.get("imagegen_model_path", ""))
+                    == configure.DIFFUSER_FAMILY_SDXL)
+    # CLIP boxes appear only when the model file actually lacks its own text
+    # encoders -- see _clips_needed(). Nothing to do with the Encoder slot.
+    _cfg_needs_clips = _clips_needed(cfg.get("imagegen_model_path", ""))
+    _cfg_pack_label = configure.sdxl_packaging_label(cfg.get("imagegen_model_path", ""))
 
     with gr.Row():
-        with gr.Column(scale=1):
-            with gr.Row():
-                _cfg_w["enc_name_tb"] = gr.Textbox(
-                    label="Encoder Name",
-                    value=cfg.get("encoder_model_name", ""),
-                    placeholder="Qwen3-4b-Z-Image-Turbo",
-                    interactive=True,
-                    scale=8,
-                )
-                _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
-
+        # ── Left column: the IMAGE GENERATOR's files ──────────────────────
+        # Everything sd-cli loads for a run, largest first: diffusion
+        # (1.49GB at Q4_0), CLIP-G (1.39GB), VAE (~335MB), CLIP-L (247MB).
+        # These belong together because they are loaded together, in one
+        # process, for one image. The CLIP pair are the diffuser's own text
+        # encoders (sd-cli --clip_l / --clip_g), not a user-swappable choice.
         with gr.Column(scale=1):
             with gr.Row():
                 _cfg_w["diff_name_tb"] = gr.Textbox(
@@ -1591,7 +1933,28 @@ def _build_config_tab_inner() -> None:
                     interactive=True,
                     scale=8,
                 )
-                _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+                # Browse and Clear stack vertically beside the textbox: one
+                # narrow column of two buttons rather than a wide row of
+                # three controls, which keeps the name field readable.
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["diff_browse_btn"] = gr.Button("Browse...", size="sm")
+                    _cfg_w["diff_clear_btn"] = gr.Button("Clear", size="sm")
+
+            with gr.Row():
+                _cfg_w["clip_g_name_tb"] = gr.Textbox(
+                    label="CLIP-G Name",
+                    value=cfg.get("clip_g_model_name", ""),
+                    placeholder="clip_g.safetensors",
+                    info="Auto-filled when found near the diffusion model.",
+                    interactive=True,
+                    visible=_cfg_needs_clips,
+                    scale=8,
+                )
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["clip_g_browse_btn"] = gr.Button(
+                        "Browse...", size="sm", visible=_cfg_needs_clips)
+                    _cfg_w["clip_g_clear_btn"] = gr.Button(
+                        "Clear", size="sm", visible=_cfg_needs_clips)
 
             with gr.Row():
                 _cfg_w["vae_name_tb"] = gr.Textbox(
@@ -1602,7 +1965,51 @@ def _build_config_tab_inner() -> None:
                     interactive=True,
                     scale=8,
                 )
-                _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm", scale=1, min_width=90)
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["vae_browse_btn"] = gr.Button("Browse...", size="sm")
+                    _cfg_w["vae_clear_btn"] = gr.Button("Clear", size="sm")
+
+            with gr.Row():
+                _cfg_w["clip_l_name_tb"] = gr.Textbox(
+                    label="CLIP-L Name",
+                    value=cfg.get("clip_l_model_name", ""),
+                    placeholder="clip_l.safetensors",
+                    info="Auto-filled when found near the diffusion model.",
+                    interactive=True,
+                    visible=_cfg_needs_clips,
+                    scale=8,
+                )
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["clip_l_browse_btn"] = gr.Button(
+                        "Browse...", size="sm", visible=_cfg_needs_clips)
+                    _cfg_w["clip_l_clear_btn"] = gr.Button(
+                        "Clear", size="sm", visible=_cfg_needs_clips)
+            # Says which packaging was detected and therefore why the CLIP
+            # boxes are or are not on screen -- otherwise their appearing and
+            # disappearing looks arbitrary.
+            _cfg_w["pack_status_md"] = gr.Markdown(
+                value=_cfg_pack_label, visible=bool(_cfg_pack_label))
+
+        # ── Right column: the separate LLM encoder ────────────────────────
+        # A different program entirely: a Qwen3 gguf run through llama.cpp,
+        # in its own process, before sd-cli is invoked. For Z-Image and
+        # Flux.2 it is the conditioner and is mandatory; for SDXL it cannot
+        # condition anything (see _encoder_slot_updates) and is used only to
+        # expand the prompt text. Kept apart from the left column so the two
+        # roles are not read as interchangeable.
+        with gr.Column(scale=1):
+            with gr.Row():
+                _cfg_w["enc_name_tb"] = gr.Textbox(
+                    label=_ENC_LABEL_ENHANCER if _cfg_is_sdxl else _ENC_LABEL_CONDITIONER,
+                    value=cfg.get("encoder_model_name", ""),
+                    placeholder="Qwen3-4b-Z-Image-Turbo",
+                    info=_ENC_INFO_ENHANCER if _cfg_is_sdxl else _ENC_INFO_CONDITIONER,
+                    interactive=True,
+                    scale=8,
+                )
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm")
+                    _cfg_w["enc_clear_btn"] = gr.Button("Clear", size="sm")
 
     # Initial interactive/value state for the two GPU-dependent controls
     # below is driven by the ACTUAL selected backend, not just install type.
@@ -1616,7 +2023,58 @@ def _build_config_tab_inner() -> None:
     img_is_vulkan   = (not is_cpu_only) and ("Vulkan" in img_backend_val)
 
     with gr.Row():
-        # ── Encoder (LLM) settings ──
+        # ── Image generation settings (LEFT) ──
+        # Kept in the same left/right order as the Model Paths row above:
+        # image-generator things on the left, the separate LLM encoder on
+        # the right. The two rows read as two columns, not a zigzag.
+        with gr.Column(scale=2):
+            gr.Markdown("### Image Generation Settings")
+            with gr.Row():
+                _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
+                                          choices=configure.CLIP_SKIP_CHOICES,
+                                          value=cfg.get("imagegen_clip_skip", 2))
+                # v-prediction override for SDXL finetunes. The gguf conversion
+                # drops the flag that marks a checkpoint as v-pred, so sd.cpp
+                # assumes eps and the output comes out washed out. Auto infers
+                # it from the filename (noobai vpred, wai-*-vpred*); force it
+                # here when a v-pred model is not named as one.
+                _cfg_w["img_pred_dd"] = gr.Dropdown(
+                    label="Prediction (SDXL)",
+                    choices=configure.PREDICTION_CHOICES,
+                    value=cfg.get("imagegen_prediction", configure.PREDICTION_AUTO),
+                    info="Auto detects v-pred from the filename.",
+                )
+            with gr.Row():
+                # Escape hatch for models auto-detection cannot place. sd.cpp-
+                # native full checkpoints carry no architecture metadata, and
+                # many SDXL finetunes are named with no "xl" token at all
+                # (artiwaifu-diffusion-v1 is an SDXL 1.0 finetune), so both
+                # detection inputs come up empty and the model would silently
+                # fall back to the Z-Image command line.
+                _cfg_w["img_family_dd"] = gr.Dropdown(
+                    label="Model Family",
+                    choices=configure.FAMILY_OVERRIDE_CHOICES,
+                    value=cfg.get("imagegen_family_override",
+                                  configure.FAMILY_OVERRIDE_AUTO),
+                    info="Set this if a model is not detected correctly.",
+                )
+            with gr.Row():
+                # sd.cpp has no per-layer GPU offload for the diffuser (no
+                # -ngl equivalent) — only whole-component placement, so this
+                # is a 3-way choice rather than a layer-count dropdown. See
+                # configure.DIFFUSER_PLACEMENT_CHOICES / parse_diffuser_placement().
+                _cfg_w["img_placement_dd"] = gr.Dropdown(
+                    label="Diffuser Placement",
+                    choices=configure.DIFFUSER_PLACEMENT_CHOICES,
+                    value=(cfg.get("imagegen_placement", configure.DIFFUSER_PLACEMENT_FULL_GPU)
+                          if img_is_vulkan else configure.DIFFUSER_PLACEMENT_FULL_CPU),
+                    info=("Split keeps the encoder+VAE on CPU, diffusion model on GPU."
+                          if img_is_vulkan else
+                          "ImageGen Backend is CPU — sd.cpp will not touch the GPU at all."),
+                    interactive=img_is_vulkan,
+                )
+
+        # ── Encoder (LLM) settings (RIGHT) ──
         with gr.Column(scale=2):
             gr.Markdown("### Encoder (LLM) Settings")
             with gr.Row():
@@ -1642,30 +2100,6 @@ def _build_config_tab_inner() -> None:
                 # fp16/coopmat2 just falls back to CPU for the attention math
                 # (correct, only slower), so it is safe on any card including a
                 # no-fp16 RX 470 — no fp16 gating, no checkbox.
-
-        # ── ImageGen settings ──
-        with gr.Column(scale=2):
-            gr.Markdown("### Image Generation Settings")
-            with gr.Row():
-                _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
-                                          choices=configure.CLIP_SKIP_CHOICES,
-                                          value=cfg.get("imagegen_clip_skip", 2))
-            with gr.Row():
-                # sd.cpp has no per-layer GPU offload for the diffuser (no
-                # -ngl equivalent) — only whole-component placement, so this
-                # is a 3-way choice rather than a layer-count dropdown. See
-                # configure.DIFFUSER_PLACEMENT_CHOICES / parse_diffuser_placement().
-                _cfg_w["img_placement_dd"] = gr.Dropdown(
-                    label="Diffuser Placement",
-                    choices=configure.DIFFUSER_PLACEMENT_CHOICES,
-                    value=(cfg.get("imagegen_placement", configure.DIFFUSER_PLACEMENT_FULL_GPU)
-                          if img_is_vulkan else configure.DIFFUSER_PLACEMENT_FULL_CPU),
-                    info=("Split keeps the encoder+VAE on CPU, diffusion model on GPU."
-                          if img_is_vulkan else
-                          "ImageGen Backend is CPU — sd.cpp will not touch the GPU at all."),
-                    interactive=img_is_vulkan,
-                )
-
     # NOTE: Prompt Template used to sit here under an "Advanced" heading. It
     # is now on the Preferences page (_build_preferences_tab_inner) and is
     # stored in data/preferences.json, not data/configuration.json — so the
@@ -1698,12 +2132,40 @@ def _build_config_tab_inner() -> None:
             return gr.update(), gr.update()
         return p, Path(p).stem
 
-    def _browse_diffusion(current_vae_path: str, current_vae_name: str):
+    def _browse_diffusion(current_vae_path: str, current_vae_name: str,
+                          cur_l_path: str, cur_g_path: str):
         p = _browse_file()
         if not p:
-            return gr.update(), gr.update(), gr.update(), gr.update()
+            return (gr.update(),) * 14
         vae_path, vae_name = _resolve_vae(p, current_vae_path, current_vae_name)
-        return p, Path(p).stem, vae_path, vae_name
+        # CLIP-L/CLIP-G are auto-detected the same way the VAE is: the
+        # quantizers ship them beside the UNet, so requiring the user to hunt
+        # for two more files by hand after picking a model is needless.
+        # Only fill the CLIP slots when this model actually needs them; a
+        # self-contained checkpoint gets them blanked so nothing stale is
+        # passed to sd-cli as a redundant override.
+        if _clips_needed(p):
+            l_path, l_name, g_path, g_name = _resolve_clips(p, cur_l_path, cur_g_path)
+        else:
+            l_path, l_name, g_path, g_name = "", "", "", ""
+        # Picking the diffuser also determines whether the CLIP rows are shown
+        # at all and what the Encoder slot means, so both refresh here rather
+        # than making the user save and revisit the page.
+        enc_u, clip_vis, _, _, _, pack_status = _encoder_slot_updates(p)
+
+        # The two name boxes each carry a VALUE and a VISIBILITY change, so the
+        # two are merged into one update apiece -- listing a component twice in
+        # `outputs` would silently drop the first update.
+        def _name_update(value):
+            u = dict(clip_vis)
+            if not isinstance(value, dict):     # a real string, not gr.update()
+                u["value"] = value
+            return gr.update(**u)
+
+        return (p, Path(p).stem, vae_path, vae_name,
+                l_path, _name_update(l_name),
+                g_path, _name_update(g_name),
+                enc_u, clip_vis, clip_vis, clip_vis, clip_vis, pack_status)
 
     def _browse_vae():
         # No _resolve_vae here: an explicit pick by the user is final and is
@@ -1717,10 +2179,79 @@ def _build_config_tab_inner() -> None:
     )
     _cfg_w["diff_browse_btn"].click(
         _browse_diffusion,
-        inputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]],
+        inputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"],
+                _cfg_w["clip_l_path_tb"], _cfg_w["clip_g_path_tb"]],
         outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"],
-                 _cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
+                 _cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"],
+                 _cfg_w["clip_l_path_tb"], _cfg_w["clip_l_name_tb"],
+                 _cfg_w["clip_g_path_tb"], _cfg_w["clip_g_name_tb"],
+                 _cfg_w["enc_name_tb"],
+                 _cfg_w["clip_l_browse_btn"], _cfg_w["clip_l_clear_btn"],
+                 _cfg_w["clip_g_browse_btn"], _cfg_w["clip_g_clear_btn"],
+                 _cfg_w["pack_status_md"]]
     )
+    # ── Clear buttons ────────────────────────────────────────────────────
+    # Each slot needs a way to become EMPTY again, not just to point somewhere
+    # else. Browse can only ever replace one path with another -- there was no
+    # way to deselect an encoder, or to drop CLIP files in order to test a
+    # self-contained checkpoint without them. Blanking both the visible name
+    # and the hidden path keeps the pair consistent; nothing is written to
+    # configuration.json until Save All Configuration, same as Browse.
+    def _clear_slot():
+        return "", ""
+
+    def _clear_diffusion():
+        """Clearing the diffuser also refreshes everything derived from it --
+        the CLIP rows' visibility, the Encoder slot's label, and the packaging
+        status line -- because with no model chosen none of those have a
+        meaning to display."""
+        enc_u, l_vis, l_btn, g_vis, g_btn, pack = _encoder_slot_updates("")
+        return ("", "", enc_u, l_vis, l_btn, l_btn, g_vis, g_btn, g_btn, pack)
+
+    def _browse_clip_l():
+        p = _browse_file(_FILETYPES_VAE)
+        return (p, Path(p).name) if p else (gr.update(), gr.update())
+
+    def _browse_clip_g():
+        p = _browse_file(_FILETYPES_VAE)
+        return (p, Path(p).name) if p else (gr.update(), gr.update())
+
+    _cfg_w["diff_clear_btn"].click(
+        _clear_diffusion, inputs=None,
+        outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"],
+                 _cfg_w["enc_name_tb"],
+                 _cfg_w["clip_l_name_tb"], _cfg_w["clip_l_browse_btn"],
+                 _cfg_w["clip_l_clear_btn"],
+                 _cfg_w["clip_g_name_tb"], _cfg_w["clip_g_browse_btn"],
+                 _cfg_w["clip_g_clear_btn"],
+                 _cfg_w["pack_status_md"]],
+    )
+    _cfg_w["vae_clear_btn"].click(
+        _clear_slot, inputs=None,
+        outputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]],
+    )
+    _cfg_w["enc_clear_btn"].click(
+        _clear_slot, inputs=None,
+        outputs=[_cfg_w["enc_path_tb"], _cfg_w["enc_name_tb"]],
+    )
+    _cfg_w["clip_l_clear_btn"].click(
+        _clear_slot, inputs=None,
+        outputs=[_cfg_w["clip_l_path_tb"], _cfg_w["clip_l_name_tb"]],
+    )
+    _cfg_w["clip_g_clear_btn"].click(
+        _clear_slot, inputs=None,
+        outputs=[_cfg_w["clip_g_path_tb"], _cfg_w["clip_g_name_tb"]],
+    )
+
+    _cfg_w["clip_l_browse_btn"].click(
+        _browse_clip_l, inputs=None,
+        outputs=[_cfg_w["clip_l_path_tb"], _cfg_w["clip_l_name_tb"]],
+    )
+    _cfg_w["clip_g_browse_btn"].click(
+        _browse_clip_g, inputs=None,
+        outputs=[_cfg_w["clip_g_path_tb"], _cfg_w["clip_g_name_tb"]],
+    )
+
     _cfg_w["vae_browse_btn"].click(
         _browse_vae,
         outputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"]]
@@ -1801,9 +2332,10 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
     )
 
     def save_all(ep, en, dp, dn, vp, vn,
+                 clp, cln, cgp, cgn,
                  enc_back, img_back, threads,
                  eb, ec, engl,
-                 ic, img_placement):
+                 ic, img_pred, img_family, img_placement):
         enc_parsed = configure.parse_backend_choice(enc_back)
         img_parsed = configure.parse_backend_choice(img_back)
         # Never persist a vision projector as the encoder (covers a path carried
@@ -1818,6 +2350,8 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "encoder_model_path":  ep,  "encoder_model_name":  en,
             "imagegen_model_path": dp,  "imagegen_model_name": dn,
             "vae_model_path":      vp,  "vae_model_name":      vn,
+            "clip_l_model_path":   clp, "clip_l_model_name":   cln,
+            "clip_g_model_path":   cgp, "clip_g_model_name":   cgn,
             "backend_encoder":     enc_back,
             "backend_imagegen":    img_back,
             # Per-side, and READ per-side by inference.py. The old code also
@@ -1833,6 +2367,11 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "encoder_ctx_size":    int(ec),
             "encoder_gpu_layers":  int(engl),
             "imagegen_clip_skip":  int(ic),
+            "imagegen_prediction": img_pred,
+            "imagegen_family_override": img_family,
+            # A changed override changes what family the saved steps/cfg belong
+            # to, so clear the marker and let the Generate page re-snap them.
+            "imagegen_last_family": "",
             "imagegen_placement":  img_placement,
             "first_run":           False,
         })
@@ -1855,10 +2394,13 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
         inputs=[
             w["enc_path_tb"], w["enc_name_tb"], w["diff_path_tb"], w["diff_name_tb"],
             w["vae_path_tb"], w["vae_name_tb"],
+            w["clip_l_path_tb"], w["clip_l_name_tb"],
+            w["clip_g_path_tb"], w["clip_g_name_tb"],
             w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
             w["enc_batch_dd"], w["enc_ctx_dd"],
             w["enc_ngl_dd"],
-            w["img_clip_dd"], w["img_placement_dd"],
+            w["img_clip_dd"], w["img_pred_dd"], w["img_family_dd"],
+            w["img_placement_dd"],
         ],
         outputs=[status_box, _gen["generate_row"], _gen["prompt_tb"],
                  _gen["negative_tb"]],
@@ -1897,11 +2439,17 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             gr.update(value=""),                                # diff_path_tb
             gr.update(value=""),                                # vae_name_tb
             gr.update(value=""),                                # vae_path_tb
+            gr.update(value=""),                                # clip_l_name_tb
+            gr.update(value=""),                                # clip_l_path_tb
+            gr.update(value=""),                                # clip_g_name_tb
+            gr.update(value=""),                                # clip_g_path_tb
             gr.update(value=d["encoder_batch_size"]),           # enc_batch_dd
             gr.update(value=d["encoder_ctx_size"]),             # enc_ctx_dd
             gr.update(value=0, interactive=False,               # enc_ngl_dd
                       info="Encoder Backend is CPU — all layers run on CPU."),
             gr.update(value=d["imagegen_clip_skip"]),           # img_clip_dd
+            gr.update(value=d["imagegen_prediction"]),          # img_pred_dd
+            gr.update(value=d["imagegen_family_override"]),     # img_family_dd
             gr.update(value=configure.DIFFUSER_PLACEMENT_FULL_CPU,  # img_placement_dd
                       interactive=False,
                       info="ImageGen Backend is CPU — sd.cpp will not touch the GPU at all."),
@@ -1915,8 +2463,11 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["enc_name_tb"], w["enc_path_tb"],
             w["diff_name_tb"], w["diff_path_tb"],
             w["vae_name_tb"], w["vae_path_tb"],
+            w["clip_l_name_tb"], w["clip_l_path_tb"],
+            w["clip_g_name_tb"], w["clip_g_path_tb"],
             w["enc_batch_dd"], w["enc_ctx_dd"], w["enc_ngl_dd"],
-            w["img_clip_dd"], w["img_placement_dd"],
+            w["img_clip_dd"], w["img_pred_dd"], w["img_family_dd"],
+            w["img_placement_dd"],
         ],
     )
 
