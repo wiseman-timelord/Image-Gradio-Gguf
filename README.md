@@ -133,16 +133,18 @@ diffusion_pytorch_model.safetensors
 ```
 
 ### Stable Diffusion XL (under construction)
-The files are more complicated...
-- Here "https://huggingface.co/OlegSkutte/sdxl-turbo-GGUF" we have the main file...
+The files are simlarly complicated...
+- The encoder, I just use this one currently...
+```
+Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
+```
+- Here we have the main [SDXL Turbo GGUF](https://huggingface.co/OlegSkutte/sdxl-turbo-GGUF) file...
 ```
 sd_xl_turbo_1.0.q8_0.gguf
 ```
-- Here "https://huggingface.co/hum-ma/SDXL-models-GGUF" we have the other files...
+- Here is the VAE file from  [SDXL Model files Collection](https://huggingface.co/hum-ma/SDXL-models-GGUF)...
 ```
-├── clip_l.safetensors                        247 MB   ← from clip/
-├── clip_g.safetensors                       1.39 GB   ← from clip/
-└── xlVAEC_c91.safetensors                   ~335 MB   ← from vae/
+xlVAEC_c91.safetensors                   ~335 MB   ← from vae folder
 ```
 
 ### Instructions:
