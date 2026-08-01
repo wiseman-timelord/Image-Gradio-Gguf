@@ -132,7 +132,7 @@ VAE — the `vae/` file from [FLUX.2-klein-9B](https://huggingface.co/black-fore
 diffusion_pytorch_model.safetensors
 ```
 
-### Stable Diffusion XL
+### Stable Diffusion XL (under construction)
 - The files are conveniently all in this repository "https://huggingface.co/hum-ma/SDXL-models-GGUF"...
 ```
 models/
