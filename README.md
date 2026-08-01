@@ -132,6 +132,16 @@ VAE — the `vae/` file from [FLUX.2-klein-9B](https://huggingface.co/black-fore
 diffusion_pytorch_model.safetensors
 ```
 
+### Stable Diffusion XL
+- The files are conveniently all in this repository "https://huggingface.co/hum-ma/SDXL-models-GGUF"...
+```
+models/
+├── stable-diffusion-xl-base-1.0-Q4_0.gguf   1.49 GB   ← pick ONE model it doesnt have to be this one, others are trained for various things.
+├── clip_l.safetensors                        247 MB   ← from clip/
+├── clip_g.safetensors                       1.39 GB   ← from clip/
+└── xlVAEC_c91.safetensors                   ~335 MB   ← from vae/
+```
+
 ### Instructions:
 Currently...
 ```
