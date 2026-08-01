@@ -3,7 +3,7 @@
 Status: Working, Windows 10/11 only (see release notes)
 
 ### Description
-A local python image generator from prompt using, 1 various compatible Encoders, and 2 choice of either, Z-Image-Turbo-GGUF or Flux-2-Klein-GGUF. This is a super, TXT to IMG and IMG to IMG image, generation project, covering what is possible currently to be most compitent through lightweight GGUF models that can fit on a 8GB GPU, but also scales to larger VRAM if you have that, and of course if you want you can also run it through CPU. The installer compiles for your specific CPU/GPU combo for the BEST speeds in inference you will find out there right now. As you can see it generates OK images, but has the typical issues associated with the libraries/models one would expect. The program uses a separate encoder file (optional but just do it), and it ensures to load this in one-shot mode, ensuring that both models will be loaded individually to the GPU, maxizing the potential size of the Image generation model. All that said, there may be a little learning if you are used to Grok or something of that level of simplicity.
+A local python image generator from prompt using, 1 various compatible Encoders, and 2 choice of either, Z-Image-Turbo-GGUF or Flux-2-Klein-GGUF or Stable Diffusion XL Turbo. This is a super, TXT to IMG and IMG to IMG image, generation project, covering what is possible currently to be most compitent through lightweight GGUF models that can fit on a 8GB GPU, but also scales to larger VRAM if you have that, and of course if you want you can also run it through CPU. The installer compiles for your specific CPU/GPU combo for the BEST speeds in inference you will find out there right now. As you can see it generates OK images, but has the typical issues associated with the libraries/models one would expect. The program uses a separate encoder file (optional but just do it), and it ensures to load this in one-shot mode, ensuring that both models will be loaded individually to the GPU, maxizing the potential size of the Image generation model. All that said, there may be a little learning if you are used to Grok or something of that level of simplicity.
 
 ### Output
 - Converting my image of SecondLife avatar to a realistic photo, how awesome is that (v1.28)...  
@@ -63,20 +63,20 @@ I put Q# because it should support any quantization, the model variety will be e
 - Third the "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, use it with all z-image-turbo image generation model variants. One is also able to split this to CPU, for a little more space in VRAM, I do, but you might not if you had 12GB+ VRAM.
 
 ### Models
-
-All encoders and image models are **GGUF** — on [HuggingFace](https://huggingface.co) look for the GGUF builds (any quantization, shown here as `Q#`). Each family also needs one `.safetensors` VAE, downloaded once.
-
-**Encoder rule:** the encoder size must match the image model — Qwen3-**4B** for Z-Image-Turbo and Flux.2-klein-**4B**, Qwen3-**8B** for Flux.2-klein-**9B**. The program auto-detects this and warns on a mismatch. One Qwen3-4B encoder serves both Z-Image-Turbo and klein-4B. Qwen3-VL models work as text-only encoders (no mmproj needed); Qwen2.5 encoders are **not** compatible with Flux.2.
+- All encoders and image models are **GGUF** — on [HuggingFace](https://huggingface.co) look for the GGUF builds (any quantization, shown here as `Q#`). Each family also needs one `.safetensors` VAE, downloaded once.
+- Encoder rule: the encoder size must match the image model — Qwen3-**4B** for Z-Image-Turbo and Flux.2-klein-**4B**, Qwen3-**8B** for Flux.2-klein-**9B**. The program auto-detects this and warns on a mismatch. One Qwen3-4B encoder serves both Z-Image-Turbo and klein-4B. Qwen3-VL models work as text-only encoders (no mmproj needed); Qwen2.5 encoders are **not** compatible with Flux.2.
+ - The lists below show most of the stuff I would even try to use with this program, though other stuff may work, I would get AI to check it first. Ie, is this encoder compatible with this image generation model, or is this image generation model compatible with this program (providing inference, configure, display, launcher, scripts). 
 
 #### Z-Image-Turbo
-Encoders — Qwen3-4B:
+
+- Encoders — Qwen3-4B:
 ```
 Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
 Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
 qwen_3_4b.Q#.gguf              (plain Qwen3-4B)
 Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
 ```
-Image models:
+- Image models:
 ```
 z_image_turbo-Q#.gguf
 darkBeastMar1526Latest_dbzit8SDAFOK-Q#.gguf
@@ -88,12 +88,13 @@ zImageTurboAnime_v10-Q#.gguf
 zImageTurboNSFW_60BF16Diffusion-Q#.gguf
 zImageTurboNSFW_61BF16Diffusion-Q#.gguf
 ```
-VAE — from [Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF):
+- VAE — from [Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF):
 ```
 ae.safetensors
 ```
 
 #### Flux.2-klein 4B
+It can do SFW and has good Img2Img...
 Encoders — Qwen3-4B (same set as Z-Image-Turbo):
 ```
 Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
@@ -114,7 +115,8 @@ diffusion_pytorch_model.safetensors
 ```
 
 #### Flux.2-klein 9B
-Encoders — Qwen3-8B:
+Untested, but presumably it can do SFW and has good Img2Img...
+- Encoders — Qwen3-8B:
 ```
 Qwen3-8b-erotic-heretic-Q#.gguf
 Qwen3-8B-Gemini-2.5-Flash-Uncensored-Q#.gguf
@@ -122,7 +124,7 @@ qwen_3_8b.Q#.gguf              (plain Qwen3-8B)
 qwen3-vl-flux2-8b-Q#.gguf      (VL, text-only)
 Qwen3-VL-8B*.Q#.gguf           (VL, text-only)
 ```
-Image models:
+- Image models:
 ```
 flux-2-klein-9b-Q#.gguf
 flux-2-klein-base-9b-Q#.gguf
@@ -133,7 +135,7 @@ diffusion_pytorch_model.safetensors
 ```
 
 ### Stable Diffusion XL (under construction)
-The files are simlarly complicated...
+It can do, SFW and NSFW, but the Img2Img is NOT as good as Flux2...
 - The encoder, I just use this one currently...
 ```
 Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
