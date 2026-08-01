@@ -164,7 +164,7 @@ Currently...
 - If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, or `A man walking his dog on the meadow on a sunny day.`, or if you want to do image to image then possibly `A photo-realistic version of the provided image.`.
 
 ### Notation:
-- When I say that SDXL Turbo's Img2Img is bad, its just like a morph between your prompt and the image, while Flux2 4b seems to be able to take a face from one image and use it in a scene as you would instruct it to be, but not able to produce NSFW.
+- When I say that SDXL Turbo's Img2Img is bad, its just like a morph between your prompt and the image, while Flux2 4b can take a face from one image and use it in a scene as you would instruct it to be, but only SFW. Guessing the way to get round this is use both, starting with Flux2, then SDXL.
 - If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...consider such things when it tells you it ran out of ram.
 - The assessment by OPUS said, the reason why I could not fit Q4 ImageGen model with DP on Full while could fit Q8 ImageGen model with DP on Split, is because the difference between DP on Split or FUll, is up to 4.6GB extra on top. Keep in mind the models are done in 1-shot mode not m-lock.
 - Something to consider is how much memory the Image model takes, image models need more space when loaded compared to a text model, if yo uneed more room for the image model then try Diffuser Placement is set to Split. So some tweaking settings may be requried with low VRAM. 
