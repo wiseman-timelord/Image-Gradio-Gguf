@@ -742,6 +742,13 @@ def write_default_configuration(cpu: Dict[str, Any],
         "encoder_model_path": "", "encoder_model_name": "",
         "imagegen_model_path": "", "imagegen_model_name": "",
         "vae_model_path": "", "vae_model_name": "",
+        # Split-SDXL text encoders. Every SDXL gguf published on HuggingFace is
+        # UNet-only (the quantizers extract the UNet and ship clip_l / clip_g /
+        # vae alongside as separate safetensors), so those two files must be
+        # supplied here. Z-Image, Flux.2 and full SDXL .safetensors checkpoints
+        # all leave these blank.
+        "clip_l_model_path": "", "clip_l_model_name": "",
+        "clip_g_model_path": "", "clip_g_model_name": "",
         "last_model_browse_dir": ".\\models",
         # Starting folder for the Generate page's "Add Image" picker. Models
         # live under .\models, but reference images are the user's own files,
@@ -769,6 +776,20 @@ def write_default_configuration(cpu: Dict[str, Any],
         "imagegen_sampling": "euler_a",
         "imagegen_batch_count": 2,
         "imagegen_clip_skip": 2,
+        # img2img denoise strength: 0.0 returns the input image untouched,
+        # 1.0 ignores it entirely. sd.cpp's own default is 0.75.
+        "imagegen_strength": 0.75,
+        # v-prediction override for SDXL finetunes. "Auto" infers it from the
+        # filename, since the gguf conversion drops the v-pred marker and
+        # sd.cpp would otherwise assume eps and produce washed-out output.
+        "imagegen_prediction": "Auto",
+        # Manual model-family override for files auto-detection cannot place
+        # (sd.cpp-native checkpoints carry no architecture metadata, and many
+        # SDXL finetunes have no "xl" token in the filename).
+        "imagegen_family_override": "Auto",
+        # Which family the saved steps/cfg/size values were chosen for; see
+        # configure.py's matching entry.
+        "imagegen_last_family": "",
         "imagegen_quality_preset": "Fast (Turbo)",
         "output_format": "png",
         "auto_save": True,
