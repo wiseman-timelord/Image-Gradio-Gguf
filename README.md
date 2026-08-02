@@ -56,13 +56,13 @@ A local python image generator from prompt using, 1 various compatible Encoders,
 - Libraries - Required libraries is handled by the installer script, but they include both, Llama.Cpp and Stable Diffusion.
 - Building - VS 2022 C++, specifically the Desktop Build Tools including CMake. Additionally the Vulkan 1.4 SDK. Additionally Windows 10/11 SDK relevant to your os version.
 
-### Models (basic z-image-turbo):
+### Models (Basic Operation Test):
 I put Q# because it should support any quantization, the model variety will be expanded upon later....
 - First you need an encoding model, get "Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf" from here [Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF](https://huggingface.co/LuffyTheFox/Qwen3-Uncensored-TextEncoders-FLUX-Klein-Z-Image-Turbo-GGUF). The encoder should be a Qwen3 4b Q4 or something of that level, we are mainly dealing with the positive/negative prompt, just dont write a book in those boxes.
 - Second you need an image generation model, get "z_image_turbo-Q#.gguf" from [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF). The image generation model should be the highest quantization you can fit on your GPU. The filesize does not represent the loaded/operating size. Ask AI which is the largest quantization of said url Provided gguf model, that will safely load on your specified GPU, and download that one.
 - Third the "ae.safetensors", this is only available from the [Vanilla Z-Image-Turbo-GGUF](https://huggingface.co/unsloth/Z-Image-Turbo-GGUF) files, get it from there, use it with all z-image-turbo image generation model variants. One is also able to split this to CPU, for a little more space in VRAM, I do, but you might not if you had 12GB+ VRAM.
 
-### Models
+### Models (Advanced Details)
 - All encoders and image models are **GGUF** — on [HuggingFace](https://huggingface.co) look for the GGUF builds (any quantization, shown here as `Q#`). Each family also needs one `.safetensors` VAE, downloaded once.
 - Encoder rule: the encoder size must match the image model — Qwen3-**4B** for Z-Image-Turbo and Flux.2-klein-**4B**, Qwen3-**8B** for Flux.2-klein-**9B**. The program auto-detects this and warns on a mismatch. One Qwen3-4B encoder serves both Z-Image-Turbo and klein-4B. Qwen3-VL models work as text-only encoders (no mmproj needed); Qwen2.5 encoders are **not** compatible with Flux.2.
  - The lists below show most of the stuff I would even try to use with this program, though other stuff may work, I would get AI to check it first. Ie, is this encoder compatible with this image generation model, or is this image generation model compatible with this program (providing inference, configure, display, launcher, scripts). 
@@ -174,14 +174,18 @@ xlVAEC_c91.safetensors                   ~335 MB   ← from vae folder
 
 ### Instructions:
 Currently...
+`````
+1. Ensure you have downloaded the correct models from Huggingface (see `Models:` section above), put them on your model storage drive (if you have one). You can put them in .\models if you like, but this is just a default location, and I instead advise to have individual model folder, that has ALL required files for that specific Image Generation model to work, as advised above, and it should detect all required files, ie for example, folder name "SDXL-models-Gguf" would have the files....
+- Huihui-Qwen3-VL-4B-Instruct-abliterated-Q4_K_M.gguf
+- sd_xl_turbo_1.0.q8_0.gguf
+- xlVAEC_c91.safetensors  
 ```
-1. Ensure you have downloaded the correct models from Huggingface (see `Models:` section above), put them on your model storage drive (if you have one). You can put them in .\models if you like, but then this will cause a bloated folder, and you may not remember they are in there later. 
-2. Ensure to download the latest release version to a suitable location, then unpack to the place you intend to have the program.
+2. Ensure to download the latest release version of Image-Gradio-Gguf to a suitable location, then unpack to the place you intend to have the program.
 3. Run the program via right click run as admin on `Image-Gradio-Gguf.bat`, this will launch the batch menu.
 4. Ensure that Python/Pip has internet access, these may request it during install (if that is an issue you may need to start install again), and the libraries/packages will install appropriately to the program folder, not globally. After which there will be a summary, and you will be returned to the batch menu. hopefully everything went ok for you. If there are any issues at this stage, I would suggest the installer should indicate what the issue was, so maybe paste that into AI with the installer script to fix your system compatibility.
 5. Back on the batch menu, select 1 to run the application, the server will start up, and then the built-in browser will pop-up its own window with the Interface displayed. Ensure to go to Configuration page, to set model paths, and what is going to be loaded where, if there is not enough ram on the relating device, it will say in the output (see notes below). Adter configuring, go back to the Generation page, type in your positive prompt, and then hit generate. After you done your first image and everything is confirmed working, then possibly configure the settings further and produce a new prompt, and keep going til you have your images.
 6. Upon exiting the program correctly through the exit button, the user will be returned to the batch menu, and one would then exit from there, or otherwise one could just click the [x] in the top right of all windows associated.
-```
+`````
 
 ### Examples:
 - If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, or `A man walking his dog on the meadow on a sunny day.`, or if you want to do image to image then possibly `A photo-realistic version of the provided image.`.
