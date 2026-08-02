@@ -225,4 +225,5 @@ Image-Gradio-Gguf/
 ```
 
 ### Disclaimer:
+- Users under the legal age to buy porn in their own country, should NOT be downloading NSFW models, and then using them to generate pornographic pictures. The same laws apply to NSFW large language models, as does apply to the normal laws for Pornography. If you are an adult already, then you are ok to download NSFW models, and likely have had sex already or not, and as such are trusted to get on unsupervised. 
 - While this program is designed to be able to create images without filtering, the idea being simpler less complex prompting in order to achieve intended result, for purposes such as for example illustrating a book, it may also generate images you dont intend, but you the "User" yourself are responsible for the contents/theme in the outputted images, by the action of the Editing of, the Positive Promt (which by default starts blank) and the modification of the Negative Prompt (which by default contains some helpful generic text segments not intended for image).
