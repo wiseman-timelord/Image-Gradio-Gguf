@@ -134,7 +134,30 @@ VAE — the `vae/` file from [FLUX.2-klein-9B](https://huggingface.co/black-fore
 diffusion_pytorch_model.safetensors
 ```
 
-### Stable Diffusion XL (under construction)
+### Flux 1 Schnell
+It can do SFW, but the Img2Img is, similar to SDXL and NOT as good as Flux2...
+- The encoder, I just use this one currently...
+```
+Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
+```
+- Here we have the main image generation model [FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) file...
+```
+flux1-schnell-Q#.gguf
+```
+- Here is the VAE file from  [FLUX.1-schnell](https://huggingface.co/black-forest-labs/FLUX.1-schnell)...
+```
+ae.safetensors                   ~335 MB   ← from vae folder
+```
+- Other encoder file (required also) from [t5-v1_1-xxl-encoder-gguf](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
+```
+t5-v1_1-xxl-encoder-Q4_K_M.gguf
+```
+- The clip file (required also) from [flux_text_encoders](https://huggingface.co/comfyanonymous/flux_text_encoders)
+```
+clip_l.safetensors
+```
+
+### Stable Diffusion XL
 It can do, SFW and NSFW, but the Img2Img is NOT as good as Flux2...
 - The encoder, I just use this one currently...
 ```
@@ -142,7 +165,7 @@ Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
 ```
 - Here we have the main [SDXL Turbo GGUF](https://huggingface.co/OlegSkutte/sdxl-turbo-GGUF) file...
 ```
-sd_xl_turbo_1.0.q8_0.gguf
+sd_xl_turbo_1.0.q.gguf
 ```
 - Here is the VAE file from  [SDXL Model files Collection](https://huggingface.co/hum-ma/SDXL-models-GGUF)...
 ```
