@@ -174,18 +174,17 @@ xlVAEC_c91.safetensors                   ~335 MB   ← from vae folder
 
 ### Instructions:
 Currently...
-`````
+```
 1. Ensure you have downloaded the correct models from Huggingface (see `Models:` section above), put them on your model storage drive (if you have one). You can put them in .\models if you like, but this is just a default location, and I instead advise to have individual model folder, that has ALL required files for that specific Image Generation model to work, as advised above, and it should detect all required files, ie for example, folder name "SDXL-models-Gguf" would have the files....
 - Huihui-Qwen3-VL-4B-Instruct-abliterated-Q4_K_M.gguf
 - sd_xl_turbo_1.0.q8_0.gguf
 - xlVAEC_c91.safetensors  
-```
 2. Ensure to download the latest release version of Image-Gradio-Gguf to a suitable location, then unpack to the place you intend to have the program.
 3. Run the program via right click run as admin on `Image-Gradio-Gguf.bat`, this will launch the batch menu.
 4. Ensure that Python/Pip has internet access, these may request it during install (if that is an issue you may need to start install again), and the libraries/packages will install appropriately to the program folder, not globally. After which there will be a summary, and you will be returned to the batch menu. hopefully everything went ok for you. If there are any issues at this stage, I would suggest the installer should indicate what the issue was, so maybe paste that into AI with the installer script to fix your system compatibility.
 5. Back on the batch menu, select 1 to run the application, the server will start up, and then the built-in browser will pop-up its own window with the Interface displayed. Ensure to go to Configuration page, to set model paths, and what is going to be loaded where, if there is not enough ram on the relating device, it will say in the output (see notes below). Adter configuring, go back to the Generation page, type in your positive prompt, and then hit generate. After you done your first image and everything is confirmed working, then possibly configure the settings further and produce a new prompt, and keep going til you have your images.
 6. Upon exiting the program correctly through the exit button, the user will be returned to the batch menu, and one would then exit from there, or otherwise one could just click the [x] in the top right of all windows associated.
-`````
+```
 
 ### Examples:
 - If you want to test the image generation, then I suggested just write something like `A picture of a Woodchuck standing next to a pile of wood while juggling small logs of wood.`, or `A man walking his dog on the meadow on a sunny day.`, or if you want to do image to image then possibly `A photo-realistic version of the provided image.`.
