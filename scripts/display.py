@@ -245,8 +245,46 @@ def _vae_name_matches_family(filename: str, family: Optional[str]) -> bool:
         # ae.safetensors: sdxl_vae-fp16-fix, xlVAEC_c91 and various finetune
         # VAEs are all legitimate, so membership of the SDXL set is the test.
         return configure.DIFFUSER_FAMILY_SDXL in configure.vae_families(low)
-    # z-image or unknown -> the exact ae.safetensors filename
+    # z-image, flux1, or unknown -> the exact ae.safetensors filename. FLUX.1
+    # takes the same file, verified working on this build, so it needs no
+    # branch of its own here.
     return low == "ae.safetensors"
+
+
+def _sibling_scan(model_path: Path, exts: Tuple[str, ...],
+                  match) -> Optional[Path]:
+    r"""Return the first file in the DIFFUSION MODEL'S OWN FOLDER that has one
+    of `exts` and satisfies `match`, or None.
+
+    Deliberately no walk-up and no sweep of .\models. Both used to be here,
+    and the reason they are gone is worth keeping written down, because the
+    case that motivated them is real: Z-Image-Turbo finetunes ship nested, none
+    of those repos include a VAE, and a single shared ae.safetensors at the
+    .\models root used to be found for all of them.
+
+    The cost was worse than the convenience. A per-model folder that is missing
+    one sub-model would silently borrow a same-named file from somewhere else
+    in the tree -- and every one of these files is generically named. Half a
+    dozen unrelated repos each ship "ae.safetensors", "clip_l.safetensors" or a
+    t5 encoder, so "found a file with the right name" is nowhere near "found
+    the right file". A FLUX.1 model in models\flux1-schnell-GGUF\ picked up a
+    T5 from models\ root purely because the name matched, and nothing on
+    screen said the file came from a different folder.
+
+    Silently wrong is the worst outcome here: a mismatched VAE or encoder does
+    not raise, it produces a black or mangled image. An empty box that asks the
+    user to Browse is strictly better, so the rule is now sibling-or-nothing.
+    A shared sub-model in a parent folder is still perfectly usable -- it just
+    has to be chosen once by hand, and the choice then persists until the
+    diffusion model changes again."""
+    try:
+        folder = model_path.expanduser().parent
+        for f in sorted(folder.iterdir()):
+            if f.is_file() and f.name.lower().endswith(exts) and match(f):
+                return f
+    except OSError:
+        pass
+    return None
 
 
 def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
@@ -254,16 +292,7 @@ def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
     Given a diffusion model path, locate the VAE that matches its family and
     return (vae_full_path, vae_stem), or ("", "") if not found.
 
-    Search order: the model's own folder first, then each folder above it up
-    to and including .\models, then a full sweep of .\models.
-
-    The walk-up matters. Z-Image-Turbo finetunes ship nested — BigDannyPt's
-    collection lays out as DarkBeast\DBZiT9-DIMRClaw\darkBeastMar2126Latest_
-    dbzit9DIMRclaw-Q8_0.gguf, two folders deep — and none of those repos
-    include a VAE, so the single ae.safetensors from the stock Z-Image-Turbo
-    repo lives at the .\models root and is shared by every diffusion model.
-    Looking only in the model's own folder found it for a flat .\models and
-    for nothing else.
+    SEARCHES THE MODEL'S OWN FOLDER AND NOTHING ELSE. See _sibling_scan().
     """
     if not diff_path_str:
         return "", ""
@@ -273,53 +302,22 @@ def _detect_vae(diff_path_str: str) -> Tuple[str, str]:
 
     # Family of the NEW diffuser decides which VAE filename we hunt for.
     family = configure.diffuser_family(diff_path_str)
-
-    def _scan(folder: Path) -> Optional[Path]:
-        try:
-            for f in folder.iterdir():
-                if f.is_file() and f.name.lower().endswith(".safetensors") \
-                        and _vae_name_matches_family(f.name, family):
-                    return f
-        except OSError:
-            pass
-        return None
-
-    models_dir = configure.get_models_dir().resolve()
-
-    # The model's folder, then upwards. Bounded: stop once we pass the models
-    # dir, and never climb more than 4 levels, so a model parked somewhere odd
-    # cannot send us walking up to C:\.
-    current = p.parent.resolve()
-    for _ in range(5):
-        hit = _scan(current)
-        if hit:
-            return str(hit), hit.stem
-        if current == models_dir or current == current.parent:
-            break
-        current = current.parent
-
-    # Models root, then anywhere beneath it.
-    hit = _scan(models_dir)
-    if hit:
-        return str(hit), hit.stem
-    try:
-        for f in models_dir.rglob("*.safetensors"):
-            if f.is_file() and _vae_name_matches_family(f.name, family):
-                return str(f), f.stem
-    except OSError:
-        pass
-    return "", ""
+    hit = _sibling_scan(
+        p, (".safetensors",),
+        lambda f: _vae_name_matches_family(f.name, family))
+    return (str(hit), hit.stem) if hit else ("", "")
 
 
 def _detect_clip(diff_path_str: str, which: str) -> Tuple[str, str]:
     """Find clip_l / clip_g next to the diffusion model, returning
     (path, name) or ("", ""). `which` is "l" or "g".
 
-    Same bounded search as _detect_vae: the model's own folder first, then up
-    to 4 levels upward stopping at the models root, then the models root and
-    everything beneath it. The quantizers ship these alongside the UNet (hum-ma
-    puts them in a clip/ subfolder), so the recursive sweep of the models root
-    is what catches that layout.
+    Same sibling-only search as _detect_vae -- the model's own folder and
+    nothing else. NOTE this does mean hum-ma's layout, which puts the CLIPs in
+    a clip/ subfolder beside the UNet rather than next to it, no longer
+    auto-fills; those two files have to be picked once by hand. That is the
+    accepted cost of never borrowing a same-named file from another model's
+    folder. See _sibling_scan() for why.
 
     Matching is by filename because these carry no metadata to key off. The
     patterns are deliberately narrow -- an underscore/dash/dot separated
@@ -328,42 +326,34 @@ def _detect_clip(diff_path_str: str, which: str) -> Tuple[str, str]:
     """
     if not diff_path_str:
         return "", ""
-    p = Path(diff_path_str).expanduser()
     letter = which.lower()
     pat = re.compile(rf"(^|[^a-z0-9])clip[-_. ]?{letter}([^a-z0-9]|$)", re.I)
+    hit = _sibling_scan(Path(diff_path_str), (".safetensors",),
+                        lambda f: pat.search(f.stem))
+    return (str(hit), hit.name) if hit else ("", "")
 
-    def _scan(folder: Path) -> Optional[Path]:
-        try:
-            if not folder.is_dir():
-                return None
-            for f in sorted(folder.iterdir()):
-                if f.is_file() and f.name.lower().endswith(".safetensors") \
-                        and pat.search(f.stem):
-                    return f
-        except OSError:
-            pass
-        return None
 
-    models_dir = configure.get_models_dir().resolve()
-    current = p.parent.resolve()
-    for _ in range(5):
-        hit = _scan(current)
-        if hit:
-            return str(hit), hit.name
-        if current == models_dir or current == current.parent:
-            break
-        current = current.parent
+def _detect_t5xxl(diff_path_str: str) -> Tuple[str, str]:
+    r"""Find a T5-XXL encoder near the diffusion model, returning (path, name).
 
-    hit = _scan(models_dir)
-    if hit:
-        return str(hit), hit.name
-    try:
-        for f in sorted(models_dir.rglob("*.safetensors")):
-            if f.is_file() and pat.search(f.stem):
-                return str(f), f.name
-    except OSError:
-        pass
-    return "", ""
+    Separate from _detect_clip() for two reasons rather than one shared
+    function with a wider pattern. First the EXTENSION: clip_l/clip_g ship as
+    .safetensors, but T5-XXL is usually a gguf quant here -- fp16 is 9.8GB of
+    system RAM for a single conditioning pass, so city96's
+    t5-v1_1-xxl-encoder-Q4_K_M.gguf (2.7GB) is the realistic file and .gguf
+    must be searched. Second the NAMING: the two common spellings share no
+    literal substring ("t5xxl_fp16" versus "t5-v1_1-xxl-encoder"), so the
+    pattern is an alternation rather than one stem with separators.
+
+    Sibling folder only, like the other two -- this is the detector that made
+    the case for that rule, having filled the T5 box from the .\models root
+    for a model sitting in models\flux1-schnell-GGUF\."""
+    if not diff_path_str:
+        return "", ""
+    pat = re.compile(r"(t5[-_. ]?xxl|t5[-_. ]?v1[-_. ]?1[-_. ]?xxl)", re.I)
+    hit = _sibling_scan(Path(diff_path_str), (".gguf", ".safetensors"),
+                        lambda f: pat.search(f.stem))
+    return (str(hit), hit.name) if hit else ("", "")
 
 
 def _resolve_clips(diff_path_str: str, cur_l_path: str, cur_g_path: str) -> tuple:
@@ -371,25 +361,44 @@ def _resolve_clips(diff_path_str: str, cur_l_path: str, cur_g_path: str) -> tupl
 
     Returns (l_path, l_name, g_path, g_name) as values or gr.update()s.
 
-    Only SDXL uses these, so switching TO any other family blanks them -- they
-    would otherwise sit there stale and get passed to a diffuser that has no
-    --clip_l flag. Within SDXL: auto-detect if found, keep what is already set
-    if it still exists on disk, else blank. Same three rules as _resolve_vae.
+    Split SDXL uses both; FLUX.1 uses clip_l alone (its second encoder is
+    T5-XXL, resolved by _resolve_t5xxl). Switching to a family that wants
+    neither blanks them -- they would otherwise sit there stale and be passed
+    to a diffuser that has no --clip_l flag. Within a family that does want
+    them: found beside the new model -> use it, otherwise blank. Same two rules
+    as _resolve_vae, and for the same reason -- nothing is inherited across a
+    model change. cur_l_path / cur_g_path are kept in the signature so the
+    wiring does not have to change.
     """
     fam = configure.diffuser_family(diff_path_str) if diff_path_str else None
+    if fam == configure.DIFFUSER_FAMILY_FLUX1:
+        # clip_l only, and an explicitly blank clip_g: a CLIP-G left over from
+        # an SDXL session must not survive the switch, or sd-cli would be
+        # handed --clip_g for a model whose spec never lists that slot.
+        path, name = _detect_clip(diff_path_str, "l")
+        return path, name, "", ""
     if fam != configure.DIFFUSER_FAMILY_SDXL:
         return "", "", "", ""
 
     out = []
-    for which, cur in (("l", cur_l_path), ("g", cur_g_path)):
+    for which in ("l", "g"):
         path, name = _detect_clip(diff_path_str, which)
-        if path:
-            out.extend([path, name])
-        elif cur and Path(cur).expanduser().exists():
-            out.extend([gr.update(), gr.update()])
-        else:
-            out.extend(["", ""])
+        out.extend([path, name] if path else ["", ""])
     return tuple(out)
+
+
+def _resolve_t5xxl(diff_path_str: str, cur_path: str) -> Tuple[Any, Any]:
+    """Decide what the T5-XXL boxes hold after the diffuser changes.
+
+    FLUX.1 is currently the only family with a t5xxl slot, so every other
+    family blanks it. Same two rules as the CLIP and VAE resolvers: found
+    beside the new model, or blank. cur_path is kept in the signature so the
+    wiring does not have to change."""
+    fam = configure.diffuser_family(diff_path_str) if diff_path_str else None
+    if fam != configure.DIFFUSER_FAMILY_FLUX1:
+        return "", ""
+    path, name = _detect_t5xxl(diff_path_str)
+    return (path, name) if path else ("", "")
 
 
 def _resolve_vae(diff_path_str: str, current_vae_path: str,
@@ -398,51 +407,57 @@ def _resolve_vae(diff_path_str: str, current_vae_path: str,
     Decide what the VAE boxes should hold after the diffusion model changes.
     Returns (path_update, name_update) for (vae_path_tb, vae_name_tb).
 
-    Three rules, in order:
-      1. ae.safetensors found for the new model  -> use it.
-      2. Not found, but the box already holds a VAE that still exists on disk
-         -> keep it. This is the normal case for the community finetunes: they
-         ship a DiT gguf and nothing else, so switching from vanilla to e.g.
-         zImageTurboNSFW must not throw away the ae.safetensors that is
-         already configured and still perfectly valid for it.
-      3. Not found and nothing usable held -> blank, and wait for the user.
-         A stale path to a deleted file is cleared rather than kept, so the
-         box never claims a VAE that generation would then fail on.
-    """
-    # Rule 0 (new): cross-family switch. If the VAE currently held belongs to
-    # the OTHER family (z-image ae vs flux2 vae), it can never be valid for the
-    # new diffuser, so blank it unconditionally and make the user set the right
-    # one. This is the flux.2 ⇄ z-image switch the user asked to be handled.
-    new_family = configure.diffuser_family(diff_path_str) if diff_path_str else None
-    cur_vae_family = configure.vae_family(current_vae_name or "")
-    if new_family and cur_vae_family and new_family != cur_vae_family:
-        return "", ""
+    Two rules now, not three:
+      1. A matching VAE sits in the new model's own folder -> use it.
+      2. Anything else -> blank, and wait for the user.
 
+    Rule 2 used to be "keep whatever is already in the box if it still exists
+    on disk", which read as helpful and was not. Combined with the old
+    tree-wide search it meant a box could hold a file the user never chose, for
+    a model that never shipped one, from a folder they were never shown --
+    and a wrong VAE does not raise, it produces a black or mangled image.
+    Picking a diffusion model now clears its companions and refills only from
+    beside it, so what is on screen is always either "found next to this model"
+    or "you chose this by hand". `current_vae_path` is retained in the
+    signature because the wiring passes it and the cross-family check below
+    still needs `current_vae_name`.
+    """
+    # There used to be a "rule 0" here that short-circuited on a cross-family
+    # switch: if the VAE already in the box belonged to a different family, it
+    # returned blank immediately. That existed only to stop a stale VAE being
+    # INHERITED, and nothing is inherited any more -- so all it did was return
+    # early and skip the detection below. Switching from an SDXL model to a
+    # FLUX.1 one therefore blanked the box and never noticed the correct
+    # ae.safetensors sitting in the new model's own folder. Detection first,
+    # unconditionally, is both simpler and right: whatever is beside the new
+    # model wins, and if there is nothing beside it the box goes empty.
     vae_path, vae_name = _detect_vae(diff_path_str)
-    if vae_path:
-        return vae_path, vae_name
-    if current_vae_path and Path(current_vae_path).expanduser().exists():
-        return gr.update(), gr.update()          # rule 2 — leave as-is
-    return "", ""
+    return (vae_path, vae_name) if vae_path else ("", "")
 
 
 def _diff_change_message(diff_path_str: str, current_vae_name: str) -> str:
     """Status-bar line for a diffusion-model change: announces the family the
-    interface has switched to, and prompts for a VAE path on a cross-family
-    switch (where _resolve_vae just blanked the box).
+    interface has switched to, and asks for a VAE when the box has been left
+    empty because none was found beside the new model.
+
+    Keyed on the OUTCOME (did detection find one?) rather than on comparing the
+    old and new families, which is what it used to do. The old test asked
+    whether the previously-held VAE belonged to a different family -- but it
+    could say "set a VAE path" while _resolve_vae had just filled the box
+    perfectly well from the new model's folder, and stay silent when the box
+    was genuinely empty. Asking what actually happened cannot drift from it.
 
     Examples:
       "Handling/interface set to Z-Image-Turbo."
-      "Switched from Z-Image-Turbo to Flux.2-Klein — set VAE (safetensors) path."
+      "Handling/interface set to Flux.2-Klein — no VAE beside it, set one."
     """
     if not diff_path_str:
         return "Handling/interface set to no model selected."
-    new_family = configure.diffuser_family(diff_path_str)
     new_label = configure.diffuser_family_label(diff_path_str)
-    cur_vae_family = configure.vae_family(current_vae_name or "")
-    if new_family and cur_vae_family and new_family != cur_vae_family:
-        old_label = configure.DIFFUSER_FAMILY_LABELS.get(cur_vae_family, "the previous model")
-        return f"Switched from {old_label} to {new_label} — set VAE (safetensors) path."
+    vae_path, _ = _detect_vae(diff_path_str)
+    if not vae_path:
+        return (f"Handling/interface set to {new_label} — no VAE found beside "
+                f"the model, set one.")
     return f"Handling/interface set to {new_label}."
 
 
@@ -471,6 +486,48 @@ def _on_diff_path_change_full(path: str, current_vae_path: str,
         vae_n = gr.update(info=hint)   # keep value, just retune the hint
     msg = _diff_change_message(path, current_vae_name)
     return vae_p, vae_n, msg
+
+
+def _on_diff_path_change_slots(path: str, cur_l_path: str, cur_g_path: str,
+                               cur_t5_path: str) -> tuple:
+    """Re-resolve the text-encoder rows whenever the diffusion path changes.
+
+    Registered as a SECOND listener on diff_path_tb.change, alongside the VAE
+    handler above. It exists because the encoder rows were previously refreshed
+    ONLY inside _browse_diffusion, so any other route to a new diffusion model
+    -- typing the path by hand, or the page being rebuilt from a saved config
+    -- left them holding whatever was in them before. Harmless while the only
+    family with external encoders was SDXL, since a stale CLIP-L is at least
+    still a CLIP-L. Not harmless with FLUX.1 in the picture: the T5-XXL row
+    would happily sit there displaying a leftover VAE filename, which sd-cli
+    would then be handed as --t5xxl and which produces a black image rather
+    than an error.
+
+    Browse still does its own resolving, and setting diff_path_tb
+    programmatically fires this too, so both run for a Browse. That is
+    deliberate and safe -- they compute the identical answer from the identical
+    inputs, exactly as the VAE handler above already double-fires.
+
+    Returns 14 updates: three path/name pairs, the encoder relabel, three
+    browse/clear button pairs, and the packaging status line."""
+    slots = _needed_slots(path)
+    if slots["clip_l"] or slots["clip_g"]:
+        l_path, l_name, g_path, g_name = _resolve_clips(path, cur_l_path, cur_g_path)
+    else:
+        l_path, l_name, g_path, g_name = "", "", "", ""
+    t5_path, t5_name = _resolve_t5xxl(path, cur_t5_path)
+    (enc_u, l_vis, _lb, g_vis, _gb, t5_vis, _tb, pack) = _encoder_slot_updates(path)
+
+    def _merge(value, vis):
+        u = dict(vis)
+        if not isinstance(value, dict):     # a real string, not gr.update()
+            u["value"] = value
+        return gr.update(**u)
+
+    return (l_path, _merge(l_name, l_vis),
+            g_path, _merge(g_name, g_vis),
+            t5_path, _merge(t5_name, t5_vis),
+            enc_u, l_vis, l_vis, g_vis, g_vis, t5_vis, t5_vis, pack)
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +624,9 @@ _gen: Dict[str, Any] = {}
 _ENC_LABEL_CONDITIONER = "Encoder Name"
 _ENC_LABEL_ENHANCER    = "Encoder Name (optional)"
 _ENC_INFO_CONDITIONER  = "Qwen3 text encoder — required; conditions the diffuser."
-_ENC_INFO_ENHANCER     = ("Optional for SDXL — used only to expand the prompt. "
-                          "SDXL conditions through CLIP-L/CLIP-G instead.")
+_ENC_INFO_ENHANCER     = ("Optional — used only to expand the prompt text. "
+                          "This diffuser conditions through its own encoders "
+                          "instead, so nothing here reaches sd-cli.")
 
 
 def _clips_needed(diff_path: str) -> bool:
@@ -587,25 +645,70 @@ def _clips_needed(diff_path: str) -> bool:
     return configure.sdxl_is_unet_only(diff_path)
 
 
+def _needed_slots(diff_path: str) -> Dict[str, bool]:
+    """Which external text-encoder rows this diffuser needs on screen.
+
+    Built family-first rather than from diffuser_spec()["text_encoders"],
+    because the SDXL spec is itself chosen by whether split CLIPs happen to be
+    configured -- asking the spec which boxes to show, in order to decide
+    whether to let the user fill those boxes, is circular. _clips_needed()
+    already resolves SDXL packaging from the FILE, which is the non-circular
+    signal, so SDXL keeps using it and FLUX.1 is stated outright.
+
+    FLUX.1 shows clip_l but NOT clip_g: it is the first family to want one
+    without the other, which is why this returns a per-slot mapping instead of
+    the single needs_clips boolean it replaces."""
+    if not diff_path:
+        return {"clip_l": False, "clip_g": False, "t5xxl": False}
+    if configure.diffuser_family(diff_path) == configure.DIFFUSER_FAMILY_FLUX1:
+        return {"clip_l": True, "clip_g": False, "t5xxl": True}
+    need = _clips_needed(diff_path)
+    return {"clip_l": need, "clip_g": need, "t5xxl": False}
+
+
+def _encoder_is_conditioner(diff_path: str) -> bool:
+    """True when the Encoder slot is the diffuser's ACTUAL text conditioner
+    (passed to sd-cli as --llm) rather than an optional prompt enhancer.
+
+    The one box has always had two jobs. Z-Image and Flux.2 condition through a
+    Qwen3 gguf, so the slot is mandatory and its contents are handed straight
+    to sd-cli. SDXL and FLUX.1 condition through their own encoders -- CLIP-L +
+    CLIP-G, and CLIP-L + T5-XXL respectively -- so for them the Qwen3 is run in
+    a separate llama.cpp process purely to rewrite the prompt text, never
+    reaches sd-cli, and is entirely optional.
+
+    Asks the SPEC rather than testing for SDXL by name, which is what the two
+    call sites used to do. That test was correct while SDXL was the only
+    non-LLM family; with FLUX.1 added it labelled a slot "required; conditions
+    the diffuser" for a family that ignores it completely. `text_encoders`
+    already records exactly this, so it is the thing to read."""
+    if not diff_path:
+        return True          # nothing chosen yet -- keep the stricter wording
+    spec = configure.diffuser_spec(diff_path, "", _has_split_clips())
+    return bool(spec and "llm" in spec["text_encoders"])
+
+
 def _encoder_slot_updates(diff_path: str) -> tuple:
-    """UI updates for the encoder/CLIP slots when the diffuser changes.
+    """UI updates for the encoder/CLIP/T5 slots when the diffuser changes.
 
     Returns (encoder box, clip_l box, clip_l button, clip_g box, clip_g button,
-    packaging status). The CLIP rows appear only when the chosen model actually
-    needs them, so a self-contained checkpoint does not present two boxes that
-    would be ignored. The Encoder box is relabelled rather than hidden for
+    t5xxl box, t5xxl button, packaging status). Each row appears only when the
+    chosen model actually needs it, so a self-contained checkpoint does not
+    present boxes that would be ignored, and FLUX.1 does not present a CLIP-G
+    it has no flag for. The Encoder box is relabelled rather than hidden for
     SDXL, since it stays useful there as a prompt enhancer."""
-    is_sdxl = (configure.diffuser_family(diff_path) ==
-               configure.DIFFUSER_FAMILY_SDXL) if diff_path else False
-    needs_clips = _clips_needed(diff_path)
+    _is_cond = _encoder_is_conditioner(diff_path)
+    slots = _needed_slots(diff_path)
     enc = gr.update(
-        label=_ENC_LABEL_ENHANCER if is_sdxl else _ENC_LABEL_CONDITIONER,
-        info=_ENC_INFO_ENHANCER if is_sdxl else _ENC_INFO_CONDITIONER,
+        label=_ENC_LABEL_CONDITIONER if _is_cond else _ENC_LABEL_ENHANCER,
+        info=_ENC_INFO_CONDITIONER if _is_cond else _ENC_INFO_ENHANCER,
     )
-    vis = gr.update(visible=needs_clips)
+    l_vis  = gr.update(visible=slots["clip_l"])
+    g_vis  = gr.update(visible=slots["clip_g"])
+    t5_vis = gr.update(visible=slots["t5xxl"])
     label = configure.sdxl_packaging_label(diff_path)
     status = gr.update(value=label, visible=bool(label))
-    return (enc, vis, vis, vis, vis, status)
+    return (enc, l_vis, l_vis, g_vis, g_vis, t5_vis, t5_vis, status)
 
 
 def _has_split_clips(c: Optional[Dict[str, Any]] = None) -> bool:
@@ -623,6 +726,23 @@ def _family_takes_input_image(diff_path: str) -> bool:
     spec = (configure.diffuser_spec(diff_path, "", _has_split_clips())
             if diff_path else None)
     return bool(spec and spec.get("img2img"))
+
+
+def _family_fuses_refs(diff_path: str) -> bool:
+    """True when the diffuser can consume SEVERAL input images in one run.
+
+    Only the "ref" path can: Flux.2 repeats -r once per reference and
+    conditions on all of them together. The "init" path (SDXL, FLUX.1)
+    denoises from exactly one -i, so several images can only ever be processed
+    one after another.
+
+    This is the question the Use All / Chain All radio actually asks, which is
+    why it is its own predicate rather than a reading of _family_uses_init_image
+    -- a family could in principle be added that fuses references without being
+    on either of today's two paths."""
+    spec = (configure.diffuser_spec(diff_path, "", _has_split_clips())
+            if diff_path else None)
+    return bool(spec and spec.get("img2img") == "ref")
 
 
 def _family_uses_init_image(diff_path: str) -> bool:
@@ -689,6 +809,10 @@ def _missing_models() -> List[str]:
         missing.append("CLIP-L")
     if "clip_g" in spec["text_encoders"] and not _model_path_ok(c.get("clip_g_model_path")):
         missing.append("CLIP-G")
+    # FLUX.1 only. Without it sd-cli loads, samples, and writes a black image
+    # rather than erroring, so a missing T5 has to be caught here.
+    if "t5xxl" in spec["text_encoders"] and not _model_path_ok(c.get("t5xxl_model_path")):
+        missing.append("T5-XXL")
     # Not universal: a full SDXL checkpoint carries its own VAE, so demanding
     # one there would hide the Generate button on a perfectly valid setup.
     if spec["vae_required"] and not _model_path_ok(c.get("vae_model_path")):
@@ -1293,26 +1417,32 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # Chain All only kicks in with 2+ images -- with 0 or 1 there is
         # nothing to split, so it collapses to the same single-run behaviour
         # as Use All. Each chain "link" is a single-image list, run through
-        # its own call to inference.generate_image(); Use All (or the
-        # collapsed case) is one run carrying the whole list.
-        # Families on the -i path consume exactly ONE input image per run:
-        # sd-cli has a single --init-img and no way to take a second. So the
-        # extra images are dropped rather than chained.
+        # its own call to inference.generate_image(); Use All is one run
+        # carrying the whole list.
         #
-        # Chaining them looked reasonable but was wrong: it turned each image
-        # into its own generation, and each generation still honours Batch
-        # Count -- so two images at a batch of 2 quietly produced FOUR images
-        # instead of the two the user asked for. Batch Count is the control
-        # that decides how many images come out; nothing else may multiply it.
-        _init_family = _family_uses_init_image(c.get("imagegen_model_path", ""))
-        if _init_family and len(_refs) > 1:
-            print(f"[generate] NOTE: this model takes one input image; using "
-                  f"{Path(_refs[0]).name} and ignoring {len(_refs) - 1} other(s).")
-            _refs = _refs[:1]
-
-        # Chain only when the user asked for it, and only where more than one
-        # image can actually be used.
-        chain_mode = (ref_mode == configure.REF_MODE_CHAIN_ALL) and len(_refs) > 1
+        # WHO GETS A CHOICE, AND WHO DOES NOT
+        # Only the "ref" families can consume several images in ONE run:
+        # Flux.2 repeats -r per reference. The "init" families -- SDXL and
+        # FLUX.1 -- denoise from a single -i and sd-cli has no way to accept a
+        # second, so "Use All" would promise something it cannot do and the
+        # radio stays hidden for them (_render_ref_mode_visibility).
+        #
+        # Hidden choice does NOT mean no chaining. This used to drop the extra
+        # images with a console note and run only the first, which is why a
+        # nine-image FLUX.1 job stopped after image one and never showed a
+        # chain position. Every family can process a pile of images one at a
+        # time; only the ability to fuse them into a single run is special. So
+        # the init families are now FORCED to chain rather than truncated, and
+        # the radio's absence just means the one available behaviour is not
+        # presented as a decision.
+        #
+        # Note the interaction with Batch Count, which is deliberate and not a
+        # bug: each link is a full generation and still honours it, so nine
+        # images at a batch of 2 produce eighteen outputs. Batch Count is
+        # "how many variations per input", not "how many images in total".
+        _supports_use_all = _family_fuses_refs(c.get("imagegen_model_path", ""))
+        chain_mode = len(_refs) > 1 and (
+            not _supports_use_all or ref_mode == configure.REF_MODE_CHAIN_ALL)
         ref_batches: List[List[str]] = ([[r] for r in _refs] if chain_mode
                                         else [_refs])
         chain_total = len(ref_batches)
@@ -1597,16 +1727,19 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         """Show the Use All / Chain All switch only when there is a real choice.
 
         TWO conditions, not one. There must be 2+ accumulated images, AND the
-        diffuser must be able to consume more than one -- which only the "ref"
-        families can. Flux.2 conditions on every image at once through
-        repeatable -r flags; SDXL takes a single -i init image and has no way
-        to accept a second, so offering "Use All" there promises something
-        sd-cli cannot do. Hiding it is what stops the mode from silently
-        turning into a chained run that multiplies the batch count."""
+        diffuser must be able to FUSE them into a single run -- which only the
+        "ref" families can. Flux.2 conditions on every image at once through
+        repeatable -r flags; SDXL and FLUX.1 take a single -i init image and
+        have no way to accept a second, so offering "Use All" there promises
+        something sd-cli cannot do.
+
+        Hiding the radio does not disable chaining. Those families always
+        chain when given several images -- see do_generate. All the hidden
+        radio means is that there is one possible behaviour rather than two,
+        so there is nothing to ask about."""
         c = configure.load_configuration()
-        spec = configure.diffuser_spec(c.get("imagegen_model_path", ""))
-        multi = bool(spec and spec.get("img2img") == "ref")
-        return gr.update(visible=bool(multi and count > 1))
+        return gr.update(visible=bool(
+            _family_fuses_refs(c.get("imagegen_model_path", "")) and count > 1))
 
     def _add_ref_images(current):
         """Open the native picker and APPEND whatever was chosen to the
@@ -1905,16 +2038,26 @@ def _build_config_tab_inner() -> None:
     # .safetensors checkpoints all leave them blank.
     _cfg_w["clip_l_path_tb"] = gr.Textbox(value=cfg.get("clip_l_model_path", ""), visible=False)
     _cfg_w["clip_g_path_tb"] = gr.Textbox(value=cfg.get("clip_g_model_path", ""), visible=False)
+    # FLUX.1's second text encoder. Shares the clip_l row's machinery but not
+    # its visibility -- FLUX.1 wants clip_l + t5xxl, split SDXL wants
+    # clip_l + clip_g, so the three rows are shown independently.
+    _cfg_w["t5xxl_path_tb"] = gr.Textbox(value=cfg.get("t5xxl_model_path", ""), visible=False)
 
     # Whether the currently-saved diffuser is SDXL decides two things on this
     # page: whether the CLIP-L/CLIP-G rows are shown at all, and whether the
     # Encoder box is presented as a required conditioner or an optional prompt
     # enhancer. Recomputed on every diffusion-model pick, below.
-    _cfg_is_sdxl = (configure.diffuser_family(cfg.get("imagegen_model_path", ""))
-                    == configure.DIFFUSER_FAMILY_SDXL)
+    # Whether the Encoder slot is this family's real conditioner or just a
+    # prompt enhancer -- see _encoder_is_conditioner(). This replaced an
+    # is-it-SDXL test, which stopped being the same question once FLUX.1
+    # arrived: it also conditions without the Qwen3.
+    _cfg_enc_cond = _encoder_is_conditioner(cfg.get("imagegen_model_path", ""))
     # CLIP boxes appear only when the model file actually lacks its own text
     # encoders -- see _clips_needed(). Nothing to do with the Encoder slot.
-    _cfg_needs_clips = _clips_needed(cfg.get("imagegen_model_path", ""))
+    _cfg_slots = _needed_slots(cfg.get("imagegen_model_path", ""))
+    _cfg_needs_clips = _cfg_slots["clip_l"]
+    _cfg_needs_clip_g = _cfg_slots["clip_g"]
+    _cfg_needs_t5 = _cfg_slots["t5xxl"]
     _cfg_pack_label = configure.sdxl_packaging_label(cfg.get("imagegen_model_path", ""))
 
     with gr.Row():
@@ -1947,14 +2090,14 @@ def _build_config_tab_inner() -> None:
                     placeholder="clip_g.safetensors",
                     info="Auto-filled when found near the diffusion model.",
                     interactive=True,
-                    visible=_cfg_needs_clips,
+                    visible=_cfg_needs_clip_g,
                     scale=8,
                 )
                 with gr.Column(scale=1, min_width=90):
                     _cfg_w["clip_g_browse_btn"] = gr.Button(
-                        "Browse...", size="sm", visible=_cfg_needs_clips)
+                        "Browse...", size="sm", visible=_cfg_needs_clip_g)
                     _cfg_w["clip_g_clear_btn"] = gr.Button(
-                        "Clear", size="sm", visible=_cfg_needs_clips)
+                        "Clear", size="sm", visible=_cfg_needs_clip_g)
 
             with gr.Row():
                 _cfg_w["vae_name_tb"] = gr.Textbox(
@@ -1984,6 +2127,23 @@ def _build_config_tab_inner() -> None:
                         "Browse...", size="sm", visible=_cfg_needs_clips)
                     _cfg_w["clip_l_clear_btn"] = gr.Button(
                         "Clear", size="sm", visible=_cfg_needs_clips)
+
+            with gr.Row():
+                _cfg_w["t5xxl_name_tb"] = gr.Textbox(
+                    label="T5-XXL Name",
+                    value=cfg.get("t5xxl_model_name", ""),
+                    placeholder="t5-v1_1-xxl-encoder-Q4_K_M.gguf",
+                    info=("FLUX.1's second encoder. A gguf quant is preferred: "
+                          "it runs on the CPU, and fp16 costs 9.8GB of RAM."),
+                    interactive=True,
+                    visible=_cfg_needs_t5,
+                    scale=8,
+                )
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["t5xxl_browse_btn"] = gr.Button(
+                        "Browse...", size="sm", visible=_cfg_needs_t5)
+                    _cfg_w["t5xxl_clear_btn"] = gr.Button(
+                        "Clear", size="sm", visible=_cfg_needs_t5)
             # Says which packaging was detected and therefore why the CLIP
             # boxes are or are not on screen -- otherwise their appearing and
             # disappearing looks arbitrary.
@@ -2000,10 +2160,10 @@ def _build_config_tab_inner() -> None:
         with gr.Column(scale=1):
             with gr.Row():
                 _cfg_w["enc_name_tb"] = gr.Textbox(
-                    label=_ENC_LABEL_ENHANCER if _cfg_is_sdxl else _ENC_LABEL_CONDITIONER,
+                    label=_ENC_LABEL_CONDITIONER if _cfg_enc_cond else _ENC_LABEL_ENHANCER,
                     value=cfg.get("encoder_model_name", ""),
                     placeholder="Qwen3-4b-Z-Image-Turbo",
-                    info=_ENC_INFO_ENHANCER if _cfg_is_sdxl else _ENC_INFO_CONDITIONER,
+                    info=_ENC_INFO_CONDITIONER if _cfg_enc_cond else _ENC_INFO_ENHANCER,
                     interactive=True,
                     scale=8,
                 )
@@ -2133,10 +2293,12 @@ def _build_config_tab_inner() -> None:
         return p, Path(p).stem
 
     def _browse_diffusion(current_vae_path: str, current_vae_name: str,
-                          cur_l_path: str, cur_g_path: str):
+                          cur_l_path: str, cur_g_path: str, cur_t5_path: str):
         p = _browse_file()
         if not p:
-            return (gr.update(),) * 14
+            # 18 = the outputs list below: 5 path/name pairs, the encoder
+            # relabel, 3 browse/clear button pairs, and the packaging line.
+            return (gr.update(),) * 18
         vae_path, vae_name = _resolve_vae(p, current_vae_path, current_vae_name)
         # CLIP-L/CLIP-G are auto-detected the same way the VAE is: the
         # quantizers ship them beside the UNet, so requiring the user to hunt
@@ -2144,28 +2306,34 @@ def _build_config_tab_inner() -> None:
         # Only fill the CLIP slots when this model actually needs them; a
         # self-contained checkpoint gets them blanked so nothing stale is
         # passed to sd-cli as a redundant override.
-        if _clips_needed(p):
+        _slots = _needed_slots(p)
+        if _slots["clip_l"] or _slots["clip_g"]:
             l_path, l_name, g_path, g_name = _resolve_clips(p, cur_l_path, cur_g_path)
         else:
             l_path, l_name, g_path, g_name = "", "", "", ""
+        t5_path, t5_name = _resolve_t5xxl(p, cur_t5_path)
         # Picking the diffuser also determines whether the CLIP rows are shown
         # at all and what the Encoder slot means, so both refresh here rather
         # than making the user save and revisit the page.
-        enc_u, clip_vis, _, _, _, pack_status = _encoder_slot_updates(p)
+        (enc_u, l_vis, _l_btn, g_vis, _g_btn,
+         t5_vis, _t5_btn, pack_status) = _encoder_slot_updates(p)
 
-        # The two name boxes each carry a VALUE and a VISIBILITY change, so the
-        # two are merged into one update apiece -- listing a component twice in
-        # `outputs` would silently drop the first update.
-        def _name_update(value):
-            u = dict(clip_vis)
+        # Each name box carries a VALUE and a VISIBILITY change, so the two are
+        # merged into one update apiece -- listing a component twice in
+        # `outputs` would silently drop the first update. The visibility now
+        # differs per slot (FLUX.1 shows clip_l and t5xxl but not clip_g), so
+        # the row's own update has to be passed in rather than a shared one.
+        def _name_update(value, vis):
+            u = dict(vis)
             if not isinstance(value, dict):     # a real string, not gr.update()
                 u["value"] = value
             return gr.update(**u)
 
         return (p, Path(p).stem, vae_path, vae_name,
-                l_path, _name_update(l_name),
-                g_path, _name_update(g_name),
-                enc_u, clip_vis, clip_vis, clip_vis, clip_vis, pack_status)
+                l_path, _name_update(l_name, l_vis),
+                g_path, _name_update(g_name, g_vis),
+                t5_path, _name_update(t5_name, t5_vis),
+                enc_u, l_vis, l_vis, g_vis, g_vis, t5_vis, t5_vis, pack_status)
 
     def _browse_vae():
         # No _resolve_vae here: an explicit pick by the user is final and is
@@ -2180,14 +2348,17 @@ def _build_config_tab_inner() -> None:
     _cfg_w["diff_browse_btn"].click(
         _browse_diffusion,
         inputs=[_cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"],
-                _cfg_w["clip_l_path_tb"], _cfg_w["clip_g_path_tb"]],
+                _cfg_w["clip_l_path_tb"], _cfg_w["clip_g_path_tb"],
+                _cfg_w["t5xxl_path_tb"]],
         outputs=[_cfg_w["diff_path_tb"], _cfg_w["diff_name_tb"],
                  _cfg_w["vae_path_tb"], _cfg_w["vae_name_tb"],
                  _cfg_w["clip_l_path_tb"], _cfg_w["clip_l_name_tb"],
                  _cfg_w["clip_g_path_tb"], _cfg_w["clip_g_name_tb"],
+                 _cfg_w["t5xxl_path_tb"], _cfg_w["t5xxl_name_tb"],
                  _cfg_w["enc_name_tb"],
                  _cfg_w["clip_l_browse_btn"], _cfg_w["clip_l_clear_btn"],
                  _cfg_w["clip_g_browse_btn"], _cfg_w["clip_g_clear_btn"],
+                 _cfg_w["t5xxl_browse_btn"], _cfg_w["t5xxl_clear_btn"],
                  _cfg_w["pack_status_md"]]
     )
     # ── Clear buttons ────────────────────────────────────────────────────
@@ -2205,8 +2376,10 @@ def _build_config_tab_inner() -> None:
         the CLIP rows' visibility, the Encoder slot's label, and the packaging
         status line -- because with no model chosen none of those have a
         meaning to display."""
-        enc_u, l_vis, l_btn, g_vis, g_btn, pack = _encoder_slot_updates("")
-        return ("", "", enc_u, l_vis, l_btn, l_btn, g_vis, g_btn, g_btn, pack)
+        (enc_u, l_vis, l_btn, g_vis, g_btn,
+         t5_vis, t5_btn, pack) = _encoder_slot_updates("")
+        return ("", "", enc_u, l_vis, l_btn, l_btn, g_vis, g_btn, g_btn,
+                t5_vis, t5_btn, t5_btn, pack)
 
     def _browse_clip_l():
         p = _browse_file(_FILETYPES_VAE)
@@ -2214,6 +2387,12 @@ def _build_config_tab_inner() -> None:
 
     def _browse_clip_g():
         p = _browse_file(_FILETYPES_VAE)
+        return (p, Path(p).name) if p else (gr.update(), gr.update())
+
+    def _browse_t5xxl():
+        # No filetype filter: T5-XXL is normally a .gguf quant here but a
+        # .safetensors is equally valid, and sd-cli takes either.
+        p = _browse_file()
         return (p, Path(p).name) if p else (gr.update(), gr.update())
 
     _cfg_w["diff_clear_btn"].click(
@@ -2224,6 +2403,8 @@ def _build_config_tab_inner() -> None:
                  _cfg_w["clip_l_clear_btn"],
                  _cfg_w["clip_g_name_tb"], _cfg_w["clip_g_browse_btn"],
                  _cfg_w["clip_g_clear_btn"],
+                 _cfg_w["t5xxl_name_tb"], _cfg_w["t5xxl_browse_btn"],
+                 _cfg_w["t5xxl_clear_btn"],
                  _cfg_w["pack_status_md"]],
     )
     _cfg_w["vae_clear_btn"].click(
@@ -2242,6 +2423,10 @@ def _build_config_tab_inner() -> None:
         _clear_slot, inputs=None,
         outputs=[_cfg_w["clip_g_path_tb"], _cfg_w["clip_g_name_tb"]],
     )
+    _cfg_w["t5xxl_clear_btn"].click(
+        _clear_slot, inputs=None,
+        outputs=[_cfg_w["t5xxl_path_tb"], _cfg_w["t5xxl_name_tb"]],
+    )
 
     _cfg_w["clip_l_browse_btn"].click(
         _browse_clip_l, inputs=None,
@@ -2250,6 +2435,10 @@ def _build_config_tab_inner() -> None:
     _cfg_w["clip_g_browse_btn"].click(
         _browse_clip_g, inputs=None,
         outputs=[_cfg_w["clip_g_path_tb"], _cfg_w["clip_g_name_tb"]],
+    )
+    _cfg_w["t5xxl_browse_btn"].click(
+        _browse_t5xxl, inputs=None,
+        outputs=[_cfg_w["t5xxl_path_tb"], _cfg_w["t5xxl_name_tb"]],
     )
 
     _cfg_w["vae_browse_btn"].click(
@@ -2331,8 +2520,25 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
         outputs=[w["vae_path_tb"], w["vae_name_tb"], status_box],
     )
 
+    # Second listener on the same event, for the text-encoder rows. Separate
+    # from the handler above rather than merged into it so the status-bar
+    # message keeps a single writer -- see _on_diff_path_change_slots.
+    w["diff_path_tb"].change(
+        _on_diff_path_change_slots,
+        inputs=[w["diff_path_tb"], w["clip_l_path_tb"], w["clip_g_path_tb"],
+                w["t5xxl_path_tb"]],
+        outputs=[w["clip_l_path_tb"], w["clip_l_name_tb"],
+                 w["clip_g_path_tb"], w["clip_g_name_tb"],
+                 w["t5xxl_path_tb"], w["t5xxl_name_tb"],
+                 w["enc_name_tb"],
+                 w["clip_l_browse_btn"], w["clip_l_clear_btn"],
+                 w["clip_g_browse_btn"], w["clip_g_clear_btn"],
+                 w["t5xxl_browse_btn"], w["t5xxl_clear_btn"],
+                 w["pack_status_md"]],
+    )
+
     def save_all(ep, en, dp, dn, vp, vn,
-                 clp, cln, cgp, cgn,
+                 clp, cln, cgp, cgn, t5p, t5n,
                  enc_back, img_back, threads,
                  eb, ec, engl,
                  ic, img_pred, img_family, img_placement):
@@ -2352,6 +2558,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "vae_model_path":      vp,  "vae_model_name":      vn,
             "clip_l_model_path":   clp, "clip_l_model_name":   cln,
             "clip_g_model_path":   cgp, "clip_g_model_name":   cgn,
+            "t5xxl_model_path":    t5p, "t5xxl_model_name":    t5n,
             "backend_encoder":     enc_back,
             "backend_imagegen":    img_back,
             # Per-side, and READ per-side by inference.py. The old code also
@@ -2396,6 +2603,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["vae_path_tb"], w["vae_name_tb"],
             w["clip_l_path_tb"], w["clip_l_name_tb"],
             w["clip_g_path_tb"], w["clip_g_name_tb"],
+            w["t5xxl_path_tb"], w["t5xxl_name_tb"],
             w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
             w["enc_batch_dd"], w["enc_ctx_dd"],
             w["enc_ngl_dd"],
@@ -2443,6 +2651,8 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             gr.update(value=""),                                # clip_l_path_tb
             gr.update(value=""),                                # clip_g_name_tb
             gr.update(value=""),                                # clip_g_path_tb
+            gr.update(value=""),                                # t5xxl_name_tb
+            gr.update(value=""),                                # t5xxl_path_tb
             gr.update(value=d["encoder_batch_size"]),           # enc_batch_dd
             gr.update(value=d["encoder_ctx_size"]),             # enc_ctx_dd
             gr.update(value=0, interactive=False,               # enc_ngl_dd
@@ -2465,6 +2675,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["vae_name_tb"], w["vae_path_tb"],
             w["clip_l_name_tb"], w["clip_l_path_tb"],
             w["clip_g_name_tb"], w["clip_g_path_tb"],
+            w["t5xxl_name_tb"], w["t5xxl_path_tb"],
             w["enc_batch_dd"], w["enc_ctx_dd"], w["enc_ngl_dd"],
             w["img_clip_dd"], w["img_pred_dd"], w["img_family_dd"],
             w["img_placement_dd"],

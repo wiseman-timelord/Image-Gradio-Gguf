@@ -993,6 +993,40 @@ def _flux2_needs_offload(diff_path: str, width: int, height: int,
     return (dit_mb + buf_mb) > vram_mb * 0.92
 
 
+def _flux1_needs_offload(diff_path: str, width: int, height: int,
+                         vk_dev: int) -> bool:
+    """Decide whether a FLUX.1 run must stream the DiT from CPU RAM.
+
+    Deliberately NOT sharing _flux2_needs_offload()'s constants, because both
+    of its numbers are wrong for Flux.1. Measured on an RX 470 (7367MB free)
+    at 512x512, with te and vae already pinned to CPU so only the DiT and its
+    compute buffer occupy VRAM:
+
+        flux compute buffer   341.50 MB at 0.25 MP  ->  ~1366 MB per megapixel
+                              (Flux.2's figure is 3000, more than double)
+        schnell Q4_0  6462.87 MB DiT + 341 = 6804 MB = 92.4% of free -> PASS
+        schnell Q4_0  at 768x768         = 7231 MB = 98.2% of free -> FAIL
+        dev     Q3_K  5105.72 MB DiT + 341 = 5447 MB = 73.9% of free -> PASS
+
+    The ceiling therefore sits between 92.4% and 98.2%, so the margin is 0.95,
+    not Flux.2's 0.92 -- 0.92 would have predicted schnell@768 fits, and it
+    does not. Resident DiT size tracks file size closely enough to use it.
+    Unknown VRAM -> do not force the slow path."""
+    try:
+        dit_mb = Path(diff_path).stat().st_size / (1024.0 * 1024.0)
+    except OSError:
+        return False
+    vram_mb = 0
+    for d in configure.get_vulkan_info().get("devices", []):
+        if d.get("index") == vk_dev:
+            vram_mb = d.get("vram_free_mb", 0) or d.get("vram_total_mb", 0) or 0
+            break
+    if not vram_mb:
+        return False
+    buf_mb = 1366.0 * (max(width, 1) * max(height, 1)) / (1024.0 * 1024.0)
+    return (dit_mb + buf_mb) > vram_mb * 0.95
+
+
 def generate_image(prompt: str, cfg: Dict[str, Any],
                    progress_callback: Optional[Callable] = None
                    ) -> Dict[str, Any]:
@@ -1029,6 +1063,7 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     diff_arch = _arch_of(diff_meta)
     family = configure.diffuser_family(diff_path, diff_arch)
     is_flux2 = family == configure.DIFFUSER_FAMILY_FLUX2
+    is_flux1 = family == configure.DIFFUSER_FAMILY_FLUX1
 
     # The spec decides how this file is driven: which flag carries the model,
     # which text encoders it needs, whether a VAE is mandatory, and whether an
@@ -1189,7 +1224,8 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
         if enc_path and Path(enc_path).exists():
             args.extend(["--llm", enc_path])
     for _slot, _flag, _key in (("clip_l", "--clip_l", "clip_l_model_path"),
-                               ("clip_g", "--clip_g", "clip_g_model_path")):
+                               ("clip_g", "--clip_g", "clip_g_model_path"),
+                               ("t5xxl",  "--t5xxl",  "t5xxl_model_path")):
         if _slot in spec["text_encoders"]:
             _p = cfg.get(_key, "")
             if _p and Path(_p).exists():
@@ -1225,9 +1261,39 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
     env = os.environ.copy()
     vk_dev = int(cfg.get("imagegen_vulkan_device", -1))
 
+    # Whether the DiT must be streamed from system RAM has to be decided HERE,
+    # before --params-backend is written, not later beside the other family
+    # flags. Upstream docs/performance.md is explicit that --offload-to-cpu
+    # works by PREPENDING `*=cpu` to --params-backend -- so a later explicit
+    # `--params-backend diffusion=vulkanN,...` overrides the wildcard and the
+    # flag becomes a silent no-op. That is exactly what was happening: measured
+    # on an RX 470, --offload-to-cpu produced byte-identical VRAM allocations
+    # (1005.20 / 1004.32 / ... MB) and identical copy_to_backend timings to a
+    # run without it. Every Flux.2 offload this program has ever requested was
+    # discarded the same way, which would surface as unexplained OOMs at just
+    # the resolutions _flux2_needs_offload() was written to rescue.
+    #
+    # The fix is to write the params backend ourselves rather than relying on a
+    # flag that edits it: when offloading, ALL weights go to `*=cpu` and are
+    # copied to the runtime backend per graph. --offload-to-cpu is then
+    # redundant and is not emitted, so there is only one thing deciding weight
+    # placement instead of two fighting.
+    _px = (int(cfg.get("imagegen_width", 512))
+           * int(cfg.get("imagegen_height", 512)))
+    _want_offload = False
+    if placement["use_vulkan_backend"] and vk_dev >= 0:
+        if is_flux2:
+            _want_offload = _flux2_needs_offload(
+                str(diff_path), int(cfg.get("imagegen_width", 512)),
+                int(cfg.get("imagegen_height", 512)), vk_dev, is_flux2_edit)
+        elif is_flux1:
+            _want_offload = _flux1_needs_offload(
+                str(diff_path), int(cfg.get("imagegen_width", 512)),
+                int(cfg.get("imagegen_height", 512)), vk_dev)
+
     if placement["use_vulkan_backend"] and vk_dev >= 0:
         dev = f"vulkan{vk_dev}"
-        if spec["encoder_to_cpu"]:
+        if spec["encoder_to_cpu"] or spec.get("vae_to_cpu"):
             # Families whose text encoder is too big to share the card with the
             # diffusion model force te=cpu regardless of the placement
             # dropdown. Currently that is Flux.2 alone: its Qwen3 conditioner
@@ -1241,6 +1307,13 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
             # only ~1.5GB, so they fit alongside the UNet and forcing them to
             # CPU would cost speed for no VRAM benefit. The placement dropdown
             # still governs there, via the branch below.
+            #
+            # FLUX.1 arrives here too, and needs it for BOTH reasons at once:
+            # its clip_l + t5xxl pair measured 3395MB, and its VAE decode
+            # compute buffer needs 1984MB on the GPU versus 1664MB on the CPU
+            # -- putting the VAE on the card costs more VRAM than leaving it
+            # off, and fails at decode_first_stage after a full sampling pass
+            # has already been paid for. Hence the vae_to_cpu spec key.
             assign = f"diffusion={dev},te=cpu,vae=cpu"
         elif placement["split_to_cpu"]:
             # Diffusion on the GPU; Qwen3 conditioner (~3.6GB) and VAE stay in
@@ -1248,7 +1321,11 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
             assign = f"diffusion={dev},te=cpu,vae=cpu"
         else:
             assign = dev
-        args.extend(["--backend", assign, "--params-backend", assign])
+        # --backend is where graphs EXECUTE and always names the GPU.
+        # --params-backend is where weights are ALLOCATED, and is the only one
+        # that changes when offloading.
+        args.extend(["--backend", assign])
+        args.extend(["--params-backend", "*=cpu" if _want_offload else assign])
         sdk = configure.get_vulkan_info().get("sdk", "") or os.environ.get("VULKAN_SDK", "")
         if sdk:
             env["PATH"] = str(Path(sdk) / "Bin") + ";" + env.get("PATH", "")
@@ -1336,16 +1413,36 @@ def generate_image(prompt: str, cfg: Dict[str, Any],
         if int(cfg.get("imagegen_width", 512)) * int(cfg.get("imagegen_height", 512)) > 1024 * 1024:
             args.append("--vae-tiling")
 
+    elif is_flux1:
+        # FLUX.1. Everything below was measured on this build, not assumed.
+        #
+        #   --guidance    deliberately NOT emitted. sd-cli already defaults
+        #                 distilled_guidance to 3.50, dev consumes it
+        #                 (flux.hpp reports guidance_embed = true) and schnell
+        #                 ignores it (guidance_embed = false). Passing it
+        #                 explicitly produced an identical parameter dump, so
+        #                 the flag would be noise that has to be gated per file.
+        #   --diffusion-fa  gated on the selected GPU's fp16 exactly as Flux.2
+        #                 is. Polaris reports fp16: 0, so this stays off there
+        #                 and the compute buffer keeps its full 341.50 MB.
+        #   --vae-tiling  only above 1MP. At 512x512 the CPU decode buffer is
+        #                 1664 MB of system RAM, which is not worth tiling; the
+        #                 comparison is >= so exactly 1024x1024 tiles too.
+        #   sampler       euler, per docs/flux.md, with cfg 1.0.
+        if configure.flux2_flash_attn_for(cfg):
+            args.append("--diffusion-fa")
+        if _px >= 1024 * 1024:
+            args.append("--vae-tiling")
+
     elif is_flux2:
         # --offload-to-cpu only when the DiT + its compute buffer would not fit
         # the GPU (auto, resolution-aware). Forcing it unconditionally streamed
         # ~5.6GB every step for the 9B and left the GPU idle at ~0% — glacial.
         # With the encoder already on CPU, the DiT stays resident on the GPU
         # whenever it fits, at full GPU speed.
-        _w = int(cfg.get("imagegen_width", 512))
-        _h = int(cfg.get("imagegen_height", 512))
-        if _flux2_needs_offload(str(diff_path), _w, _h, vk_dev, is_flux2_edit):
-            args.append("--offload-to-cpu")
+        # Offloading is handled above, by writing --params-backend directly.
+        # --offload-to-cpu is NOT emitted here: it only rewrites that same
+        # argument, and emitting both is what made it a no-op.
         args.append("--vae-tiling")
         # Flash attention keeps the compute buffer small and the flux.2 docs
         # recommend it, BUT the Vulkan flash-attention path needs fp16. Some

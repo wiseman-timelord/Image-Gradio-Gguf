@@ -230,6 +230,7 @@ DIFFUSER_PLACEMENT_CHOICES: List[str] = [
 # needs the 8B. There are, in effect, just two encoder "slots".
 # ---------------------------------------------------------------------------
 DIFFUSER_FAMILY_ZIMAGE = "z-image"
+DIFFUSER_FAMILY_FLUX1  = "flux1"
 DIFFUSER_FAMILY_FLUX2  = "flux2"
 DIFFUSER_FAMILY_SDXL   = "sdxl"
 
@@ -277,9 +278,17 @@ REF_MODE_DEFAULT   = REF_MODE_CHAIN_ALL
 ENCODER_DIM_QWEN3_4B = 2560
 ENCODER_DIM_QWEN3_8B = 4096
 
-# general.architecture (lowercased, exact) -> family. Klein GGUFs report `flux`
-# or `flux2`; Z-Image and its finetunes report `lumina2`.
-DIFFUSER_FLUX2_ARCH:  List[str] = ["flux2", "flux"]
+# general.architecture (lowercased, exact) -> family. Z-Image and its finetunes
+# report `lumina2`.
+#
+# `flux` is AMBIGUOUS and must never map straight to a family. Klein GGUFs
+# report it, and so does every FLUX.1 file -- mhnakif/fluxunchained shows
+# Architecture: flux on its HuggingFace metadata panel. A FLUX.1 file resolved
+# to flux2 gets driven with --llm <Qwen3> and dies at tensor validation with no
+# useful message. Only `flux2` is unambiguous; a bare `flux` falls through to
+# the filename tiebreak in _flux_arch_tiebreak().
+DIFFUSER_FLUX2_ARCH:  List[str] = ["flux2"]
+DIFFUSER_FLUX_AMBIGUOUS_ARCH: List[str] = ["flux"]
 DIFFUSER_ZIMAGE_ARCH: List[str] = ["lumina2"]
 # SDXL and the SD-classic checkpoints. Unambiguous: nothing else reports these,
 # so arch alone settles the family and no filename test is needed when the GGUF
@@ -290,10 +299,26 @@ DIFFUSER_SDXL_ARCH:   List[str] = ["sdxl", "sd1", "sd2"]
 # Flux2 is checked FIRST: a "flux-2-klein" name must not fall through to the
 # z-image bucket. These are a strict subset of DIFFUSION_NAME_PATTERNS split by
 # family -- the "flux"/"klein" tokens go to flux2, everything Z-Image to zimage.
+# The "2" is guarded against a following digit or dot so that
+# "Persephone-Flux-2.0" -- a FLUX.1-dev finetune whose author versioned it 2.0
+# -- is not claimed by flux2. "flux-2-klein" and "flux2-dev" still match.
 DIFFUSER_FLUX2_NAME_PATTERNS: List[str] = [
-    r"flux[-_. ]?2",
+    r"flux[-_. ]?2(?![.\d])",
     r"flux[-_. ]?klein",
     r"\bklein\b",
+]
+# Tested BEFORE the flux2 patterns, because the discriminating token in a
+# FLUX.1 filename ("schnell", "persephone") is more specific than the generic
+# "flux" both families share. kontext is listed here as a FLUX.1 derivative;
+# note it wants the ref path rather than init, which the spec does not yet
+# distinguish -- a Kontext file will currently be driven as plain img2img.
+DIFFUSER_FLUX1_NAME_PATTERNS: List[str] = [
+    r"flux[-_. ]?1",
+    r"\bschnell\b",
+    r"\bkontext\b",
+    r"fluxed[-_. ]?up",
+    r"flux[-_. ]?unchained",
+    r"persephone",
 ]
 DIFFUSER_ZIMAGE_NAME_PATTERNS: List[str] = [
     r"z[-_. ]?image",
@@ -326,6 +351,7 @@ VAE_FLUX2_NAME_PATTERNS: List[str] = [
 
 DIFFUSER_FAMILY_LABELS: Dict[str, str] = {
     DIFFUSER_FAMILY_ZIMAGE: "Z-Image-Turbo",
+    DIFFUSER_FAMILY_FLUX1:  "Flux.1",
     DIFFUSER_FAMILY_FLUX2:  "Flux.2-Klein",
     DIFFUSER_FAMILY_SDXL:   "SDXL",
 }
@@ -333,6 +359,8 @@ DIFFUSER_FAMILY_LABELS: Dict[str, str] = {
 # What each family's VAE box should say it wants, shown as the box's info hint.
 DIFFUSER_VAE_HINTS: Dict[str, str] = {
     DIFFUSER_FAMILY_ZIMAGE: "Z-Image expects ae.safetensors (the Flux.1 VAE).",
+    DIFFUSER_FAMILY_FLUX1:  ("Flux.1 expects ae.safetensors -- the SAME file "
+                             "Z-Image uses, verified working on this build."),
     DIFFUSER_FAMILY_FLUX2:  ("Flux.2 expects flux2_ae "
                              "(often downloaded as diffusion_pytorch_model.safetensors)."),
     DIFFUSER_FAMILY_SDXL:   ("SDXL expects an SDXL VAE. sdxl_vae-fp16-fix "
@@ -382,6 +410,30 @@ DIFFUSER_FAMILY_SPECS: Dict[str, Dict[str, Any]] = {
         "clip_skip":      False,
         "img2img":        "ref",
         "encoder_to_cpu": True,
+    },
+    # FLUX.1 (schnell, dev, and the CivitAI finetunes quantized from them).
+    # Standalone diffusion weights plus TWO external encoders -- CLIP-L and
+    # T5-XXL -- neither of which is an LLM, so this is the first family to use
+    # the clip_l slot without clip_g. Every value below was measured on an
+    # RX 470 8GB at 512x512, not assumed:
+    #   clip_skip      false. Flux carries no usable CLIP skip.
+    #   encoder_to_cpu true, and NOT optional: the two encoders occupy
+    #                  3395MB, which would evict the DiT from an 8GB card.
+    #   vae_to_cpu     true, and also not optional: the VAE decode compute
+    #                  buffer needs 1984MB on the GPU (measured -- it is
+    #                  LARGER than the 1664MB it needs on CPU), and the run
+    #                  dies at decode_first_stage after paying for a full
+    #                  sampling pass. This is the first family to need the
+    #                  key, so callers must treat a missing one as False.
+    #   img2img        "init". -i + --strength, verified at 0.60 and 0.85.
+    DIFFUSER_FAMILY_FLUX1: {
+        "model_flag":     "--diffusion-model",
+        "text_encoders":  ("clip_l", "t5xxl"),
+        "vae_required":   True,
+        "clip_skip":      False,
+        "img2img":        "init",
+        "encoder_to_cpu": True,
+        "vae_to_cpu":     True,
     },
     # SDXL as a FULL .safetensors checkpoint (sd_xl_base_1.0.safetensors and
     # the CivitAI finetunes in their original form). One file carries the UNet,
@@ -508,11 +560,12 @@ FAMILY_OVERRIDE_AUTO = "Auto"
 FAMILY_OVERRIDE_SDXL_FULL  = "SDXL (all-in-one file)"
 FAMILY_OVERRIDE_SDXL_SPLIT = "SDXL (needs CLIP files)"
 FAMILY_OVERRIDE_CHOICES: List[str] = [
-    FAMILY_OVERRIDE_AUTO, "Z-Image", "Flux.2",
+    FAMILY_OVERRIDE_AUTO, "Z-Image", "Flux.1", "Flux.2",
     FAMILY_OVERRIDE_SDXL_FULL, FAMILY_OVERRIDE_SDXL_SPLIT,
 ]
 _FAMILY_OVERRIDE_MAP: Dict[str, str] = {
     "z-image": DIFFUSER_FAMILY_ZIMAGE,
+    "flux.1":  DIFFUSER_FAMILY_FLUX1,
     "flux.2":  DIFFUSER_FAMILY_FLUX2,
     "sdxl":    DIFFUSER_FAMILY_SDXL,
     FAMILY_OVERRIDE_SDXL_FULL.lower():  DIFFUSER_FAMILY_SDXL,
@@ -545,8 +598,32 @@ def get_family_override() -> Optional[str]:
     return _family_override
 
 
+def _flux_arch_tiebreak(low: str) -> str:
+    """Split a bare general.architecture=flux between the two Flux families.
+
+    Called only when the metadata is genuinely ambiguous.
+
+    FLUX.1 tokens are tested FIRST, and the order is load-bearing rather than
+    cosmetic. pyys/Persephone-Flux-2.0 is a FLUX.1-dev finetune whose author
+    versioned it "2.0", and normalize_model_name() flattens the separators, so
+    by the time the patterns run the name reads "flux 2 0" and no lookahead on
+    the flux2 pattern can tell that decimal from a real Flux.2. The specific
+    token ("persephone") has to win over the generic one. Nothing in the FLUX.1
+    list can match a genuine Klein filename, so the reverse risk is nil.
+
+    An unrecognised name defaults to FLUX.1, whose DiT + clip_l + t5xxl layout
+    is both the older packaging and by far the more common one on HuggingFace."""
+    for pat in DIFFUSER_FLUX1_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_FLUX1
+    for pat in DIFFUSER_FLUX2_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_FLUX2
+    return DIFFUSER_FAMILY_FLUX1
+
+
 def diffuser_family(name: str, arch: str = "") -> Optional[str]:
-    """Return DIFFUSER_FAMILY_FLUX2 / DIFFUSER_FAMILY_ZIMAGE / None.
+    """Return one of the DIFFUSER_FAMILY_* constants, or None.
 
     Architecture metadata wins when present (same policy as classify_model());
     the FILENAME is the fallback. Flux2 is tested before Z-Image.
@@ -565,14 +642,21 @@ def diffuser_family(name: str, arch: str = "") -> Optional[str]:
         return _family_override
 
     a = str(arch).strip().lower()
+    low = normalize_model_name(name)
     if a:
         if a in DIFFUSER_FLUX2_ARCH:
             return DIFFUSER_FAMILY_FLUX2
+        if a in DIFFUSER_FLUX_AMBIGUOUS_ARCH:
+            # Both Flux families answer to this one. Metadata has said all it
+            # can, so hand the decision to the filename rather than guessing.
+            return _flux_arch_tiebreak(low)
         if a in DIFFUSER_ZIMAGE_ARCH:
             return DIFFUSER_FAMILY_ZIMAGE
         if a in DIFFUSER_SDXL_ARCH:
             return DIFFUSER_FAMILY_SDXL
-    low = normalize_model_name(name)
+    for pat in DIFFUSER_FLUX1_NAME_PATTERNS:
+        if re.search(pat, low):
+            return DIFFUSER_FAMILY_FLUX1
     for pat in DIFFUSER_FLUX2_NAME_PATTERNS:
         if re.search(pat, low):
             return DIFFUSER_FAMILY_FLUX2
@@ -719,7 +803,17 @@ def vae_families(name: str) -> set:
             return {DIFFUSER_FAMILY_SDXL}
     for pat in VAE_ZIMAGE_NAME_PATTERNS:
         if re.search(pat, low):
-            return {DIFFUSER_FAMILY_ZIMAGE}
+            # TWO families, which is the case this function was built as a set
+            # for. ae.safetensors is the Flux.1 autoencoder and Z-Image reuses
+            # it verbatim, so it is correct for both and the property of
+            # neither. Returning one family made vae_family() name that one,
+            # and the cross-family check in display._resolve_vae then blanked a
+            # perfectly good ae.safetensors the moment a FLUX.1 model was
+            # picked. Two entries make vae_family() return None -- "no single
+            # right answer" -- which is exactly right, while inference.py's
+            # mismatch check tests membership rather than equality and so
+            # keeps passing for both.
+            return {DIFFUSER_FAMILY_ZIMAGE, DIFFUSER_FAMILY_FLUX1}
     return set()
 
 
@@ -1974,9 +2068,13 @@ def _default_configuration() -> Dict[str, Any]:
         # which condition through the Qwen3 encoder_model_path instead.
         "clip_l_model_path":   "",  "clip_l_model_name":   "",
         "clip_g_model_path":   "",  "clip_g_model_name":   "",
+        # T5-XXL, FLUX.1's second text encoder. Accepts .safetensors or .gguf;
+        # a gguf quant is strongly preferred because this runs on the CPU and
+        # t5xxl_fp16 is 9.8GB of system RAM for one conditioning pass.
+        "t5xxl_model_path":    "",  "t5xxl_model_name":    "",
         # img2img denoise strength: 0.0 returns the init image untouched, 1.0
-        # ignores it entirely. sd.cpp's own default is 0.75.
-        "imagegen_strength": 0.75,
+        # ignores it entirely. sd.cpp's own default is 0.75, but I use 0.65.
+        "imagegen_strength": 0.65,
         # v-prediction override for SDXL finetunes; see sdxl_prediction_override.
         "imagegen_prediction": PREDICTION_AUTO,
         # Manual model-family override for files auto-detection cannot place;
