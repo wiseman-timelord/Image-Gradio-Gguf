@@ -2043,7 +2043,7 @@ def _build_config_tab_inner() -> None:
     # legitimately misses and the user has to be able to point at the one they
     # already have. Full paths live in the hidden *_path_tb boxes; the visible
     # boxes carry display names only.
-    gr.Markdown("### Model Paths")
+    gr.Markdown("### Generation Model Files")
     _cfg_w["enc_path_tb"]  = gr.Textbox(value=cfg.get("encoder_model_path", ""),  visible=False)
     _cfg_w["diff_path_tb"] = gr.Textbox(value=cfg.get("imagegen_model_path", ""), visible=False)
     _cfg_w["vae_path_tb"]  = gr.Textbox(value=cfg.get("vae_model_path", ""),      visible=False)
@@ -2195,7 +2195,6 @@ def _build_config_tab_inner() -> None:
                 value=_cfg_pack_label, visible=bool(_cfg_pack_label))
 
         with gr.Column(scale=1):
-            gr.Markdown("### Image Generation Settings")
             with gr.Row():
                 _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
                                           choices=configure.CLIP_SKIP_CHOICES,
@@ -2262,7 +2261,6 @@ def _build_config_tab_inner() -> None:
 
         # ── Encoder (LLM) settings (RIGHT) ──
         with gr.Column(scale=1):
-            gr.Markdown("### Encoder (LLM) Settings")
             with gr.Row():
                 _cfg_w["enc_batch_dd"] = gr.Dropdown(label="Batch Size",
                                            choices=configure.BATCH_SIZE_CHOICES,
