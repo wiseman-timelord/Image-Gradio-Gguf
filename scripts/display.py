@@ -508,8 +508,21 @@ def _on_diff_path_change_slots(path: str, cur_l_path: str, cur_g_path: str,
     deliberate and safe -- they compute the identical answer from the identical
     inputs, exactly as the VAE handler above already double-fires.
 
-    Returns 14 updates: three path/name pairs, the encoder relabel, three
-    browse/clear button pairs, and the packaging status line."""
+    It ALSO resets the Model Family override to Auto, which is the fix for a
+    trap that cost a debugging session. The override is one global setting
+    persisted in configuration.json, not a per-model note: set it to Flux.1 to
+    force one stubborn file, pick a Klein model afterwards, and the Klein is
+    still driven as Flux.1. Both symptoms of that are silent and neither
+    mentions the override -- Denoise Strength appears on a model that has no
+    --strength, and the Use All / Chain All switch vanishes on the one family
+    that can actually fuse references, because both are read off img2img in
+    the spec the override chose. An override is an answer to "what is THIS
+    file", so a different file must re-ask the question.
+
+    Returns 15 updates: three path/name pairs, the encoder relabel, three
+    browse/clear button pairs, the packaging status line, and the family
+    dropdown."""
+    configure.set_family_override(configure.FAMILY_OVERRIDE_AUTO)
     slots = _needed_slots(path)
     if slots["clip_l"] or slots["clip_g"]:
         l_path, l_name, g_path, g_name = _resolve_clips(path, cur_l_path, cur_g_path)
@@ -527,7 +540,8 @@ def _on_diff_path_change_slots(path: str, cur_l_path: str, cur_g_path: str,
     return (l_path, _merge(l_name, l_vis),
             g_path, _merge(g_name, g_vis),
             t5_path, _merge(t5_name, t5_vis),
-            enc_u, l_vis, l_vis, g_vis, g_vis, t5_vis, t5_vis, pack)
+            enc_u, l_vis, l_vis, g_vis, g_vis, t5_vis, t5_vis, pack,
+            gr.update(value=configure.FAMILY_OVERRIDE_AUTO))
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +1197,7 @@ def _build_generate_tab_inner() -> None:
                     )
             _gen["negative_history_state"] = gr.State(False)
 
-            gr.Markdown("#### Submitting Input (check settings)")
+            gr.Markdown("#### Submitting Input")
             with gr.Row(visible=configured) as _gen["generate_row"]:
                 # Single dynamic button: "Generate" (primary) when idle,
                 # "..Please Wait.." (disabled) while running. do_generate()
@@ -2060,6 +2074,17 @@ def _build_config_tab_inner() -> None:
     _cfg_needs_t5 = _cfg_slots["t5xxl"]
     _cfg_pack_label = configure.sdxl_packaging_label(cfg.get("imagegen_model_path", ""))
 
+    # Initial interactive/value state for the two GPU-dependent controls
+    # below is driven by the ACTUAL selected backend, not just install type.
+    # A Vulkan-capable install with "CPU" currently selected must still show
+    # GPU Layers / Diffuser Placement as locked at their CPU-forced values —
+    # otherwise the controls look interactive but silently have no effect,
+    # which was the root of the original bug report.
+    enc_backend_val = _default_backend_value("backend_encoder")
+    enc_is_vulkan   = (not is_cpu_only) and ("Vulkan" in enc_backend_val)
+    img_backend_val = _default_backend_value("backend_imagegen")
+    img_is_vulkan   = (not is_cpu_only) and ("Vulkan" in img_backend_val)
+
     with gr.Row():
         # ── Left column: the IMAGE GENERATOR's files ──────────────────────
         # Everything sd-cli loads for a run, largest first: diffusion
@@ -2068,6 +2093,25 @@ def _build_config_tab_inner() -> None:
         # process, for one image. The CLIP pair are the diffuser's own text
         # encoders (sd-cli --clip_l / --clip_g), not a user-swappable choice.
         with gr.Column(scale=1):
+            # Model Family sits ABOVE the diffusion model it describes, and is
+            # the first thing on the page for a reason: it decides which of
+            # the boxes below are even shown. Reading it after the boxes it
+            # governs made the page look like it was rearranging itself for no
+            # visible reason.
+            with gr.Row():
+                # Escape hatch for models auto-detection cannot place. sd.cpp-
+                # native full checkpoints carry no architecture metadata, and
+                # many SDXL finetunes are named with no "xl" token at all
+                # (artiwaifu-diffusion-v1 is an SDXL 1.0 finetune), so both
+                # detection inputs come up empty and the model would silently
+                # fall back to the Z-Image command line.
+                _cfg_w["img_family_dd"] = gr.Dropdown(
+                    label="Model Family",
+                    choices=configure.FAMILY_OVERRIDE_CHOICES,
+                    value=cfg.get("imagegen_family_override",
+                                  configure.FAMILY_OVERRIDE_AUTO),
+                    info="Set this if a model is not detected correctly.",
+                )
             with gr.Row():
                 _cfg_w["diff_name_tb"] = gr.Textbox(
                     label="Diffusion Name",
@@ -2150,44 +2194,7 @@ def _build_config_tab_inner() -> None:
             _cfg_w["pack_status_md"] = gr.Markdown(
                 value=_cfg_pack_label, visible=bool(_cfg_pack_label))
 
-        # ── Right column: the separate LLM encoder ────────────────────────
-        # A different program entirely: a Qwen3 gguf run through llama.cpp,
-        # in its own process, before sd-cli is invoked. For Z-Image and
-        # Flux.2 it is the conditioner and is mandatory; for SDXL it cannot
-        # condition anything (see _encoder_slot_updates) and is used only to
-        # expand the prompt text. Kept apart from the left column so the two
-        # roles are not read as interchangeable.
         with gr.Column(scale=1):
-            with gr.Row():
-                _cfg_w["enc_name_tb"] = gr.Textbox(
-                    label=_ENC_LABEL_CONDITIONER if _cfg_enc_cond else _ENC_LABEL_ENHANCER,
-                    value=cfg.get("encoder_model_name", ""),
-                    placeholder="Qwen3-4b-Z-Image-Turbo",
-                    info=_ENC_INFO_CONDITIONER if _cfg_enc_cond else _ENC_INFO_ENHANCER,
-                    interactive=True,
-                    scale=8,
-                )
-                with gr.Column(scale=1, min_width=90):
-                    _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm")
-                    _cfg_w["enc_clear_btn"] = gr.Button("Clear", size="sm")
-
-    # Initial interactive/value state for the two GPU-dependent controls
-    # below is driven by the ACTUAL selected backend, not just install type.
-    # A Vulkan-capable install with "CPU" currently selected must still show
-    # GPU Layers / Diffuser Placement as locked at their CPU-forced values —
-    # otherwise the controls look interactive but silently have no effect,
-    # which was the root of the original bug report.
-    enc_backend_val = _default_backend_value("backend_encoder")
-    enc_is_vulkan   = (not is_cpu_only) and ("Vulkan" in enc_backend_val)
-    img_backend_val = _default_backend_value("backend_imagegen")
-    img_is_vulkan   = (not is_cpu_only) and ("Vulkan" in img_backend_val)
-
-    with gr.Row():
-        # ── Image generation settings (LEFT) ──
-        # Kept in the same left/right order as the Model Paths row above:
-        # image-generator things on the left, the separate LLM encoder on
-        # the right. The two rows read as two columns, not a zigzag.
-        with gr.Column(scale=2):
             gr.Markdown("### Image Generation Settings")
             with gr.Row():
                 _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
@@ -2205,20 +2212,6 @@ def _build_config_tab_inner() -> None:
                     info="Auto detects v-pred from the filename.",
                 )
             with gr.Row():
-                # Escape hatch for models auto-detection cannot place. sd.cpp-
-                # native full checkpoints carry no architecture metadata, and
-                # many SDXL finetunes are named with no "xl" token at all
-                # (artiwaifu-diffusion-v1 is an SDXL 1.0 finetune), so both
-                # detection inputs come up empty and the model would silently
-                # fall back to the Z-Image command line.
-                _cfg_w["img_family_dd"] = gr.Dropdown(
-                    label="Model Family",
-                    choices=configure.FAMILY_OVERRIDE_CHOICES,
-                    value=cfg.get("imagegen_family_override",
-                                  configure.FAMILY_OVERRIDE_AUTO),
-                    info="Set this if a model is not detected correctly.",
-                )
-            with gr.Row():
                 # sd.cpp has no per-layer GPU offload for the diffuser (no
                 # -ngl equivalent) — only whole-component placement, so this
                 # is a 3-way choice rather than a layer-count dropdown. See
@@ -2234,8 +2227,41 @@ def _build_config_tab_inner() -> None:
                     interactive=img_is_vulkan,
                 )
 
+
+        # ── Right column: the separate LLM encoder ────────────────────────
+        # A different program entirely: a Qwen3 gguf run through llama.cpp,
+        # in its own process, before sd-cli is invoked. For Z-Image and
+        # Flux.2 it is the conditioner and is mandatory; for SDXL it cannot
+        # condition anything (see _encoder_slot_updates) and is used only to
+        # expand the prompt text. Kept apart from the left column so the two
+        # roles are not read as interchangeable.
+    # ── Encoder row ──────────────────────────────────────────────────────
+    # The page is now two rows of one subject each, rather than two rows that
+    # each mix both. Row 1 is everything sd-cli loads and every setting that
+    # shapes the image; row 2 is the Qwen3 LLM and its settings. The encoder
+    # path used to sit beside the diffusion files, which read as though it
+    # were another file sd-cli loads -- it is not. It runs in a separate
+    # llama.cpp process before sd-cli is invoked, and for SDXL and FLUX.1 it
+    # never reaches sd-cli at all.
+    gr.Markdown("### Encoder Model")
+    with gr.Row():
+        # ── Encoder model path (LEFT) ──
+        with gr.Column(scale=1):
+            with gr.Row():
+                _cfg_w["enc_name_tb"] = gr.Textbox(
+                    label=_ENC_LABEL_CONDITIONER if _cfg_enc_cond else _ENC_LABEL_ENHANCER,
+                    value=cfg.get("encoder_model_name", ""),
+                    placeholder="Qwen3-4b-Z-Image-Turbo",
+                    info=_ENC_INFO_CONDITIONER if _cfg_enc_cond else _ENC_INFO_ENHANCER,
+                    interactive=True,
+                    scale=8,
+                )
+                with gr.Column(scale=1, min_width=90):
+                    _cfg_w["enc_browse_btn"] = gr.Button("Browse...", size="sm")
+                    _cfg_w["enc_clear_btn"] = gr.Button("Clear", size="sm")
+
         # ── Encoder (LLM) settings (RIGHT) ──
-        with gr.Column(scale=2):
+        with gr.Column(scale=1):
             gr.Markdown("### Encoder (LLM) Settings")
             with gr.Row():
                 _cfg_w["enc_batch_dd"] = gr.Dropdown(label="Batch Size",
@@ -2534,7 +2560,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
                  w["clip_l_browse_btn"], w["clip_l_clear_btn"],
                  w["clip_g_browse_btn"], w["clip_g_clear_btn"],
                  w["t5xxl_browse_btn"], w["t5xxl_clear_btn"],
-                 w["pack_status_md"]],
+                 w["pack_status_md"], w["img_family_dd"]],
     )
 
     def save_all(ep, en, dp, dn, vp, vn,
