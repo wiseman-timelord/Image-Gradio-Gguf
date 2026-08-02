@@ -77,7 +77,7 @@ Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
 qwen_3_4b.Q#.gguf              (plain Qwen3-4B)
 Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
 ```
-- Image models:
+- Image models (Only 1):
 ```
 z_image_turbo-Q#.gguf
 
