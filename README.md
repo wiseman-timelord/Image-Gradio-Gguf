@@ -66,6 +66,7 @@ I put Q# because it should support any quantization, the model variety will be e
 - All encoders and image models are **GGUF** — on [HuggingFace](https://huggingface.co) look for the GGUF builds (any quantization, shown here as `Q#`). Each family also needs one `.safetensors` VAE, downloaded once.
 - Encoder rule: the encoder size must match the image model — Qwen3-**4B** for Z-Image-Turbo and Flux.2-klein-**4B**, Qwen3-**8B** for Flux.2-klein-**9B**. The program auto-detects this and warns on a mismatch. One Qwen3-4B encoder serves both Z-Image-Turbo and klein-4B. Qwen3-VL models work as text-only encoders (no mmproj needed); Qwen2.5 encoders are **not** compatible with Flux.2.
  - The lists below show most of the models advised currently for use with this program, though other stuff may work I have been too busy with development to find the REALLY GOOD MODELS, but there are specific websites for that. Models not on the list would also have to be AI verified to be compatible, ie the models used in the program are sometimes NOT the normal GGUF model, and they either do or dont have bits included. 
+- For reference of memory usage. In testing with flux2 klein-4b, it can generate a 512x512 image, while adding 2 images for Use All mode, on an 8GB GPU with diffuser placement split, while, 768x512 or with 3 images, will cause out of memory  issues on 8GB VRAM.
 
 #### Z-Image-Turbo
 
@@ -106,7 +107,7 @@ Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
 Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
 flux2-klein-4b-uncensored-q#.gguf and qwen3-4b-abl-q#.gguf (same model)
 ```
-Image models (For reference of memory usage. In testing with flux2 klein-4b, it can generate a 512x512 image, while adding 2 images for Use All mode, on an 8GB GPU with diffuser placement split, while, 768x512 or with 3 images, will cause out of memory  issues on 8GB VRAM):
+Image models (Only 1):
 ```
 flux-2-klein-4b-Q#.gguf
 flux-2-klein-base-4b-Q#.gguf
@@ -118,7 +119,7 @@ diffusion_pytorch_model.safetensors
 
 #### Flux.2-klein 9B
 Untested, but presumably it can do SFW and has good Img2Img...
-- Encoders — Qwen3-8B:
+- Encoders — (only 1):
 ```
 Qwen3-8b-erotic-heretic-Q#.gguf
 Qwen3-8B-Gemini-2.5-Flash-Uncensored-Q#.gguf
@@ -126,7 +127,7 @@ qwen_3_8b.Q#.gguf              (plain Qwen3-8B)
 qwen3-vl-flux2-8b-Q#.gguf      (VL, text-only)
 Qwen3-VL-8B*.Q#.gguf           (VL, text-only)
 ```
-- Image models:
+- Image models (only 1):
 ```
 flux-2-klein-9b-Q#.gguf
 flux-2-klein-base-9b-Q#.gguf
@@ -142,7 +143,7 @@ It can do SFW, but the Img2Img is, similar to SDXL and NOT as good as Flux2...
 ```
 Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
 ```
-- Here we have the main image generation model (only one), the Vanilla [FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) or the (much larger) NSFW [Persephone-Flux-2.0-Q8-GGUF](https://huggingface.co/pyys/Persephone-Flux-2.0-Q8-GGUF), file...
+- Here we have the main image generation model, the Vanilla [FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) or the (much larger) NSFW [Persephone-Flux-2.0-Q8-GGUF](https://huggingface.co/pyys/Persephone-Flux-2.0-Q8-GGUF), file (only 1)...
 ```
 flux1-schnell-Q#.gguf
 Persephone-Flux-2.0-Q#-GGUF
