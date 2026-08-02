@@ -150,7 +150,7 @@ ae.safetensors                   ~335 MB   ← from vae folder
 ```
 - Other encoder file (required also) from [t5-v1_1-xxl-encoder-gguf](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)
 ```
-t5-v1_1-xxl-encoder-Q4_K_M.gguf
+t5-v1_1-xxl-encoder-Q#.gguf
 ```
 - The clip file (required also) from [flux_text_encoders](https://huggingface.co/comfyanonymous/flux_text_encoders)
 ```
@@ -165,7 +165,7 @@ Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
 ```
 - Here we have the main [SDXL Turbo GGUF](https://huggingface.co/OlegSkutte/sdxl-turbo-GGUF) file...
 ```
-sd_xl_turbo_1.0.q.gguf
+sd_xl_turbo_1.0.q#.gguf
 ```
 - Here is the VAE file from  [SDXL Model files Collection](https://huggingface.co/hum-ma/SDXL-models-GGUF)...
 ```
@@ -188,7 +188,7 @@ Currently...
 
 ### Notation:
 - Clarifying, SDXL Turbo and Flux1 Schnell, Img to Img is bad, its just like a morph between prompt image and the selected image, while Flux2 4b, uses specific instructed parts in the generated image.
-- Flux1, Flux2, Z-Image Turbo are all SFW, where as SDXL is, SFW and NSFW. Using two different models in 2 stage process, can possibly work, but best solution would be a NSFW trained version of Flux2. 
+- Flux1, Flux2, Z-Image Turbo are all SFW, where as SDXL is, SFW and NSFW. Using Flux2 then SDXL in 2 stage process, can possibly work, but best solution would be a NSFW trained version of Flux2. 
 - If you want to generate a 1024x1024 size image, be aware, this creates ~3GB of overhead on the GPU if thats where the Image Generation model is loaded, while a 768x768 image would have ~1.8GB of overhead...consider such things when it tells you it ran out of ram.
 - The assessment by OPUS said, the reason why I could not fit Q4 ImageGen model with DP on Full while could fit Q8 ImageGen model with DP on Split, is because the difference between DP on Split or FUll, is up to 4.6GB extra on top. Keep in mind the models are done in 1-shot mode not m-lock.
 - Something to consider is how much memory the Image model takes, image models need more space when loaded compared to a text model, if yo uneed more room for the image model then try Diffuser Placement is set to Split. So some tweaking settings may be requried with low VRAM. 
