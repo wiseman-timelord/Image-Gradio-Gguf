@@ -65,7 +65,7 @@ I put Q# because it should support any quantization, the model variety will be e
 ### Models (Advanced Details)
 - All encoders and image models are **GGUF** — on [HuggingFace](https://huggingface.co) look for the GGUF builds (any quantization, shown here as `Q#`). Each family also needs one `.safetensors` VAE, downloaded once.
 - Encoder rule: the encoder size must match the image model — Qwen3-**4B** for Z-Image-Turbo and Flux.2-klein-**4B**, Qwen3-**8B** for Flux.2-klein-**9B**. The program auto-detects this and warns on a mismatch. One Qwen3-4B encoder serves both Z-Image-Turbo and klein-4B. Qwen3-VL models work as text-only encoders (no mmproj needed); Qwen2.5 encoders are **not** compatible with Flux.2.
- - The lists below show most of the stuff I would even try to use with this program, though other stuff may work, I would get AI to check it first. Ie, is this encoder compatible with this image generation model, or is this image generation model compatible with this program (providing inference, configure, display, launcher, scripts). 
+ - The lists below show most of the models advised currently for use with this program, though other stuff may work I have been too busy with development to find the REALLY GOOD MODELS, but there are specific websites for that. Models not on the list would also have to be AI verified to be compatible, ie the models used in the program are sometimes NOT the normal GGUF model, and they either do or dont have bits included. 
 
 #### Z-Image-Turbo
 
