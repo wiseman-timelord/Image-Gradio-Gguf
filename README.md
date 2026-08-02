@@ -143,10 +143,12 @@ It can do SFW, but the Img2Img is, similar to SDXL and NOT as good as Flux2...
 ```
 Huihui-Qwen3-VL-4B-Instruct-abliterated-Q#.gguf
 ```
-- Here we have the main image generation model, the Vanilla [FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) or the (much larger) NSFW [Persephone-Flux-2.0-Q8-GGUF](https://huggingface.co/pyys/Persephone-Flux-2.0-Q8-GGUF), file (only 1)...
+- Here we have the main image generation model, the Vanilla model [FLUX.1-schnell-gguf](https://huggingface.co/city96/FLUX.1-schnell-gguf) or NSFW models such as [FLUX.1-dev-FluxedUp-V10-GGUF](https://huggingface.co/h4shy/FLUX.1-dev-FluxedUp-V10-GGUF), (only 1)...
 ```
 flux1-schnell-Q#.gguf
-Persephone-Flux-2.0-Q#-GGUF
+
+(needs testing)
+fluxedup-v10-q4_0.gguf
 ```
 - Here is the VAE file from [SDXL Model files Collection](https://huggingface.co/hum-ma/SDXL-models-GGUF), using this one bypasses the prompt rejection filter...
 ```
