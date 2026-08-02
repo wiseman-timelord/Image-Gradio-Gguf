@@ -69,7 +69,7 @@ I put Q# because it should support any quantization, the model variety will be e
 
 #### Z-Image-Turbo
 
-- Encoders — Qwen3-4B:
+- Encoders (only 1):
 ```
 Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
 Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
@@ -79,6 +79,8 @@ Qwen3-VL-4B*.Q#.gguf           (VL, text-only)
 - Image models:
 ```
 z_image_turbo-Q#.gguf
+
+(these need testing, but may not work)
 darkBeastMar1526Latest_dbzit8SDAFOK-Q#.gguf
 darkBeastMar2126Latest_dbzit9DIMRclaw-Q#.gguf
 eventHorizon_zitV10-Q#.gguf
@@ -95,7 +97,7 @@ ae.safetensors
 
 #### Flux.2-klein 4B
 It can do SFW and has good Img2Img...
-Encoders — Qwen3-4B (same set as Z-Image-Turbo):
+Encoders — (only 1):
 ```
 Qwen3-4b-Z-Image-Turbo-AbliteratedV1.Q#.gguf
 Qwen3-4b-Uncensored-Z-Image-Engineer-V4-Q#.gguf
