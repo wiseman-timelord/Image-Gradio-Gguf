@@ -2008,13 +2008,14 @@ def _build_config_tab_inner() -> None:
     # and locks both dropdowns — it just does not announce itself.
     is_cpu_only = configure.get_install_type() == "cpu_only"
 
-    gr.Markdown("### Backend Selection (model loading is one-shot)")
+    gr.Markdown("### Backend Selection")
     with gr.Row():
+
         with gr.Column(scale=2):
-            _cfg_w["enc_backend_dd"] = gr.Dropdown(
-                label="Encoder Backend",
+            _cfg_w["img_backend_dd"] = gr.Dropdown(
+                label="ImageGen Backend",
                 choices=choices,
-                value=_default_backend_value("backend_encoder"),
+                value=_default_backend_value("backend_imagegen"),
                 interactive=not is_cpu_only,
             )
 
@@ -2026,10 +2027,10 @@ def _build_config_tab_inner() -> None:
             )
 
         with gr.Column(scale=2):
-            _cfg_w["img_backend_dd"] = gr.Dropdown(
-                label="ImageGen Backend",
+            _cfg_w["enc_backend_dd"] = gr.Dropdown(
+                label="Encoder Backend",
                 choices=choices,
-                value=_default_backend_value("backend_imagegen"),
+                value=_default_backend_value("backend_encoder"),
                 interactive=not is_cpu_only,
             )
 
