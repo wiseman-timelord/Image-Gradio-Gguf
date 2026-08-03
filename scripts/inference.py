@@ -814,7 +814,17 @@ def enhance_prompt(prompt: str, cfg: Dict[str, Any],
         "--flash-attn", "auto",
     ]
 
-    backend = cfg.get("backend_encoder", "CPU")
+    # The Configuration page's "Processing Method" -- one choice governing both
+    # this encoder pass and the sd-cli pass that follows. It replaced the
+    # separate backend_encoder / backend_imagegen pair; the old keys are read
+    # as a fallback so a configuration.json written before the merge still
+    # selects the right device on its first load, rather than silently
+    # dropping to CPU. configure._migrate_split_backends() folds them away
+    # permanently on the next save.
+    backend = (cfg.get("backend_processing")
+               or cfg.get("backend_encoder")
+               or cfg.get("backend_imagegen")
+               or "CPU")
     use_vulkan = "Vulkan" in backend
     env = os.environ.copy()
 

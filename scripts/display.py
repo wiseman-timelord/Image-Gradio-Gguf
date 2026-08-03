@@ -80,6 +80,18 @@ def _prefs() -> Dict[str, Any]:
     return configure.load_preferences()
 
 
+def _gcfg() -> Dict[str, Any]:
+    """Fresh load of data/generation.json — the Generation page's own file.
+
+    The third of the three settings files, and read the same deliberate way as
+    the other two: this page's widgets are seeded from here and nowhere else,
+    so a Generation setting can never be silently written by a Configuration
+    or Preferences save. inference.py still receives ONE merged dict — see
+    configure.generation_config(), which do_generate() uses.
+    """
+    return configure.load_generation()
+
+
 _FILETYPES_MODEL = [
     ("Model files", "*.gguf *.safetensors"),
     ("GGUF",        "*.gguf"),
@@ -213,7 +225,7 @@ def _backend_choices() -> List[str]:
 
 def _default_backend_value(key: str) -> str:
     """
-    Load the saved backend string; if it's no longer in the current
+    Load the saved Processing Method string; if it's no longer in the current
     choices list (e.g. GPU was removed, or this is a fresh install with
     a newly-branded CPU label), fall back to the CPU entry.
     """
@@ -626,6 +638,75 @@ def _idle_preview_image() -> Optional[str]:
 # Module-level refs so _wire_generate_events() can access them
 _gen: Dict[str, Any] = {}
 
+# The gr.Blocks object build_app() creates, kept so _allow_local_files() can
+# extend its allowed_paths list at runtime. See that function for why.
+_blocks_app: Optional[Any] = None
+
+
+def _allow_local_files(paths: List[str]) -> None:
+    r"""Permit Gradio to serve specific files from outside the project folder.
+
+    THE PROBLEM. Gradio refuses to serve any file that is not under the current
+    working directory, the system temp directory, its own cache, or an explicit
+    allowed_paths entry — it raises InvalidPathError rather than silently
+    leaking. That is the right default. But the Input thumbnail gallery shows
+    the user's OWN reference images, which live wherever they keep their
+    pictures: G:\Pictures\..., a NAS share, an external drive. Handing the
+    gallery one of those paths therefore blew up the whole Add Image handler:
+
+        InvalidPathError: Cannot move G:\Pictures\foo.jpg to the gradio cache
+        dir because it was not created by the application ...
+
+    This did not happen before the gallery existed, because the reference list
+    was a Textbox showing FILENAMES — text, never served as a file. The moment
+    an actual image component points at those paths, they have to be allowed.
+
+    WHY NOT allowed_paths AT LAUNCH. launch() overwrites blocks.allowed_paths
+    with whatever it is handed, and it is handed it exactly once at startup —
+    long before the user has browsed anywhere. There is no set of folders we
+    could name up front that would cover "wherever they pick images from next".
+
+    WHY THIS WORKS. Both of Gradio's checks — the postprocess one in
+    processing_utils._check_allowed and the request-time one in
+    route_utils — read blocks.allowed_paths LIVE on each call rather than
+    capturing it at launch. Appending to that list in place therefore takes
+    effect immediately, for both the outbound update and the browser's
+    subsequent fetch of the image.
+
+    EXACT FILES, NOT FOLDERS. Each individual file is registered, never its
+    parent directory. Gradio's is_allowed_file() treats an allowed_paths entry
+    that IS the file as a match, so this is sufficient — and it means picking
+    one image out of a folder does not quietly make every other file in that
+    folder fetchable over the loopback port. The list grows by one entry per
+    image the user deliberately chose, and by nothing else.
+
+    Silent on failure: a Gradio internals change that renames or retypes
+    allowed_paths must degrade to the old "that image will not display"
+    behaviour, not take down the Add Image click that triggered it.
+    """
+    app = _blocks_app
+    if app is None:
+        return
+    try:
+        allowed = app.allowed_paths
+        if not isinstance(allowed, list):
+            return
+        known = {str(p) for p in allowed}
+        for p in paths or []:
+            if not p:
+                continue
+            try:
+                resolved = str(Path(str(p)).resolve())
+            except OSError:
+                continue
+            if resolved not in known:
+                # append() rather than reassignment: other parts of Gradio
+                # hold a reference to this same list object.
+                allowed.append(resolved)
+                known.add(resolved)
+    except Exception:
+        pass
+
 
 # SDXL's text encoders are FIXED by architecture: CLIP-L (OpenCLIP ViT-L/14,
 # 768-dim) and CLIP-G (ViT-bigG/14, 1280-dim), concatenated to the 2048-dim
@@ -636,7 +717,7 @@ _gen: Dict[str, Any] = {}
 # prompt text before sd-cli ever sees it). Z-Image and Flux.2 are the opposite:
 # there the Encoder IS the conditioner and is mandatory.
 _ENC_LABEL_CONDITIONER = "Encoder Name"
-_ENC_LABEL_ENHANCER    = "Encoder Name (optional)"
+_ENC_LABEL_ENHANCER    = "External Encoder (optional)"
 _ENC_INFO_CONDITIONER  = "Qwen3 text encoder — required; conditions the diffuser."
 _ENC_INFO_ENHANCER     = ("Optional — used only to expand the prompt text. "
                           "This diffuser conditions through its own encoders "
@@ -870,31 +951,46 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
                              cur_width: Any = None, cur_height: Any = None
                              ) -> Tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
     """(settings_header, ref_row, status, sampler_dd, steps_dd, cfg_scale_sld,
-    width_dd, height_dd) for the current diffuser.
+    width_dd, height_dd, strength_sld, ref_mode_radio, batch_dd,
+    output_fmt_dd, seed_num, preset_dd) for the current diffuser.
 
-    Keeps the "Settings (Flux 2 / Z-Image-Turbo / no model selected)" header and
-    the Flux.2-only controls in step with whatever model is set, flashes any
-    encoder/VAE compatibility problem on arrival, leaves the Sampler untouched
-    (euler_a default suits both families), and swaps the Diffuse Steps, CFG-Scale
-    and Width/Height choices to the set that fits the family: distilled klein →
-    steps 4-8, cfg ~1.0, sizes 512-1536; klein-base → ~20 steps, cfg ~4; Z-Image
-    → 8 steps, cfg ~1-2, sizes 256-1536. (Flux.2's 512 floor is deliberate — it
-    degrades below that.)
+    Keeps the Settings header, the input-image row and every generation control
+    in step with whatever model is set, and flashes any encoder/VAE
+    compatibility problem on arrival.
 
-    Current steps/cfg/width/height are passed in so a value already valid for the
-    new family is KEPT (no clobbering a deliberate choice); only an out-of-range
-    value is snapped to the family default. Returned in the generate_tab.select
-    outputs order.
+    Two distinct jobs, and the distinction is the whole point:
 
-    That "keep what is valid" rule applies WITHIN a family only. On a change of
-    family the values are snapped to the new family's defaults even when they
-    would pass the range test, because the same number means different things
-    to different families: cfg 1.5 is correct for a distilled model and badly
-    wrong for SDXL base (which wants ~7), yet 1.5 sits inside SDXL's 1.0-12.0
-    range and would survive as a silently bad setting. Steps behave the same
-    way -- 8 is a full run for Z-Image and a quarter of one for SDXL base.
+      WITHIN a family, only the CHOICE LISTS are retuned (steps dropdown
+      contents, cfg slider range, width/height options). A value the user has
+      deliberately set is kept as long as it is still valid, because nothing
+      about the model changed.
+
+      ON a family CHANGE, the entire settings panel is snapped to that model's
+      defaults -- steps, cfg, sampler, batch count, strength, seed, output
+      format, quality preset and resolution -- from
+      configure.family_generation_defaults(). This is deliberate and not a
+      convenience: the same number means different things to different
+      families. cfg 1.5 is correct for a distilled model and badly wrong for
+      SDXL base (which wants ~7), yet it sits inside SDXL's 1.0-12.0 range and
+      would survive a pure range test as a silently bad setting. 8 steps is a
+      full run for Z-Image and a quarter of one for FLUX.1 dev. euler_a is
+      right for Flux.2 and wrong for SDXL base.
+
+    The two PROMPTS are never touched by either path. They are the user's own
+    text, they are not model-specific, and losing a carefully written prompt
+    because the model was swapped would be indefensible.
+
+    Resolution always lands on 512x512 on a family change (see
+    DEFAULT_GENERATION_WIDTH) regardless of what the family is natively good
+    at -- the compute buffer scales with pixel count, so on an 8GB card 1024 is
+    the difference between running and OOMing. The user raises it deliberately
+    once they know the model loads.
     """
     c = configure.load_configuration()
+    # imagegen_last_family lives in generation.json alongside the steps/cfg/
+    # size values it describes; the model path it is compared against lives in
+    # configuration.json. Hence two loads rather than one.
+    g = configure.load_generation()
     diff = c.get("imagegen_model_path", "")
     fam_label = configure.diffuser_family_label(diff)
     # The input-image column is shown for any family that can take one (Flux.2
@@ -906,22 +1002,22 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
     takes_multi = bool(_spec_now and _spec_now.get("img2img") == "ref")
     ok, msg = inference.check_model_compatibility(c)
     status = gr.update() if ok else gr.update(value="⚠ " + msg)
-    # Sampler is NOT touched by family selection — euler_a is the default for
-    # both families and empirically the better choice for Flux.2 on this build,
-    # so leave whatever the user has set (no reset-to-euler).
-    sampler_upd = gr.update()
 
     spec = configure.family_step_cfg(diff)
+    # The full "optimal settings for this model" set -- the same one the
+    # Restore To Defaults button applies, so a model change and an explicit
+    # restore can never land on different values.
+    defaults = configure.family_generation_defaults(diff)
     step_choices, step_default = spec["steps"]
     cfg_min, cfg_max, cfg_step, cfg_default = spec["cfg"]
 
     # Has the family changed since these values were last saved? If so, the
     # numbers came from a different model class and are not evidence of intent.
     fam_key = configure.family_step_cfg_key(diff)
-    family_changed = fam_key != c.get("imagegen_last_family", "")
+    family_changed = fam_key != g.get("imagegen_last_family", "")
     if family_changed:
         try:
-            configure.update_configuration({"imagegen_last_family": fam_key})
+            configure.update_generation({"imagegen_last_family": fam_key})
         except Exception:
             pass      # a failed write only costs one extra snap next time
 
@@ -940,27 +1036,41 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
                else (cc if (cc is not None and cfg_min <= cc <= cfg_max) else cfg_default))
     cfg_upd = gr.update(minimum=cfg_min, maximum=cfg_max, step=cfg_step, value=cfg_val)
 
-    # Width / height: swap to the family's allowed sizes, keeping a valid current
-    # value, else snapping to 768 (a safe native-ish default for both families).
+    # Width / height: swap to the family's allowed sizes, keeping a valid
+    # current value, else snapping to 768.
     sizes = configure.family_image_sizes(diff)
-    def _size_upd(cur: Any) -> Any:
+    def _size_upd(cur: Any, fallback: int) -> Any:
         try:
             cv = int(cur)
         except (TypeError, ValueError):
             cv = None
         if family_changed:
-            # Always drop back to 512x512 on a model switch. SDXL's NATIVE
-            # resolution is 1024 and it does look better there, but defaulting
-            # to it means every switch risks an immediate OOM on a small card:
-            # 1024 roughly quadruples the compute buffer versus 512. A
-            # conservative default that always runs beats a better-looking one
-            # that sometimes cannot, so the user raises it deliberately once
-            # they know the model loads.
-            return gr.update(choices=sizes,
-                             value=(512 if 512 in sizes else min(sizes)))
+            return gr.update(choices=sizes, value=fallback)
         return gr.update(choices=sizes, value=(cv if cv in sizes else 768))
-    width_upd = _size_upd(cur_width)
-    height_upd = _size_upd(cur_height)
+    width_upd  = _size_upd(cur_width,  defaults["imagegen_width"])
+    height_upd = _size_upd(cur_height, defaults["imagegen_height"])
+
+    # On a family change every remaining setting is snapped to the new model's
+    # defaults too; within a family they are left exactly as the user has them.
+    # Sampler used to be excluded from this on the grounds that euler_a suited
+    # every family -- which stopped being true once SDXL base (dpm++2m) and
+    # FLUX.1 (euler) were supported, and left whichever sampler the previous
+    # model wanted silently applied to the new one.
+    _snap = (lambda key: gr.update(value=defaults[key]) if family_changed
+             else gr.update())
+    sampler_upd = _snap("imagegen_sampling")
+    batch_upd   = _snap("imagegen_batch_count")
+    fmt_upd     = _snap("output_format")
+    seed_upd    = _snap("imagegen_seed")
+    preset_upd  = _snap("imagegen_quality_preset")
+
+    # Strength carries a value as well as its visibility: it is meaningful only
+    # for -i families with an image loaded, but when the family changes the
+    # value underneath still has to become the new family's.
+    _strength_visible = bool(uses_init and configure.get_ref_images())
+    strength_upd = (gr.update(visible=_strength_visible,
+                              value=defaults["imagegen_strength"])
+                    if family_changed else gr.update(visible=_strength_visible))
 
     return (
         gr.update(value=f"### Settings ({fam_label})"),
@@ -971,19 +1081,27 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
         cfg_upd,
         width_upd,
         height_upd,
-        # Strength also requires an image to be loaded, not merely a family
-        # that could accept one.
-        gr.update(visible=bool(uses_init and configure.get_ref_images())),
+        strength_upd,
         # The mode radio depends on the FAMILY as well as the image count, so
         # it is re-synced here: switching from Flux.2 to SDXL on the
         # Configuration page must retract it even though no image changed.
         gr.update(visible=bool(takes_multi and len(configure.get_ref_images()) > 1)),
+        batch_upd,
+        fmt_upd,
+        seed_upd,
+        preset_upd,
     )
 
 
 def _build_generate_tab_inner() -> None:
     """Build Generate tab widgets; store refs in _gen for later wiring."""
     cfg = _cfg()
+    # Every widget on this page is seeded from generation.json (gen), NOT from
+    # configuration.json (cfg). cfg is still needed here, but only for the two
+    # things this page reads rather than owns: the diffusion model path (to
+    # label the Settings header and decide whether the input-image column
+    # appears) and the "is everything configured yet" gate.
+    gen = _gcfg()
     presets = configure.get_generation_presets()
     configured = _models_configured()
 
@@ -997,6 +1115,32 @@ def _build_generate_tab_inner() -> None:
     _initial_family_label = configure.diffuser_family_label(
         cfg.get("imagegen_model_path", ""))
 
+    # Build the family-dependent dropdowns with the CURRENT family's choice
+    # lists, not the generic supersets. _generate_family_updates() swaps them
+    # to exactly these lists on tab-select anyway, but that fires only when the
+    # user CLICKS the tab — and Generation is the first tab, so on launch it
+    # has usually not fired at all.
+    #
+    # This was survivable while the saved values were always in the generic
+    # lists, and stopped being so once generation.json started faithfully
+    # restoring family-tuned ones: a saved 20 steps (flux1_dev, flux2_base) or
+    # 30 (sdxl_base) is not in STEP_CHOICES, and a Dropdown handed a value
+    # outside its choices warns on stdout and does not reliably show it. The
+    # user would open the app to a Diffuse Steps box that had silently lost the
+    # setting their last run used.
+    #
+    # Same three lists, same helper, so this can never disagree with what the
+    # tab-select handler applies a moment later.
+    _initial_diff = cfg.get("imagegen_model_path", "")
+    _initial_steps = configure.family_step_cfg(_initial_diff)["steps"][0]
+    _initial_cfg_rng = configure.family_step_cfg(_initial_diff)["cfg"]
+    _initial_sizes = configure.family_image_sizes(_initial_diff)
+
+    def _seed(value: Any, choices: List[Any], fallback: Any) -> Any:
+        """A saved value if the current family still allows it, else the
+        family's own fallback. Never returns something outside `choices`."""
+        return value if value in choices else fallback
+
     with gr.Row():
         # ── Column 1: settings only ─────────────────────────────────────────
         # Prompts and the Generate button moved to column 2 so the three
@@ -1006,41 +1150,64 @@ def _build_generate_tab_inner() -> None:
             with gr.Row():
                 _gen["preset_dd"] = gr.Dropdown(
                     label="Quality Preset", choices=list(presets.keys()),
-                    value=cfg.get("imagegen_quality_preset", "Fast (Turbo)"),
+                    value=gen.get("imagegen_quality_preset", "Fast (Turbo)"),
                 )
                 _gen["sampler_dd"] = gr.Dropdown(
                     label="Sampler Type", choices=list(configure.SAMPLER_MAP.keys()),
-                    value=cfg.get("imagegen_sampling", "euler_a"),
+                    value=gen.get("imagegen_sampling", "euler_a"),
                 )
             with gr.Row():
-                _gen["width_dd"]  = gr.Dropdown(label="Image Width",  choices=configure.IMAGE_SIZES,
-                                                value=cfg.get("imagegen_width", 512))
-                _gen["height_dd"] = gr.Dropdown(label="Image Height", choices=configure.IMAGE_SIZES,
-                                                value=cfg.get("imagegen_height", 512))
+                _gen["width_dd"]  = gr.Dropdown(
+                    label="Image Width", choices=_initial_sizes,
+                    value=_seed(gen.get("imagegen_width", 512), _initial_sizes, 512),
+                )
+                _gen["height_dd"] = gr.Dropdown(
+                    label="Image Height", choices=_initial_sizes,
+                    value=_seed(gen.get("imagegen_height", 512), _initial_sizes, 512),
+                )
             with gr.Row():
                 _gen["steps_dd"] = gr.Dropdown(
-                    label="Diffuse Steps", choices=configure.STEP_CHOICES,
-                    value=cfg.get("imagegen_steps", 4),
+                    label="Diffuse Steps", choices=_initial_steps,
+                    value=_seed(gen.get("imagegen_steps", 4), _initial_steps,
+                                configure.family_step_cfg(_initial_diff)["steps"][1]),
                 )
                 _gen["cfg_scale_sld"] = gr.Slider(
-                    label="CFG Scale", minimum=0.5, maximum=20.0, step=0.5,
-                    value=cfg.get("imagegen_cfg_scale", 1.0),
+                    label="CFG Scale",
+                    minimum=_initial_cfg_rng[0], maximum=_initial_cfg_rng[1],
+                    step=_initial_cfg_rng[2],
+                    value=gen.get("imagegen_cfg_scale", _initial_cfg_rng[3]),
                 )
             with gr.Row():
                 _gen["batch_dd"] = gr.Dropdown(label="Batch Count",
                                                choices=configure.BATCH_COUNT_CHOICES,
-                                               value=cfg.get("imagegen_batch_count", 1)
+                                               value=gen.get("imagegen_batch_count", 1)
                 )
                 _gen["output_fmt_dd"] = gr.Dropdown(
                     label="Output Format", choices=configure.OUTPUT_FORMATS,
-                    value=cfg.get("output_format", "png"),
+                    value=gen.get("output_format", "png"),
                 )
             with gr.Row():
                 _gen["seed_num"] = gr.Number(label="Gen Seed (-1 = random)",
-                                             value=cfg.get("imagegen_seed", -1), precision=0)
-            # NOTE: no manual "Save as Default" button — successful generations
-            # auto-save their settings panel values (see do_generate's success
-            # branch), so the next launch picks up the last settings that worked.
+                                             value=gen.get("imagegen_seed", -1), precision=0)
+            # ── Restore To Defaults ──────────────────────────────────────────
+            # Repaints this whole settings panel to the loaded model's optimal
+            # values (configure.family_generation_defaults). Deliberately NOT
+            # paired with a Save button, unlike the Configuration and
+            # Preferences pages: this page has no Save, because it persists
+            # itself to generation.json on every submission. So the restored
+            # values become permanent the next time Generate is clicked, and
+            # clicking away without generating leaves the previous saved set
+            # untouched — which is the useful behaviour for a button whose
+            # whole purpose is "let me try again from a known-good baseline".
+            #
+            # variant="stop" (red) matches the revert buttons on the other two
+            # pages, so the destructive-ish action reads the same everywhere.
+            _gen["restore_defaults_btn"] = gr.Button(
+                "Restore To Defaults", variant="stop", size="sm",
+            )
+            # NOTE: no manual "Save as Default" button — every submission
+            # auto-saves this panel to generation.json (see do_generate), so
+            # the next launch picks up the last settings that were used.
 
         # ── Column 2: image input, prompts, Generate button ──────────────────
         # Order is deliberate, top to bottom: Image Edit, then the prompts,
@@ -1135,7 +1302,7 @@ def _build_generate_tab_inner() -> None:
                 _gen["strength_sld"] = gr.Slider(
                     label="Denoise Strength",
                     minimum=0.0, maximum=1.0, step=0.05,
-                    value=float(cfg.get("imagegen_strength", 0.75)),
+                    value=float(gen.get("imagegen_strength", 0.65)),
                     # Needs BOTH an -i-path family and at least one image
                     # already in the list; an empty list leaves nothing for a
                     # denoise fraction to apply to.
@@ -1162,7 +1329,7 @@ def _build_generate_tab_inner() -> None:
                 show_label=False,
                 placeholder=prompt_ph,
                 lines=2, max_lines=10,
-                value=cfg.get("last_prompt", ""),
+                value=gen.get("last_prompt", ""),
                 elem_id="prompt-positive",
             )
             _positive_history = configure.get_prompt_history("positive")
@@ -1184,7 +1351,7 @@ def _build_generate_tab_inner() -> None:
                 show_label=False,
                 placeholder=neg_ph,
                 lines=2, max_lines=10,
-                value=cfg.get("negative_prompt", ""),
+                value=gen.get("negative_prompt", ""),
                 elem_id="prompt-negative",
             )
             _negative_history = configure.get_prompt_history("negative")
@@ -1204,8 +1371,59 @@ def _build_generate_tab_inner() -> None:
                 # flips it on entry and back on its final yield.
                 _gen["generate_btn"] = gr.Button("Generate Image", variant="primary", size="lg")
 
-        # ── Column 3: image preview only ────────────────────────────────────
+        # ── Column 3: input thumbnails, then image preview ───────────────────
         with gr.Column(scale=1):
+            # ── Input: thumbnails of the centre column's reference images ────
+            # One row per the requirement, mirroring the centre column's list:
+            # every image added there gets a thumbnail here, so the pile can be
+            # identified visually rather than by filename alone.
+            #
+            # The whole block is hidden while the list is empty, so on a
+            # text-to-image model (or before the first Add) this column opens
+            # straight onto "### Output" exactly as it did before — no reserved
+            # blank space, no shifted preview.
+            #
+            # "Input" is deliberately a #### heading against Output's ###: this
+            # is the subordinate, supporting row of the two, and the subtler
+            # weight keeps the eye on the preview underneath.
+            #
+            # SIZE is a Preferences setting (Input Thumbnail Size), because it
+            # is a straight trade against the preview below — see
+            # configure.INPUT_THUMBNAIL_CHOICES. Read once here, at build time,
+            # for the same reason build_app() reads it once for the CSS: the
+            # two must agree, and Gradio has no runtime stylesheet hook.
+            _input_thumb = configure.get_input_thumbnail_size()
+            _refs_now = configure.get_ref_images()
+            # The COLUMN toggles; the gallery inside it is built visible=True
+            # and stays that way. That is the same shape as the ref_row block
+            # in column 2, and it matters for the reason spelled out on
+            # ref_list_tb: Gradio 6 does not always paint a component whose
+            # value and visibility arrive in the same update, so the first Add
+            # can drop its content (gradio issues #11768 / #12511). Two things
+            # guard against it here — the gallery itself never toggles, and the
+            # ref_images_state .change handler pushes the same updates a second
+            # time from the list state, independently of the button click. If
+            # the first pass ever misses, the second lands.
+            with gr.Column(visible=bool(_refs_now)) as _gen["input_row"]:
+                gr.Markdown("#### Input")
+                # Same one-row horizontal scroller as the Thumbnails Gallery at
+                # the bottom of the page (see the #input-gallery CSS in
+                # build_app), for the same reason: a wrapping grid would grow a
+                # second and third row as images are added and push the Output
+                # section down the page, which is precisely what this row must
+                # not do. allow_preview=False keeps a click from opening
+                # Gradio's full-screen lightbox — clicking a thumbnail here
+                # sends the image to the preview box below instead.
+                _gen["input_gallery"] = gr.Gallery(
+                    value=_refs_now,
+                    columns=16, rows=1,
+                    height=_input_thumb,
+                    object_fit="contain",
+                    allow_preview=False,
+                    show_label=False,
+                    fit_columns=False,
+                    elem_id="input-gallery",
+                )
             gr.Markdown("### Output")
             # Single currently-selected/in-progress image — most recent
             # generation, the live phase status image, or a clicked gallery
@@ -1389,16 +1607,15 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # Cancel any pending unload while we are generating
         _cancel_inactivity_timer()
 
-        # inference.py takes ONE dict and reads keys from both files out of it
-        # — enhance_prompt() wants prompt_template, which now lives in
-        # preferences.json, while everything else comes from configuration.json.
-        # Merged here, at the one place a generation is launched, so neither
-        # inference.py nor the save handlers need to know about the split.
+        # inference.py takes ONE dict and reads keys from all THREE settings
+        # files out of it — model paths and devices from configuration.json,
+        # prompt_template from preferences.json, and everything on this page
+        # from generation.json. configure.generation_config() does the merge in
+        # the one place that knows about all three, so neither inference.py nor
+        # any save handler has to know the split exists.
         # ref_images is added per-run below (see ref_batches) rather than
         # here, since Chain All needs a different list on each run.
-        base_gen_cfg = dict(c)
-        base_gen_cfg["prompt_template"] = _prefs().get(
-            "prompt_template", configure.DEFAULT_PROMPT_TEMPLATE)
+        base_gen_cfg = configure.generation_config()
         base_gen_cfg.update(
             imagegen_width=int(width), imagegen_height=int(height),
             imagegen_steps=int(steps), imagegen_sampling=sampler,
@@ -1412,6 +1629,48 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # hidden, which is every family that does not use the -i path.
         if strength is not None:
             base_gen_cfg["imagegen_strength"] = float(strength)
+
+        # ── Save the whole Generation page to generation.json ───────────────
+        # ON SUBMISSION, before a single pixel is generated — not on success,
+        # and not conditionally on the Quality Preset being "Custom", which is
+        # what this used to do. Both of those old conditions lost work the user
+        # had actually done:
+        #   * success-only meant a run that OOM'd, or hit a bad model pairing,
+        #     threw away the settings that were on screen when it started —
+        #     which are exactly the settings the user wants back to adjust and
+        #     retry.
+        #   * Custom-only meant that with a named preset selected, the prompt,
+        #     negative prompt, seed, batch count and output format were never
+        #     saved at all. Those are not part of any preset, so nothing was
+        #     reconstructing them; they were simply lost at exit.
+        # Saving here, unconditionally, means the page always reopens exactly
+        # as it was last left. The preset NAME is saved alongside the values so
+        # the dropdown reads correctly on the next launch either way.
+        #
+        # Reference images are the one thing deliberately not saved — see
+        # configure.GENERATION_KEYS for why (the paths may not exist next
+        # launch, so restoring them repopulates the input column with dead
+        # entries that only fail at generation time).
+        #
+        # A failed write must never block a generation: the settings are worth
+        # remembering, but not at the cost of the run the user just asked for.
+        try:
+            configure.update_generation({
+                "imagegen_quality_preset": quality_preset,
+                "imagegen_width": int(width), "imagegen_height": int(height),
+                "imagegen_steps": int(steps), "imagegen_sampling": sampler,
+                "imagegen_cfg_scale": float(cfg_scale),
+                "imagegen_seed": int(seed), "imagegen_batch_count": int(batch),
+                "imagegen_strength": float(base_gen_cfg.get("imagegen_strength", 0.65)),
+                "imagegen_ref_mode": (ref_mode if ref_mode in configure.REF_MODE_CHOICES
+                                      else configure.get_ref_mode()),
+                "output_format": output_format,
+                "last_prompt": prompt,
+                "negative_prompt": negative,
+            })
+        except Exception as e:
+            print(f"[generate] WARNING: could not save generation.json: {e}",
+                  flush=True)
 
         # Reference images (Flux.2 -r). The accumulated list arrives from
         # ref_images_state as a list of real on-disk paths (the native picker
@@ -1668,29 +1927,12 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # Start inactivity timer now that ALL links have finished
         _reset_inactivity_timer()
 
-        # Auto-save settings only when the Quality Preset is "Custom", and
-        # only once any link succeeded. Named presets (Fast, Balanced,
-        # Quality, etc.) are fixed — no need to persist them since they are
-        # always reconstructed from configure.get_generation_presets().
-        # Custom captures any user-modified combination that deviates from
-        # the named presets, and must be saved so it survives the next launch.
-        if chain_successes > 0:
-            if quality_preset == "Custom":
-                configure.update_configuration({
-                    "imagegen_quality_preset": "Custom",
-                    "imagegen_width": int(width), "imagegen_height": int(height),
-                    "imagegen_steps": int(steps), "imagegen_sampling": sampler,
-                    "imagegen_cfg_scale": float(cfg_scale),
-                    "imagegen_seed": int(seed), "imagegen_batch_count": int(batch),
-                    "negative_prompt": negative,
-                    "output_format": output_format,
-                })
-            else:
-                # Still persist the currently-active named preset so that
-                # it is restored correctly on next launch.
-                configure.update_configuration({
-                    "imagegen_quality_preset": quality_preset,
-                })
+        # NOTE: nothing is saved here any more. The whole Generation page is
+        # written to generation.json on SUBMISSION, up at the top of this
+        # function, so a run that fails still keeps the settings that produced
+        # it. See the block there for why the old save — which fired only on
+        # success, and only when the Quality Preset was "Custom" — was losing
+        # the prompt, seed, batch count and output format on every preset run.
 
 
     def on_generate_click(prompt, negative, width, height, steps, sampler,
@@ -1712,6 +1954,33 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     strength)
 
     # ── Reference-image Add / Clear handlers ────────────────────────────────
+    def _render_input_gallery(paths: List[str]) -> Tuple[Any, Any]:
+        """(gallery value, row visibility) for the right column's Input row.
+
+        Returns BOTH because the row must collapse entirely when the list is
+        empty — a visible-but-empty gallery still reserves its row height plus
+        Gradio's empty-state placeholder, which would push the Output preview
+        down the page for no benefit. Two outputs, one source of truth.
+
+        Only real, still-present files are passed to the gallery. A path can go
+        stale between being added and being rendered (the user deletes or
+        renames the file, or unplugs the drive), and gr.Gallery given a missing
+        path throws rather than skipping it, which would take the whole event
+        handler down with it. The reference LIST itself is left untouched by
+        this filtering — inference.generate_image() does its own existence
+        check and reports missing files properly at generation time, which is
+        where the user can actually act on the message."""
+        alive = [p for p in (paths or []) if p and Path(str(p)).exists()]
+        # Registered HERE, not at the call sites, because this is the one
+        # function every gallery update passes through — the Add button, the
+        # Clear button, the ref_images_state .change handler and the tab-select
+        # resync all land on it. Doing it at each call site instead would mean
+        # any future path that forgets is a crash rather than a cosmetic miss.
+        # It must also happen before the update is RETURNED, since Gradio
+        # validates outgoing paths while postprocessing this handler's result.
+        _allow_local_files(alive)
+        return gr.update(value=alive), gr.update(visible=bool(alive))
+
     def _render_ref_list(paths: List[str]) -> Any:
         """Show accumulated reference filenames one per line.
 
@@ -1767,8 +2036,11 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         acc = list(current or [])
         acc.extend(_browse_images())
         configure.set_ref_images(acc)
+        # _render_input_gallery registers these paths with Gradio before
+        # returning them; see _allow_local_files.
+        _gal, _row = _render_input_gallery(acc)
         return (acc, _render_ref_list(acc), _render_ref_mode_visibility(len(acc)),
-                _render_strength_visibility(len(acc)))
+                _render_strength_visibility(len(acc)), _gal, _row)
 
     def _clear_ref_images():
         """The ONE thing that empties the reference-image list.
@@ -1779,20 +2051,30 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         the way they last asked for rather than silently reverting.
         """
         configure.set_ref_images([])
-        return [], _render_ref_list([]), gr.update(visible=False), gr.update(visible=False)
+        return ([], _render_ref_list([]), gr.update(visible=False),
+                gr.update(visible=False), gr.update(value=[]),
+                gr.update(visible=False))
 
     def _resync_ref_widgets() -> tuple:
-        """Recompute the reference-image widgets from the authoritative list.
+        """Recompute the reference-image widgets from the authoritative list,
+        on arrival at the Generate tab.
 
-        Used when the Generate tab is selected, because the diffuser may have
-        been changed on the Configuration page in between -- and the radio's
-        visibility depends on the FAMILY as well as the image count, so it can
-        go stale without the image list changing at all. Returns
-        (list, mode radio, strength)."""
+        Returns (ref list textbox, input gallery, input row) — and deliberately
+        NOT the mode radio or the strength slider, even though both also depend
+        on the list. Those two are already re-synced on this same tab-select by
+        _generate_family_updates(), which has to touch them anyway because
+        their visibility depends on the FAMILY as well as the image count.
+        Two handlers writing the same component on one trigger is a race with
+        no upside, so the outputs are split cleanly between them: that one owns
+        everything family-dependent, this one owns everything that is purely a
+        function of the list.
+
+        This function existed before but was never wired to anything, which is
+        why the reference list and (now) the input thumbnails could go stale
+        after a round trip through another tab."""
         imgs = configure.get_ref_images()
-        return (_render_ref_list(imgs),
-                _render_ref_mode_visibility(len(imgs)),
-                _render_strength_visibility(len(imgs)))
+        gal, row = _render_input_gallery(imgs)
+        return _render_ref_list(imgs), gal, row
 
     def _on_ref_mode_change(mode):
         """Record the user's Use All / Chain All choice in session state, so
@@ -1803,13 +2085,13 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         _add_ref_images,
         inputs=[_gen["ref_images_state"]],
         outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"],
-                 _gen["strength_sld"]],
+                 _gen["strength_sld"], _gen["input_gallery"], _gen["input_row"]],
     )
     _gen["ref_clear_btn"].click(
         _clear_ref_images,
         inputs=None,
         outputs=[_gen["ref_images_state"], _gen["ref_list_tb"], _gen["ref_mode_radio"],
-                 _gen["strength_sld"]],
+                 _gen["strength_sld"], _gen["input_gallery"], _gen["input_row"]],
     )
     # ── Belt-and-braces sync ─────────────────────────────────────────────
     # The two widgets whose visibility depends on the image list are also
@@ -1823,12 +2105,15 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     # for whatever reason, these follow.
     def _on_ref_images_changed(imgs):
         n = len(imgs or [])
-        return _render_ref_mode_visibility(n), _render_strength_visibility(n)
+        gal, row = _render_input_gallery(imgs)
+        return (_render_ref_mode_visibility(n), _render_strength_visibility(n),
+                gal, row)
 
     _gen["ref_images_state"].change(
         _on_ref_images_changed,
         inputs=[_gen["ref_images_state"]],
-        outputs=[_gen["ref_mode_radio"], _gen["strength_sld"]],
+        outputs=[_gen["ref_mode_radio"], _gen["strength_sld"],
+                 _gen["input_gallery"], _gen["input_row"]],
     )
 
     _gen["ref_mode_radio"].change(
@@ -1855,6 +2140,73 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     # (and the mode radio) exactly as the user left it, so iterating on the
     # same images costs nothing but another click on Generate. "Clear Images"
     # is the only way to empty the list.
+
+    # ── Restore To Defaults (Generation page) ───────────────────────────────
+    def _restore_generation_defaults() -> tuple:
+        """Repaint the settings panel to the loaded model's optimal values.
+
+        Reads the SAME configure.family_generation_defaults() that a model
+        change applies, so "restore" and "switch models" can never disagree
+        about what optimal means for a given family. Choice lists are pushed
+        alongside the values, because a stale dropdown could otherwise reject
+        the very value being restored (steps 20 is not in Z-Image's list).
+
+        The POSITIVE prompt is not touched — it is the user's own writing and
+        a settings button has no business deleting it. The NEGATIVE prompt IS
+        reset, because it is factory boilerplate with a real default
+        (configure.DEFAULT_NEGATIVE_PROMPT) rather than authored content, and
+        someone clicking "Restore To Defaults" plainly means to include it.
+
+        Nothing is written to disk here. The restored values persist on the
+        next Generate click like any other change to this page.
+        """
+        diff = configure.load_configuration().get("imagegen_model_path", "")
+        d = configure.family_generation_defaults(diff)
+        spec = configure.family_step_cfg(diff)
+        step_choices, _ = spec["steps"]
+        cfg_min, cfg_max, cfg_step, _ = spec["cfg"]
+        sizes = configure.family_image_sizes(diff)
+        fam_label = configure.diffuser_family_label(diff)
+        try:
+            gr.Info(f"Generation settings restored to the {fam_label} defaults.")
+        except Exception:
+            pass
+        return (
+            gr.update(choices=sizes, value=d["imagegen_width"]),
+            gr.update(choices=sizes, value=d["imagegen_height"]),
+            gr.update(choices=step_choices, value=d["imagegen_steps"]),
+            gr.update(minimum=cfg_min, maximum=cfg_max, step=cfg_step,
+                      value=d["imagegen_cfg_scale"]),
+            gr.update(value=d["imagegen_sampling"]),
+            gr.update(value=d["imagegen_batch_count"]),
+            gr.update(value=d["output_format"]),
+            gr.update(value=d["imagegen_seed"]),
+            gr.update(value=d["imagegen_strength"]),
+            gr.update(value=configure.DEFAULT_NEGATIVE_PROMPT),
+            # The preset name. Be aware this one may not stick: every widget
+            # above carries a .change handler that forces the preset to
+            # "Custom" (see _set_custom), and those fire on the frontend after
+            # this handler's outputs land, regardless of the order they are
+            # listed in here. So the dropdown will often settle on "Custom"
+            # a moment after the restore.
+            #
+            # Left as-is rather than worked around, because it is cosmetic and
+            # the honest fix is disproportionate: _set_custom receives only the
+            # one widget's value, so teaching it "these values ARE a named
+            # preset, do not say Custom" means re-plumbing it to take the whole
+            # panel as input. The VALUES restored are correct either way, and
+            # "Custom" over a hand-restored set is not a lie.
+            gr.update(value=d["imagegen_quality_preset"]),
+        )
+
+    _gen["restore_defaults_btn"].click(
+        _restore_generation_defaults,
+        inputs=None,
+        outputs=[_gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
+                 _gen["cfg_scale_sld"], _gen["sampler_dd"], _gen["batch_dd"],
+                 _gen["output_fmt_dd"], _gen["seed_num"], _gen["strength_sld"],
+                 _gen["negative_tb"], _gen["preset_dd"]],
+    )
 
     _gen["thumbnails_link"].click(
         _open_output_folder,
@@ -1909,13 +2261,35 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         outputs=[_gen["settings_header"], _gen["ref_row"], status_box,
                  _gen["sampler_dd"], _gen["steps_dd"], _gen["cfg_scale_sld"],
                  _gen["width_dd"], _gen["height_dd"], _gen["strength_sld"],
-                 _gen["ref_mode_radio"]],
+                 _gen["ref_mode_radio"], _gen["batch_dd"],
+                 _gen["output_fmt_dd"], _gen["seed_num"], _gen["preset_dd"]],
     )
 
     _gen["prompt_tb"].focus(
         _generate_gate_updates,
         inputs=None,
         outputs=[_gen["generate_row"], _gen["prompt_tb"], _gen["negative_tb"]],
+    )
+
+    # Third select handler: the widgets that depend ONLY on the reference-image
+    # list (the filename list and the input thumbnail strip), which the two
+    # handlers above deliberately do not touch. See _resync_ref_widgets for why
+    # the outputs are split three ways rather than merged.
+    _gen["generate_tab"].select(
+        _resync_ref_widgets,
+        inputs=None,
+        outputs=[_gen["ref_list_tb"], _gen["input_gallery"], _gen["input_row"]],
+    )
+
+    # Clicking an input thumbnail puts that image in the preview box, so a
+    # reference can be inspected full-size without leaving the page. Same
+    # handler and same target as the output gallery below it — the preview box
+    # is simply "whatever image is currently being looked at", whether that is
+    # a generated result or an input about to be used.
+    _gen["input_gallery"].select(
+        on_gallery_select,
+        inputs=None,
+        outputs=_gen["preview_img"],
     )
 
     _wire_prompt_history_events()
@@ -2011,14 +2385,6 @@ def _build_config_tab_inner() -> None:
     gr.Markdown("### Backend Selection")
     with gr.Row():
 
-        with gr.Column(scale=2):
-            _cfg_w["img_backend_dd"] = gr.Dropdown(
-                label="ImageGen Backend",
-                choices=choices,
-                value=_default_backend_value("backend_imagegen"),
-                interactive=not is_cpu_only,
-            )
-
         with gr.Column(scale=1):
             _cfg_w["threads_dd"] = gr.Dropdown(
                 label="CPU Threads",
@@ -2026,12 +2392,25 @@ def _build_config_tab_inner() -> None:
                 value=cfg.get("encoder_threads", dt),
             )
 
+        # ONE control for both halves of a run, where there used to be two
+        # ("ImageGen Backend" and "Encoder Backend"). They were only ever set
+        # to the same value: on a one-GPU machine there is no second device to
+        # split across, and the decision that actually matters -- keeping the
+        # encoder and VAE off the card so the diffusion model gets all of it --
+        # is made per FAMILY by DIFFUSER_FAMILY_SPECS (encoder_to_cpu /
+        # vae_to_cpu) and by Diffuser Placement, not here. Two dropdowns that
+        # always agreed were two chances to disagree by accident.
+        #
+        # scale=2 against CPU Threads' scale=1, so the wider control (which
+        # carries a full GPU name and VRAM figure) gets the room it needs and
+        # the two sit neatly on one row.
         with gr.Column(scale=2):
-            _cfg_w["enc_backend_dd"] = gr.Dropdown(
-                label="Encoder Backend",
+            _cfg_w["proc_backend_dd"] = gr.Dropdown(
+                label="Processing Method",
                 choices=choices,
-                value=_default_backend_value("backend_encoder"),
+                value=_default_backend_value("backend_processing"),
                 interactive=not is_cpu_only,
+                info="Where both the encoder and the image generator run.",
             )
 
     # ── Model paths ──
@@ -2081,10 +2460,14 @@ def _build_config_tab_inner() -> None:
     # GPU Layers / Diffuser Placement as locked at their CPU-forced values —
     # otherwise the controls look interactive but silently have no effect,
     # which was the root of the original bug report.
-    enc_backend_val = _default_backend_value("backend_encoder")
-    enc_is_vulkan   = (not is_cpu_only) and ("Vulkan" in enc_backend_val)
-    img_backend_val = _default_backend_value("backend_imagegen")
-    img_is_vulkan   = (not is_cpu_only) and ("Vulkan" in img_backend_val)
+    # One Processing Method now drives both, so the two flags are the same
+    # boolean. They are kept as separate names because the widgets they gate
+    # remain distinct -- GPU Layers belongs to the encoder, Diffuser Placement
+    # to the image generator -- and reading "enc_is_vulkan" beside the encoder
+    # widget stays clearer than one shared name used in two contexts.
+    proc_backend_val = _default_backend_value("backend_processing")
+    enc_is_vulkan   = (not is_cpu_only) and ("Vulkan" in proc_backend_val)
+    img_is_vulkan   = enc_is_vulkan
 
     with gr.Row():
         # ── Left column: the IMAGE GENERATOR's files ──────────────────────
@@ -2223,7 +2606,7 @@ def _build_config_tab_inner() -> None:
                           if img_is_vulkan else configure.DIFFUSER_PLACEMENT_FULL_CPU),
                     info=("Split keeps the encoder+VAE on CPU, diffusion model on GPU."
                           if img_is_vulkan else
-                          "ImageGen Backend is CPU — sd.cpp will not touch the GPU at all."),
+                          "Processing Method is CPU — sd.cpp will not touch the GPU at all."),
                     interactive=img_is_vulkan,
                 )
 
@@ -2276,7 +2659,7 @@ def _build_config_tab_inner() -> None:
                     choices=configure.GPU_LAYER_CHOICES,
                     value=cfg.get("encoder_gpu_layers", -1) if enc_is_vulkan else 0,
                     info=("(-1 = all layers)." if enc_is_vulkan
-                          else "Encoder Backend is CPU — all layers run on CPU."),
+                          else "Processing Method is CPU — all layers run on CPU."),
                     interactive=enc_is_vulkan,
                 )
                 # Encoder flash attention is automatic and needs no toggle:
@@ -2506,11 +2889,15 @@ def _build_config_tab_inner() -> None:
             except (TypeError, ValueError):
                 pass
         return gr.update(value=0, interactive=False,
-                         info="Encoder Backend is CPU — all layers run on CPU.")
+                         info="Processing Method is CPU — all layers run on CPU.")
 
-    _cfg_w["enc_backend_dd"].change(
+    # Both handlers hang off the SAME dropdown now. Two listeners on one event
+    # rather than one listener returning both, because they own disjoint
+    # outputs (GPU Layers vs Diffuser Placement) and each keeps its own
+    # remembered-value dict; merging them would only tangle that.
+    _cfg_w["proc_backend_dd"].change(
         _on_enc_backend_change,
-        inputs=[_cfg_w["enc_backend_dd"], _cfg_w["enc_ngl_dd"]],
+        inputs=[_cfg_w["proc_backend_dd"], _cfg_w["enc_ngl_dd"]],
         outputs=_cfg_w["enc_ngl_dd"],
     )
 
@@ -2522,11 +2909,11 @@ def _build_config_tab_inner() -> None:
         if current_placement and current_placement != configure.DIFFUSER_PLACEMENT_FULL_CPU:
             _last_placement_value["v"] = current_placement
         return gr.update(value=configure.DIFFUSER_PLACEMENT_FULL_CPU, interactive=False,
-                         info="ImageGen Backend is CPU — sd.cpp will not touch the GPU at all.")
+                         info="Processing Method is CPU — sd.cpp will not touch the GPU at all.")
 
-    _cfg_w["img_backend_dd"].change(
+    _cfg_w["proc_backend_dd"].change(
         _on_img_backend_change,
-        inputs=[_cfg_w["img_backend_dd"], _cfg_w["img_placement_dd"]],
+        inputs=[_cfg_w["proc_backend_dd"], _cfg_w["img_placement_dd"]],
         outputs=_cfg_w["img_placement_dd"],
     )
 
@@ -2564,11 +2951,20 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
 
     def save_all(ep, en, dp, dn, vp, vn,
                  clp, cln, cgp, cgn, t5p, t5n,
-                 enc_back, img_back, threads,
+                 proc_back, threads,
                  eb, ec, engl,
                  ic, img_pred, img_family, img_placement):
-        enc_parsed = configure.parse_backend_choice(enc_back)
-        img_parsed = configure.parse_backend_choice(img_back)
+        # One Processing Method choice, parsed once, written to BOTH per-side
+        # device keys. inference.py still reads encoder_vulkan_device and
+        # imagegen_vulkan_device separately -- that split is real (the two run
+        # in different processes and each needs its own -dev / --backend
+        # argument), it is only the USER-FACING choice that has been merged.
+        # So the two keys stay and simply always receive the same value.
+        proc_parsed = configure.parse_backend_choice(proc_back)
+        # Read BEFORE update_configuration() overwrites it, so the comparison
+        # below is against what was on disk rather than what we just wrote.
+        _prev_family_override = configure.load_configuration().get(
+            "imagegen_family_override", configure.FAMILY_OVERRIDE_AUTO)
         # Never persist a vision projector as the encoder (covers a path carried
         # over from a prior session or a hand-edited config file). Clear it so
         # it can't reach the backend, and flag it in the saved-status message.
@@ -2584,15 +2980,14 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "clip_l_model_path":   clp, "clip_l_model_name":   cln,
             "clip_g_model_path":   cgp, "clip_g_model_name":   cgn,
             "t5xxl_model_path":    t5p, "t5xxl_model_name":    t5n,
-            "backend_encoder":     enc_back,
-            "backend_imagegen":    img_back,
+            "backend_processing":  proc_back,
             # Per-side, and READ per-side by inference.py. The old code also
             # wrote a shared "vulkan_device" from the ImageGen dropdown only,
             # while enhance_prompt() read that same key for the ENCODER -- so
             # picking "CPU" for ImageGen silently set the encoder's device to
             # -1. The two keys below were already being written and never read.
-            "encoder_vulkan_device": enc_parsed["vulkan_device"],
-            "imagegen_vulkan_device": img_parsed["vulkan_device"],
+            "encoder_vulkan_device": proc_parsed["vulkan_device"],
+            "imagegen_vulkan_device": proc_parsed["vulkan_device"],
             "encoder_threads":     int(threads),
             "imagegen_threads":    int(threads),
             "encoder_batch_size":  int(eb),
@@ -2601,12 +2996,30 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             "imagegen_clip_skip":  int(ic),
             "imagegen_prediction": img_pred,
             "imagegen_family_override": img_family,
-            # A changed override changes what family the saved steps/cfg belong
-            # to, so clear the marker and let the Generate page re-snap them.
-            "imagegen_last_family": "",
             "imagegen_placement":  img_placement,
             "first_run":           False,
         })
+        # Clearing imagegen_last_family forces the Generation page to re-snap
+        # steps/cfg/size/sampler to the family defaults next time it is
+        # opened -- correct when the user has just told us the model is a
+        # different family than we thought, and destructive otherwise.
+        #
+        # This used to fire on EVERY save. Saving the Configuration page for
+        # any reason at all -- correcting a VAE path, changing thread count,
+        # switching Processing Method -- therefore silently discarded whatever
+        # the user had tuned on the Generation page the moment they navigated
+        # back to it. That was survivable while those values were transient;
+        # now that generation.json restores them faithfully it is a real loss,
+        # and it is exactly the "something is reverting my settings" behaviour
+        # worth hunting down.
+        #
+        # So it is conditional: only when the Model Family override actually
+        # differs from what was stored does the marker get cleared.
+        if img_family != _prev_family_override:
+            try:
+                configure.update_generation({"imagegen_last_family": ""})
+            except Exception:
+                pass
         # Saving is the moment the model paths become real (the Generate page
         # reads configuration.json, not these textboxes), so refresh that
         # page's gate right here rather than leaving it stale until the user
@@ -2629,7 +3042,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             w["clip_l_path_tb"], w["clip_l_name_tb"],
             w["clip_g_path_tb"], w["clip_g_name_tb"],
             w["t5xxl_path_tb"], w["t5xxl_name_tb"],
-            w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
+            w["proc_backend_dd"], w["threads_dd"],
             w["enc_batch_dd"], w["enc_ctx_dd"],
             w["enc_ngl_dd"],
             w["img_clip_dd"], w["img_pred_dd"], w["img_family_dd"],
@@ -2663,8 +3076,7 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
         except Exception:
             pass
         return (
-            gr.update(value=cpu_backend),                       # enc_backend_dd
-            gr.update(value=cpu_backend),                       # img_backend_dd
+            gr.update(value=cpu_backend),                       # proc_backend_dd
             gr.update(value=d["encoder_threads"]),              # threads_dd
             gr.update(value=""),                                # enc_name_tb
             gr.update(value=""),                                # enc_path_tb
@@ -2681,20 +3093,20 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
             gr.update(value=d["encoder_batch_size"]),           # enc_batch_dd
             gr.update(value=d["encoder_ctx_size"]),             # enc_ctx_dd
             gr.update(value=0, interactive=False,               # enc_ngl_dd
-                      info="Encoder Backend is CPU — all layers run on CPU."),
+                      info="Processing Method is CPU — all layers run on CPU."),
             gr.update(value=d["imagegen_clip_skip"]),           # img_clip_dd
             gr.update(value=d["imagegen_prediction"]),          # img_pred_dd
             gr.update(value=d["imagegen_family_override"]),     # img_family_dd
             gr.update(value=configure.DIFFUSER_PLACEMENT_FULL_CPU,  # img_placement_dd
                       interactive=False,
-                      info="ImageGen Backend is CPU — sd.cpp will not touch the GPU at all."),
+                      info="Processing Method is CPU — sd.cpp will not touch the GPU at all."),
         )
 
     w["revert_btn"].click(
         revert_config,
         inputs=[],
         outputs=[
-            w["enc_backend_dd"], w["img_backend_dd"], w["threads_dd"],
+            w["proc_backend_dd"], w["threads_dd"],
             w["enc_name_tb"], w["enc_path_tb"],
             w["diff_name_tb"], w["diff_path_tb"],
             w["vae_name_tb"], w["vae_path_tb"],
@@ -2741,14 +3153,29 @@ def _build_preferences_tab_inner() -> None:
                 info="How many images the Thumbnails Gallery shows, newest first.",
             )
         with gr.Column(scale=1):
+            # Sizes the Input thumbnail strip in the Generation page's right
+            # column. It shares that column with the Output preview, so this
+            # is a direct trade: larger thumbnails are easier to identify,
+            # but every pixel comes out of the preview below.
+            #
+            # The "next launch" note is not boilerplate — it is accurate. The
+            # value is baked into the stylesheet when the app assembles it at
+            # startup (see build_app), because Gradio offers no way to swap a
+            # running app's CSS. Saying so here is better than the user
+            # clicking Save and wondering why nothing moved.
+            _prf["input_thumb_dd"] = gr.Dropdown(
+                label="Input Thumbnail Size",
+                choices=configure.INPUT_THUMBNAIL_CHOICES,
+                value=configure.get_input_thumbnail_size(),
+                info=("Pixel size of the Generation page's Input thumbnails. "
+                      "Applies on next launch."),
+            )
+        with gr.Column(scale=1):
             _prf["encoder_debug_chk"] = gr.Checkbox(
                 label="Encoder Model Debug",
                 value=bool(prefs.get("encoder_model_debug", False)),
                 info="Print encoder output to terminal.",
             )
-        # Spacer so the two controls keep a sane width instead of stretching.
-        with gr.Column(scale=1):
-            pass
 
     # "Revert To Defaults" sits to the right of Save; variant="stop" gives it
     # the red styling. It only repaints the widgets — preferences.json is not
@@ -2768,24 +3195,37 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
     output listing is unsliced (see _get_recent_images), so this costs a
     re-render, not a rescan.
     """
-    def save_prefs(prompt_template, max_thumbs, encoder_debug):
+    def save_prefs(prompt_template, max_thumbs, input_thumb, encoder_debug):
         try:
             thumbs = int(max_thumbs)
         except (TypeError, ValueError):
             thumbs = configure.DEFAULT_MAX_THUMBNAILS
         if thumbs not in configure.MAX_THUMBNAIL_CHOICES:
             thumbs = configure.DEFAULT_MAX_THUMBNAILS
+        try:
+            in_thumb = int(input_thumb)
+        except (TypeError, ValueError):
+            in_thumb = configure.DEFAULT_INPUT_THUMBNAIL
+        if in_thumb not in configure.INPUT_THUMBNAIL_CHOICES:
+            in_thumb = configure.DEFAULT_INPUT_THUMBNAIL
         configure.update_preferences({
             "prompt_template": prompt_template,
             "max_thumbnails":  thumbs,
+            "input_thumbnail_size": in_thumb,
             "encoder_model_debug": bool(encoder_debug),
         })
-        return "All preferences saved!", _get_recent_images(thumbs)
+        # Max Thumbnails re-slices the gallery immediately (the cached listing
+        # is unsliced, so this costs a re-render, not a rescan). Input
+        # Thumbnail Size cannot do the same — it lives in the stylesheet, which
+        # is fixed for the life of the process — so the message says so rather
+        # than letting the user wonder.
+        return ("All preferences saved! Input Thumbnail Size applies on next "
+                "launch."), _get_recent_images(thumbs)
 
     _prf["save_prefs_btn"].click(
         save_prefs,
         inputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
-                _prf["encoder_debug_chk"]],
+                _prf["input_thumb_dd"], _prf["encoder_debug_chk"]],
         outputs=[status_box, _gen["output_gallery"]],
     )
 
@@ -2803,6 +3243,7 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
         return (
             gr.update(value=configure.DEFAULT_PROMPT_TEMPLATE),  # prompt_template_tb
             gr.update(value=configure.DEFAULT_MAX_THUMBNAILS),   # max_thumbs_dd
+            gr.update(value=configure.DEFAULT_INPUT_THUMBNAIL),  # input_thumb_dd
             gr.update(value=False),                              # encoder_debug_chk
         )
 
@@ -2810,7 +3251,7 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
         revert_prefs,
         inputs=[],
         outputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
-                 _prf["encoder_debug_chk"]],
+                 _prf["input_thumb_dd"], _prf["encoder_debug_chk"]],
     )
 
 
@@ -3246,6 +3687,60 @@ many paths that returns, they all land in this one scrolling row. ────�
     overflow-y: hidden !important;
     scrollbar-width: thin !important;      /* Firefox: thin bar when visible */
 }
+
+/* ── Input gallery: the same one-row horizontal scroller, in column 3 ─────
+Identical technique to #output-gallery above and for identical reasons — see
+that block for the full explanation of why Gradio's native grid has to be
+replaced rather than configured. Only two things differ:
+
+  * the height comes from a PREFERENCE (Input Thumbnail Size) rather than a
+    constant, interpolated below from configure.get_input_thumbnail_size().
+    Every pixel this row occupies is a pixel the Output preview beneath it
+    loses, which is exactly why it is the user's choice and not a fixed value.
+  * the cell width subtracts configure.INPUT_GALLERY_PADDING rather than a
+    literal 16, though the number is the same — Gradio's .grid-wrap adds 8px
+    above and below, and the cells have to stay square.
+
+The horizontal scroller is what stops this row from ever growing taller: no
+matter how many reference images are added, they extend rightward behind a
+scrollbar instead of wrapping onto a second line and shoving Output down the
+page. That is the whole requirement — the input thumbnails must not push the
+Input/Output sections around. ─────────────────────────────────────────────── */
+#input-gallery .thumbnail-lg > img,
+#input-gallery .thumbnail-lg img,
+#input-gallery .grid-wrap img,
+#input-gallery .gallery-item img,
+#input-gallery .thumbnail-item img,
+#input-gallery img {
+    object-fit: contain !important;
+    width: 100% !important;
+    height: 100% !important;
+    max-width: 100% !important;
+    max-height: 100% !important;
+}
+#input-gallery .thumbnail-lg,
+#input-gallery .gallery-item,
+#input-gallery .grid-wrap .gallery-item {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    overflow: hidden !important;
+    background: var(--background-fill-secondary) !important;
+}
+#input-gallery .grid-container {
+    display: grid !important;
+    grid-auto-flow: column !important;
+    grid-template-columns: none !important;
+    grid-template-rows: 1fr !important;
+    grid-auto-columns: calc(__INPUT_THUMB__px - __INPUT_PAD__px) !important;
+    height: 100% !important;
+}
+#input-gallery .grid-wrap {
+    height: __INPUT_THUMB__px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    scrollbar-width: thin !important;
+}
 """
     # Substitute the preview-box height placeholder with the single shared
     # constant (configure.PREVIEW_IMAGE_HEIGHT) — same value used for the
@@ -3256,6 +3751,22 @@ many paths that returns, they all land in this one scrolling row. ────�
     # #output-gallery height/thumbnail-width CSS here, so the row height and
     # the derived square cell size can never drift apart.
     _css = _css.replace("__THUMB_GALLERY_HEIGHT__", str(configure.THUMBNAIL_GALLERY_HEIGHT))
+    # Input gallery row height. Unlike the two above this is a PREFERENCE, not
+    # a constant, so it is read here rather than hardcoded — the same accessor
+    # _build_generate_tab_inner() uses for the gr.Gallery(height=...) kwarg, so
+    # the CSS (which carries !important and would otherwise win) and the kwarg
+    # always agree.
+    #
+    # Read ONCE, when the stylesheet is assembled at launch. Changing Input
+    # Thumbnail Size therefore takes effect on the next launch, not the moment
+    # Save All Preferences is clicked — Gradio has no hook for swapping the
+    # stylesheet on a running Blocks app, and the alternatives (injecting a
+    # <style> tag through gr.HTML, or swapping elem_classes at runtime) are
+    # either at the mercy of Gradio's HTML sanitiser or unreliable across
+    # versions. The Preferences info text says so, so the behaviour is stated
+    # rather than surprising.
+    _css = _css.replace("__INPUT_THUMB__", str(configure.get_input_thumbnail_size()))
+    _css = _css.replace("__INPUT_PAD__", str(configure.INPUT_GALLERY_PADDING))
 
     with gr.Blocks(title="Image-Gradio-Gguf") as app:
         gr.Markdown("# Image-Gradio-Gguf")
@@ -3301,5 +3812,12 @@ many paths that returns, they all land in this one scrolling row. ────�
         _wire_config_events(shared_status)
         _wire_preferences_events(shared_status)
         _wire_debug_events(shared_status)
+
+    # Kept so _allow_local_files() can extend this app's allowed_paths at
+    # runtime, which is what lets the Input gallery display reference images
+    # from outside the project folder. Set here rather than passed around,
+    # because the handlers that need it are closures wired above.
+    global _blocks_app
+    _blocks_app = app
 
     return app, _css

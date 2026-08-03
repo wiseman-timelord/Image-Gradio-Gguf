@@ -734,6 +734,27 @@ def is_flux2_base_variant(name: str) -> bool:
     return bool(re.search(r"\bbase\b|[-_.]base[-_.]", str(name).lower()))
 
 
+def is_flux1_schnell_variant(name: str) -> bool:
+    """True for the step-distilled FLUX.1 [schnell] lineage, False for the
+    dev lineage (which is what every CivitAI finetune this program is likely
+    to meet actually is -- fluxedUp, brainflux, and the rest are dev merges).
+
+    DEV IS THE DEFAULT, and deliberately so. Getting it backwards is cheap in
+    one direction and expensive in the other: a schnell file misread as dev
+    opens at 20 steps and merely wastes time producing an image that was
+    already finished at 4, whereas a dev file misread as schnell opens at 4
+    steps and produces visible mush that reads as "this model is broken".
+    So only an explicit schnell token flips it.
+
+    "merge"/"fusion" files that blend the two lineages (Flux Fusion and
+    friends) carry both tokens and land on schnell, which is right: they are
+    published as few-step models.
+
+    Uses the normalized name so "flux1_schnell_Q4_0" -- where the token sits
+    between two underscores, which \\b cannot see past -- is recognised."""
+    return bool(re.search(r"\bschnell\b", normalize_model_name(name)))
+
+
 def flux2_size_dim(name: str) -> Optional[int]:
     """Required encoder hidden dim for a Flux.2-klein diffuser, from its size
     token: klein-4B -> 2560 (Qwen3-4B), klein-9B -> 4096 (Qwen3-8B).
@@ -1083,6 +1104,20 @@ def is_sdxl_distilled_variant(name: str) -> bool:
 #             budget, which is a different tokenizer, so it is set with slack
 #             and the word count is enforced in the system prompt as well.
 #
+#   FLUX.1    conditions through CLIP-L (77 tokens, effectively a throwaway
+#             pooled vector here) plus T5-XXL, and sd.cpp compiles the T5
+#             stream at 512 tokens for dev-lineage files and 256 for schnell.
+#             512 T5 tokens is roughly 350-380 English words, so the generous
+#             1200-char default is close enough to the ceiling that a chatty
+#             enhancer can push the tail of the prompt past it -- and what
+#             gets dropped is the END of the text, which is where the
+#             enhancer puts its lighting/atmosphere detail. 800 chars keeps
+#             the whole rewrite inside the window with room to spare, and
+#             still leaves FLUX.1 far more budget than SDXL's 320. Prose, not
+#             keywords: T5 is a real language model and FLUX.1 was trained on
+#             natural-language captions, so the SDXL keyword-list style would
+#             actively hurt here.
+#
 #   Z-Image   condition through a Qwen3 LLM with a real context window, so long
 #   Flux.2    descriptive prose genuinely helps and is what these were tuned
 #             for. Keep the original generous budget.
@@ -1105,6 +1140,13 @@ FAMILY_PROMPT_ENHANCE: Dict[str, Dict[str, Any]] = {
                   "visual keywords covering subject, setting, lighting and "
                   "style. Put the main subject FIRST. No sentences, no "
                   "narration, no preamble."),
+    },
+    DIFFUSER_FAMILY_FLUX1: {
+        "max_tokens": 200,
+        "max_chars":  800,
+        "style": ("Write flowing natural-language prose, at most 120 words. "
+                  "Be descriptive about subject, style, lighting, composition, "
+                  "colors, and atmosphere. No keyword lists, no preamble."),
     },
     DIFFUSER_FAMILY_ZIMAGE: dict(PROMPT_ENHANCE_DEFAULTS),
     DIFFUSER_FAMILY_FLUX2:  dict(PROMPT_ENHANCE_DEFAULTS),
@@ -1256,6 +1298,17 @@ IMAGE_SIZES       = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
 FLUX2_IMAGE_SIZES  = [512, 768, 1024, 1280, 1536, 1792, 2048]
 ZIMAGE_IMAGE_SIZES = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
 
+# FLUX.1 (dev, schnell, and the CivitAI finetunes quantized from them, e.g.
+# fluxedUp). Trained at 1024 and, like Flux.2, it does NOT degrade gracefully
+# downwards -- BFL document the supported band as 0.1-2.0 MP, whose lower end
+# is ~320x320, and in practice anything under 512 loses coherence rather than
+# just detail. So the floor is 512, matching Flux.2 rather than Z-Image's 256.
+# The 2048 ceiling is 4MP, above BFL's documented 2MP recommendation but
+# reachable on a big card; VRAM, not this list, is the real limit (a Q4_0
+# FLUX.1 DiT is ~6.5GB before the compute buffer -- see
+# inference._flux1_needs_offload, which measured 1366 MB per megapixel).
+FLUX1_IMAGE_SIZES  = [512, 768, 1024, 1280, 1536, 1792, 2048]
+
 # SDXL was trained at roughly 1MP across a set of aspect buckets, with
 # 1024x1024 native. The off-square bucket sizes here (832/896/1152/1216/1344)
 # are all multiples of 64, so sd.cpp will not silently round them (see the
@@ -1264,6 +1317,8 @@ ZIMAGE_IMAGE_SIZES = [256, 512, 768, 1024, 1280, 1536, 1792, 2048]
 SDXL_IMAGE_SIZES = [512, 768, 832, 896, 1024, 1152, 1216, 1344, 1536]
 
 FAMILY_IMAGE_SIZES: Dict[str, List[int]] = {
+    "flux1_dev":       FLUX1_IMAGE_SIZES,
+    "flux1_schnell":   FLUX1_IMAGE_SIZES,
     "flux2_distilled": FLUX2_IMAGE_SIZES,
     "flux2_base":      FLUX2_IMAGE_SIZES,
     "sdxl_base":       SDXL_IMAGE_SIZES,
@@ -1277,12 +1332,30 @@ def family_image_sizes(diffuser_name: str) -> List[int]:
     """Allowed width/height values for the loaded diffuser's family."""
     return FAMILY_IMAGE_SIZES.get(family_step_cfg_key(diffuser_name), IMAGE_SIZES)
 
-# Z-Image-Turbo is a distilled few-step model; step counts are conventionally
-# chosen as doubling powers of two (2/4/6/8/10/12) to match the distillation
-# schedule the turbo checkpoint was trained against. Restricting the choices
-# here keeps the UI from offering values that don't correspond to a step the
-# turbo schedule was actually trained on.
-STEP_CHOICES      = [2, 4, 6, 8, 10, 12]
+# Diffuse Steps: ONE list, ONE default, for every family.
+#
+# This used to be per-family -- FLUX.1 dev opened at 20 with a floor of 16,
+# SDXL base at 30, the distilled models at 4-8. That was "optimal" in the sense
+# a model card means it, and wrong in the sense that matters here: on the
+# hardware this program targets, 20 steps at 512x512 is minutes of waiting
+# before you learn whether the prompt was any good, and a floor of 16 removed
+# the ability to find out faster. A default nobody will sit through is not a
+# good default.
+#
+# 8 is the compromise, everywhere. It is enough for a usable image out of every
+# family this program drives -- generous for the distilled models (Z-Image-
+# Turbo, klein, schnell, SDXL-Turbo, which are trained for 4), and soft but
+# legible for the undistilled ones (FLUX.1 dev, klein base, SDXL base). It
+# lands in a reasonable time on an 8GB card, which is the property being
+# optimised for. Anyone who wants the model's full quality raises it, and the
+# list goes to 32 so they can.
+#
+# The list spans both regimes deliberately: 4/6 for few-step models, 8-12 as
+# the general working band, 16-32 for the undistilled families at full quality.
+STEP_CHOICES      = [4, 6, 8, 10, 12, 16, 20, 24, 28, 32]
+
+# The single step default, used by every entry in FAMILY_STEP_CFG below.
+DEFAULT_STEPS     = 8
 BATCH_SIZE_CHOICES = [128, 256, 512, 1024, 2048]
 
 # ---------------------------------------------------------------------------
@@ -1301,12 +1374,46 @@ BATCH_SIZE_CHOICES = [128, 256, 512, 1024, 2048]
 #
 # Each entry: steps -> (choices, default); cfg -> (min, max, step, default).
 FAMILY_STEP_CFG = {
+    # ── FLUX.1 ───────────────────────────────────────────────────────────
+    # Split in two, because dev and schnell are as far apart as klein-base and
+    # klein-distilled are, and a single "flux1" entry would be wrong for one of
+    # them. Both are GUIDANCE-distilled, which is the part that trips people up:
+    # --cfg-scale must stay at 1.0 for either. Real classifier-free guidance was
+    # trained out of both, so raising cfg does not strengthen the prompt, it
+    # burns the image AND doubles the step time (two forward passes instead of
+    # one). What dev *does* consume is the separate embedded guidance value,
+    # which sd-cli already defaults to 3.50 and this program deliberately does
+    # not pass (see the is_flux1 branch in inference.generate_image). Because
+    # cfg is pinned at 1.0, the NEGATIVE PROMPT does nothing for either variant
+    # -- it is only read when cfg > 1.0.
+    #
+    # STEPS are no longer split per family -- every entry below takes the same
+    # STEP_CHOICES list and the same DEFAULT_STEPS of 8; see the note there for
+    # why. What still differs, and what these entries exist for, is CFG.
+    #
+    #   dev      : covers fluxedUp and effectively every other CivitAI FLUX.1
+    #              finetune, since they are near-universally dev-lineage merges.
+    #              Raise Diffuse Steps toward 20-28 for its full quality; 8 gets
+    #              a legible image in a fraction of the time. NOTE the model's
+    #              own card may recommend dpm++2m rather than euler -- the
+    #              Sampler dropdown is deliberately never overridden by family
+    #              selection, so that stays the user's call.
+    #   schnell  : step-distilled, trained for 4. 8 costs a little time for
+    #              nothing but does not degrade it.
+    "flux1_dev": {
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
+        "cfg":    (1.0, 1.5, 0.5, 1.0),
+    },
+    "flux1_schnell": {
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
+        "cfg":    (1.0, 1.5, 0.5, 1.0),
+    },
     "flux2_distilled": {
-        "steps":  ([4, 6, 8], 4),
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
         "cfg":    (1.0, 2.0, 0.5, 1.0),
     },
     "flux2_base": {
-        "steps":  ([16, 20, 24, 28], 20),
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
         "cfg":    (1.0, 8.0, 0.5, 4.0),
     },
     # Z-Image-Turbo (distilled S3-DiT): 8-step model — 8 is the sweet spot,
@@ -1315,7 +1422,7 @@ FAMILY_STEP_CFG = {
     # Sampler is NOT forced (euler AND euler_a both work well for Z-Image),
     # unlike Flux.2 which must be euler.
     "z-image": {
-        "steps":  ([4, 6, 8, 10, 12], 8),
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
         "cfg":    (1.0, 4.0, 0.5, 1.0),
     },
     # SDXL base and ordinary (non-distilled) finetunes: a conventional
@@ -1323,28 +1430,31 @@ FAMILY_STEP_CFG = {
     # drives. 25-30 steps at cfg 6-8 is the standard band, and the negative
     # prompt actually does something here because cfg is above 1.0.
     "sdxl_base": {
-        "steps":  ([20, 24, 28, 30, 32, 40], 30),
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
         "cfg":    (1.0, 12.0, 0.5, 7.0),
     },
     # Distilled SDXL: Turbo, Lightning, Hyper, DMD2, LCM. Step-distilled the
     # same way Klein and Z-Image-Turbo are, and wanting the same treatment --
     # a few steps at cfg near 1.0. See is_sdxl_distilled_variant().
     "sdxl_distilled": {
-        "steps":  ([1, 2, 4, 6, 8], 6),
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
         "cfg":    (1.0, 3.0, 0.5, 1.5),
     },
     # No diffuser chosen yet: keep the permissive superset.
     "none": {
-        "steps":  (STEP_CHOICES, 8),
+        "steps":  (STEP_CHOICES, DEFAULT_STEPS),
         "cfg":    (0.5, 20.0, 0.5, 1.0),
     },
 }
 
 
 def family_step_cfg_key(diff_path: str, diff_arch: str = "") -> str:
-    """Map a diffuser to its FAMILY_STEP_CFG key: 'flux2_distilled',
-    'flux2_base', 'z-image', or 'none'."""
+    """Map a diffuser to its FAMILY_STEP_CFG key: 'flux1_dev',
+    'flux1_schnell', 'flux2_distilled', 'flux2_base', 'sdxl_base',
+    'sdxl_distilled', 'z-image', or 'none'."""
     fam = diffuser_family(diff_path, diff_arch) if diff_path else None
+    if fam == DIFFUSER_FAMILY_FLUX1:
+        return "flux1_schnell" if is_flux1_schnell_variant(diff_path) else "flux1_dev"
     if fam == DIFFUSER_FAMILY_FLUX2:
         return "flux2_base" if is_flux2_base_variant(diff_path) else "flux2_distilled"
     if fam == DIFFUSER_FAMILY_SDXL:
@@ -1428,6 +1538,38 @@ PREVIEW_IMAGE_HEIGHT: int = 500
 THUMBNAIL_GALLERY_HEIGHT: int = 123
 
 # ---------------------------------------------------------------------------
+# Input-image gallery (Generation page, right-hand column, above Output)
+# ---------------------------------------------------------------------------
+# A one-row, horizontally-scrolling strip of thumbnails of whatever is
+# currently in the centre column's "Add Image" list, so each reference image
+# can be identified at a glance instead of by filename alone.
+#
+# The SIZE is a preference because it is a direct trade against the Output
+# preview below it. Both live in the same column, so every pixel this row
+# takes is a pixel the preview loses; too large and the Output section starts
+# getting pushed off-screen, too small and the thumbnails stop being
+# identifiable. 128 is the default because at 128 the row costs less than a
+# third of the 500px preview and a face is still recognisable. 96 is for
+# small windows, 160/196 for people running the app maximised on a large
+# display.
+#
+# Same single-source pattern as PREVIEW_IMAGE_HEIGHT / THUMBNAIL_GALLERY_
+# HEIGHT: the chosen value feeds BOTH the gr.Gallery(height=...) kwarg and the
+# #input-gallery CSS in display.py, so the row height and the derived square
+# cell width can never drift apart. Unlike those two it is a preference rather
+# than a constant, so display.build_app() reads it once when it assembles the
+# stylesheet -- which is why a change here takes effect on the next launch
+# rather than the moment Save is clicked. Gradio has no runtime stylesheet
+# hook to do better without shipping a <style> injection hack.
+INPUT_THUMBNAIL_CHOICES: List[int] = [96, 128, 160, 196]
+DEFAULT_INPUT_THUMBNAIL: int = 128
+
+# Vertical padding Gradio's own .grid-wrap adds above and below the row (8px
+# each). Subtracted when deriving the square cell width from the row height,
+# exactly as the output gallery's CSS does with its literal 16.
+INPUT_GALLERY_PADDING: int = 16
+
+# ---------------------------------------------------------------------------
 # Qt app-window geometry (persisted across sessions by launcher.py)
 # ---------------------------------------------------------------------------
 WINDOW_GEOMETRY_UNSET: int = -1   # sentinel for "no saved x/y yet"
@@ -1476,10 +1618,16 @@ APP_STATE: Dict[str, Any] = {
 def init_session_state() -> None:
     """Prime APP_STATE from disk once, at startup (called by launcher.main()).
 
-    Only last_image_browse_dir needs priming — it is the one piece of this
-    state that persists across runs. Doing it here means the picker's first
-    open costs no JSON read, and it keeps "load at startup" honest rather
-    than lazy-loading on first click.
+    TWO pieces of this state persist across runs and are primed here:
+    last_image_browse_dir (configuration.json — where the "Add Image" picker
+    opens) and ref_mode (generation.json — the Use All / Chain All switch).
+    Doing both at startup means the picker's first open and the first Add cost
+    no JSON read, and it keeps "load at startup" honest rather than lazy-
+    loading on first use.
+
+    The reference-image LIST is the one thing deliberately NOT restored: those
+    paths are the user's own files and may not exist next launch, so the list
+    always starts empty (see the GENERATION_KEYS note).
     """
     cfg = load_configuration()
     saved = cfg.get("last_image_browse_dir", "") or ""
@@ -1487,7 +1635,8 @@ def init_session_state() -> None:
         saved = str(get_pictures_dir())
     APP_STATE["last_image_browse_dir"] = saved
     APP_STATE["ref_images"] = []
-    APP_STATE["ref_mode"] = REF_MODE_DEFAULT
+    mode = load_generation().get("imagegen_ref_mode", REF_MODE_DEFAULT)
+    APP_STATE["ref_mode"] = mode if mode in REF_MODE_CHOICES else REF_MODE_DEFAULT
 
 
 def get_last_image_dir() -> str:
@@ -1538,15 +1687,39 @@ def set_ref_images(paths: List[str]) -> None:
 
 
 def get_ref_mode() -> str:
-    """Current Use All / Chain All selection. REF_MODE_DEFAULT until the user
-    changes it; whatever they chose after that, for the rest of the session."""
+    """Current Use All / Chain All selection. Seeded from generation.json at
+    startup (init_session_state) and owned by the user from then on."""
     mode = APP_STATE.get("ref_mode") or REF_MODE_DEFAULT
     return mode if mode in REF_MODE_CHOICES else REF_MODE_DEFAULT
 
 
 def set_ref_mode(mode: str) -> None:
-    if mode in REF_MODE_CHOICES:
-        APP_STATE["ref_mode"] = mode
+    """Record a Use All / Chain All change in session state AND on disk.
+
+    This used to be session-only, on the grounds that a remembered "Use All"
+    silently reintroduces the multi-reference VRAM spike on the next launch.
+    It now persists because "every setting on the Generation page is saved on
+    submission" is the rule, and this is a setting on that page.
+
+    The original worry is defused rather than ignored: the reference-image
+    list itself is NOT restored, so a launch that starts with Use All starts
+    with zero images to apply it to. The radio is hidden below 2 images, and by
+    the time the user has added a second one they have made a deliberate choice
+    to build a multi-reference edit. If you ever want the old behaviour back,
+    drop the update_generation() call here and the load_generation() read in
+    init_session_state(); nothing else depends on it.
+
+    A failed write costs the next session its remembered mode and nothing
+    else, so it must never break the click that caused it."""
+    if mode not in REF_MODE_CHOICES:
+        return
+    if APP_STATE.get("ref_mode") == mode:
+        return
+    APP_STATE["ref_mode"] = mode
+    try:
+        update_generation({"imagegen_ref_mode": mode})
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Generation phase timing  (transient — not persisted to disk)
@@ -1608,6 +1781,11 @@ def get_configuration_path() -> Path:
 def get_preferences_path() -> Path:
     """data/preferences.json — everything set on the Preferences page."""
     return _get_project_root() / "data" / "preferences.json"
+
+
+def get_generation_path() -> Path:
+    """data/generation.json — everything set on the Generation page."""
+    return _get_project_root() / "data" / "generation.json"
 
 
 def _legacy_persistent_path() -> Path:
@@ -1756,6 +1934,26 @@ def _resolve_pictures_dir() -> Path:
         if candidate.is_dir():
             return candidate
     return Path.home()
+
+
+def get_dictionaries_dir() -> Path:
+    """data/dictionaries — Chromium .bdic spellcheck dictionaries.
+
+    Read by launcher.py, which points QtWebEngine at this folder via the
+    QTWEBENGINE_DICTIONARIES_PATH environment variable so the prompt boxes get
+    red squiggles under misspelled words. Populated once at install time by
+    installer.install_spellcheck_dictionary().
+
+    Entirely offline: the dictionary is a local binary file and Chromium's
+    spellchecker reads it in-process. Nothing is sent anywhere. (Chromium also
+    has a "spelling service" mode that POSTs text to Google — that is a
+    SEPARATE feature, off by default, and QtWebEngine exposes no way to switch
+    it on, so there is no path by which prompt text could leave the machine.)
+    """
+    return _get_project_root() / "data" / "dictionaries"
+
+
+SPELLCHECK_LANGUAGE: str = "en-US"
 
 
 def get_build_dir() -> Path:
@@ -2072,20 +2270,11 @@ def _default_configuration() -> Dict[str, Any]:
         # a gguf quant is strongly preferred because this runs on the CPU and
         # t5xxl_fp16 is 9.8GB of system RAM for one conditioning pass.
         "t5xxl_model_path":    "",  "t5xxl_model_name":    "",
-        # img2img denoise strength: 0.0 returns the init image untouched, 1.0
-        # ignores it entirely. sd.cpp's own default is 0.75, but I use 0.65.
-        "imagegen_strength": 0.65,
         # v-prediction override for SDXL finetunes; see sdxl_prediction_override.
         "imagegen_prediction": PREDICTION_AUTO,
         # Manual model-family override for files auto-detection cannot place;
         # see FAMILY_OVERRIDE_CHOICES.
         "imagegen_family_override": FAMILY_OVERRIDE_AUTO,
-        # The family_step_cfg_key() the saved steps/cfg/size values belong to.
-        # Steps and CFG mean different things per family -- cfg 1.5 is correct
-        # for a distilled model and badly wrong for SDXL base, which wants ~7 --
-        # so the Generation page needs to know whether the current values were
-        # chosen FOR the current family or inherited from a different one.
-        "imagegen_last_family": "",
         "last_model_browse_dir": ".\\models",
         # Starting folder for the Generate page's "Add Image" picker. Unlike
         # last_model_browse_dir (which sensibly starts at .\models, where this
@@ -2095,8 +2284,7 @@ def _default_configuration() -> Dict[str, Any]:
         # redirected to OneDrive or another drive. Overwritten with whatever
         # folder they actually browse to (see set_last_image_dir).
         "last_image_browse_dir": str(get_pictures_dir()),
-        "backend_encoder": cpu_label,
-        "backend_imagegen": cpu_label,
+        "backend_processing": cpu_label,
         "encoder_threads": dt,
         "encoder_batch_size": 512,
         "encoder_ctx_size": 4096,
@@ -2114,18 +2302,15 @@ def _default_configuration() -> Dict[str, Any]:
                                if (is_cpu_only or gpu < 0)
                                else DIFFUSER_PLACEMENT_FULL_GPU),
         "imagegen_threads": dt,
-        "imagegen_width": 512,
-        "imagegen_height": 512,
-        "imagegen_steps": 6,
-        "imagegen_cfg_scale": 1.0,
-        "imagegen_seed": -1,
-        "imagegen_sampling": "euler_a",
-        "imagegen_batch_count": 2,
         "imagegen_clip_skip": 2,
-        "imagegen_quality_preset": "Fast (Turbo)",
-        "output_format": "png",
+        # Everything the Generation page owns -- width/height/steps/cfg/seed/
+        # sampler/batch/format/preset/strength/prompts -- used to live here and
+        # now lives in data/generation.json (see _default_generation() and
+        # GENERATION_KEYS). Nothing may be listed in both files: a key in two
+        # files is written by whichever page saved last and read from whichever
+        # file the caller happened to load, which is exactly the bug the
+        # configuration/preferences split was made to avoid.
         "auto_save": True,
-        "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
         "ui_theme": "Default",
         "first_run": True,
         # Qt app-window geometry, saved on shutdown and restored on next
@@ -2165,16 +2350,29 @@ def save_constants(config: configparser.ConfigParser) -> None:
         config.write(f)
 
 
-def _load_json_with_defaults(path: Path, defaults: Dict[str, Any]) -> Dict[str, Any]:
+def _load_json_with_defaults(path: Path, defaults: Dict[str, Any],
+                             migrate=None) -> Dict[str, Any]:
     """Read a JSON dict, backfilling any keys missing because the file was
     written by an older version of the program (e.g. before the window-geometry
     keys existed). Saved values always win; defaults only fill genuine gaps, so
-    this never overwrites real user data. Unreadable/corrupt -> defaults."""
+    this never overwrites real user data. Unreadable/corrupt -> defaults.
+
+    `migrate`, if given, is applied to the RAW file contents BEFORE the defaults
+    are merged in, and must return the rewritten dict. The ordering is the whole
+    point and was worth a bug to learn: a migration that renames a key cannot
+    run after the backfill, because by then the NEW key is present with its
+    default value and the migration cannot tell "the user already has this" from
+    "the backfill just invented it". Renaming backend_encoder/backend_imagegen
+    to backend_processing that way silently threw away a saved GPU choice and
+    reset the user to CPU. Before the merge, the raw dict says only what the
+    user actually saved."""
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
+                    if migrate is not None:
+                        data = migrate(data)
                     merged = dict(defaults)
                     merged.update(data)
                     return merged
@@ -2195,11 +2393,40 @@ def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 
 # ── configuration.json (Configuration page) ────────────────────────────────
 
+def _migrate_split_backends(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold a pre-merge configuration.json's two backend keys into one.
+
+    backend_encoder and backend_imagegen used to be separate dropdowns, on the
+    theory that the Qwen3 encoder and the sd.cpp diffuser could usefully sit on
+    different devices. In practice they never did: on a one-GPU machine there is
+    no second device to split across, and the encoder/VAE-to-CPU decision that
+    actually matters is made per FAMILY by the spec table (encoder_to_cpu /
+    vae_to_cpu) and by the Diffuser Placement dropdown -- not by this control.
+    Two dropdowns that were always set the same thing is one dropdown.
+
+    The IMAGEGEN value wins when the two disagree. It is the one that governs
+    the expensive half of the run, so if a user ever did set them apart, that is
+    the choice worth keeping.
+
+    Both old keys are dropped, so nothing is left behind for a later reader to
+    pick up. In-place on the dict, before the caller sees it; the file itself is
+    rewritten on the next save rather than eagerly here, since a stale pair of
+    keys sitting in the JSON is inert once nothing reads them.
+    """
+    legacy = cfg.pop("backend_imagegen", None) or cfg.pop("backend_encoder", None)
+    cfg.pop("backend_encoder", None)
+    if legacy and not cfg.get("backend_processing"):
+        cfg["backend_processing"] = legacy
+    return cfg
+
+
 def load_configuration() -> Dict[str, Any]:
     """Load data/configuration.json, migrating a pre-split persistent.json
     into place first if that is all that exists."""
     _migrate_legacy_persistent()
-    cfg = _load_json_with_defaults(get_configuration_path(), _default_configuration())
+    cfg = _load_json_with_defaults(get_configuration_path(),
+                                   _default_configuration(),
+                                   migrate=_migrate_split_backends)
     # Refresh the module-level family override on every load, so that
     # diffuser_family() -- called from a dozen places that only have a path --
     # sees the user's current choice without an extra argument everywhere.
@@ -2227,6 +2454,7 @@ def _default_preferences() -> Dict[str, Any]:
     return {
         "prompt_template": DEFAULT_PROMPT_TEMPLATE,
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
+        "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
         "encoder_model_debug": False,
     }
 
@@ -2275,6 +2503,289 @@ def update_preferences(updates: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+# ── generation.json (Generation page) ──────────────────────────────────────
+# The THIRD settings file, and the same rule as the other two: one page owns
+# one file, and no key appears in more than one.
+#
+#   configuration.json  this machine's wiring -- model paths, backends,
+#                       threads, device indices, window geometry. Reseeded by
+#                       the installer on a clean install.
+#   preferences.json    standing taste -- prompt template, thumbnail counts.
+#   generation.json     what was on the Generation page when Generate was last
+#                       clicked.
+#
+# WHY IT IS SEPARATE. These values are not machine wiring and they are not
+# standing taste; they are the state of one page, they change on every run, and
+# they are the set most likely to want wiping or hand-editing on their own. Two
+# concrete consequences of the old arrangement, both fixed by the split:
+#   * a clean install deletes configuration.json, which took the user's last
+#     working steps/cfg/size/prompt with it even though a reinstall invalidates
+#     none of them. generation.json is seeded once and never purged, exactly
+#     like preferences.json and prompt_cache.json.
+#   * the Configuration page's Save wrote the whole configuration dict back,
+#     so its save and the Generation page's auto-save were two writers on one
+#     file racing over unrelated keys.
+#
+# WHAT IS NOT IN HERE: the reference-image LIST. Those paths are the user's own
+# files and may well not exist next launch (a temp folder, a removed USB
+# stick, a renamed directory), so restoring them would repopulate the input
+# column with dead paths that only fail at generation time. The list stays
+# session-only in APP_STATE, and the Generation page opens with it empty.
+# imagegen_ref_mode -- the Use All / Chain All switch -- IS saved: it is a
+# setting rather than a file reference, and it survives having no images to
+# apply to (with 0 or 1 images the radio is hidden and the value is simply
+# not consulted).
+GENERATION_KEYS: List[str] = [
+    "imagegen_width", "imagegen_height",
+    "imagegen_steps", "imagegen_cfg_scale",
+    "imagegen_sampling", "imagegen_seed",
+    "imagegen_batch_count", "imagegen_quality_preset",
+    "imagegen_strength", "imagegen_ref_mode",
+    "imagegen_last_family",
+    "output_format",
+    "last_prompt", "negative_prompt",
+]
+
+
+# ---------------------------------------------------------------------------
+# Per-family generation DEFAULTS -- the full "optimal settings for this model"
+# set, not just steps and cfg.
+# ---------------------------------------------------------------------------
+# FAMILY_STEP_CFG above already carries the two numbers that matter most, and
+# it stays the source of truth for those. This table adds the rest of the
+# Generation page: sampler, batch count and denoise strength. Together they are
+# what family_generation_defaults() returns, and that ONE function is what both
+# the "Restore To Defaults" button and the on-model-change snap apply, so the
+# two can never drift into recommending different things.
+#
+#   sampler   Not a taste setting -- it interacts with the scheduler each
+#             family was distilled against.
+#               flux1     : euler, per stable-diffusion.cpp's docs/flux.md.
+#                           (Individual finetunes may print a different
+#                           recommendation on their model card -- fluxedUp
+#                           asks for dpm++2m -- which is exactly why this is a
+#                           starting point the user can change, not a lock.)
+#               flux2     : euler_a. Deliberately NOT plain euler despite
+#                           Flux.2 being a rectified-flow model: on this
+#                           sd.cpp build euler comes out semi-garbled on the
+#                           target hardware and euler_a is clean. Measured,
+#                           not assumed.
+#               z-image   : euler_a. Both work; this is the better default.
+#               sdxl_base : dpm++2m, the long-standing SDXL standard and what
+#                           nearly every finetune's card recommends.
+#               sdxl_dist : euler_a. The distilled derivatives want the simple
+#                           sampler their few-step schedule was trained on.
+#
+#   batch     How many images per Generate click. 1 for the SLOW families
+#             (flux1_dev at 20 steps, flux2_base at 20, sdxl_base at 30) and 2
+#             for the few-step distilled ones. This is the setting most likely
+#             to make a model feel broken on an 8GB card: a batch of 2 at 20+
+#             steps is several minutes before anything appears on screen, and
+#             the natural read of that is "it has hung". Fast models get 2
+#             because a second variation is nearly free and genuinely useful.
+#
+#   strength  img2img denoise. Only consulted by the families that use the -i
+#             init-image path (flux1, sdxl); Flux.2 conditions through -r and
+#             has no strength parameter at all. 0.65 throughout: enough to
+#             restyle while keeping composition, and the value this program has
+#             always used in place of sd.cpp's more destructive 0.75.
+FAMILY_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "flux1_dev":       {"sampler": "euler",   "batch": 1, "strength": 0.65},
+    "flux1_schnell":   {"sampler": "euler",   "batch": 2, "strength": 0.65},
+    "flux2_distilled": {"sampler": "euler_a", "batch": 2, "strength": 0.65},
+    "flux2_base":      {"sampler": "euler_a", "batch": 1, "strength": 0.65},
+    "z-image":         {"sampler": "euler_a", "batch": 2, "strength": 0.65},
+    "sdxl_base":       {"sampler": "dpm++2m", "batch": 1, "strength": 0.65},
+    "sdxl_distilled":  {"sampler": "euler_a", "batch": 2, "strength": 0.65},
+    "none":            {"sampler": "euler_a", "batch": 2, "strength": 0.65},
+}
+
+# Resolution is the ONE default that is deliberately NOT per-family.
+#
+# Every family here is natively 1024 and every one of them looks better there,
+# so a "best settings" table would put 1024 in all eight rows -- and that is
+# precisely the wrong default on the hardware this program targets. The compute
+# buffer scales with pixel count, so 1024 is roughly four times the VRAM of 512
+# (measured for FLUX.1 at ~1366 MB per megapixel; Flux.2 is ~3000). On an 8GB
+# card that is the difference between a run that completes and a run that OOMs
+# or falls back to streaming weights from system RAM at a fraction of the
+# speed.
+#
+# So 512x512 is fixed across all families: it is the size that WORKS, on every
+# sensible model, on the smallest card this program supports. Raising it is a
+# deliberate act the user takes once they know their model loads -- which is
+# the right way round, because a conservative default that always runs beats a
+# better-looking one that sometimes cannot.
+#
+# Guarded with a membership test rather than assumed: 512 is in every entry of
+# FAMILY_IMAGE_SIZES today, but if a future family's floor were ever raised
+# above it the fallback keeps this returning a value the dropdown will accept.
+DEFAULT_GENERATION_WIDTH:  int = 512
+DEFAULT_GENERATION_HEIGHT: int = 512
+
+# The factory negative prompt. Named because three separate places want the
+# same literal -- _default_generation(), family_generation_defaults() (for the
+# Restore To Defaults button) and installer.py's write_default_generation() --
+# and three hand-copied string literals is three chances to drift.
+DEFAULT_NEGATIVE_PROMPT: str = (
+    "Visual obstructions. Cartoon. Blurry. Background people. Missing/mutated arms/legs. Missing/mutated hands/feet. Well covered, winter clothing. Phones, headphones."
+)
+
+
+def family_generation_defaults(diff_path: str, diff_arch: str = "") -> Dict[str, Any]:
+    """The complete set of optimal Generation-page settings for a diffuser.
+
+    Returns real values (not gr.updates) keyed exactly as generation.json is,
+    so the same dict can seed widgets, be written to disk, or be diffed against
+    what is on screen. Every key the Generation page owns is present EXCEPT the
+    two prompts: the positive prompt is the user's own work and no "defaults"
+    button should ever delete it, and the negative prompt is handled separately
+    by the caller (see display._restore_generation_defaults) because resetting
+    boilerplate is reasonable on an explicit button press but not on a model
+    change.
+
+    Composed from FAMILY_STEP_CFG (steps/cfg), FAMILY_GENERATION_DEFAULTS
+    (sampler/batch/strength) and the fixed 512x512 resolution. Always returns a
+    valid set: an unknown model falls back to the 'none' entry, which is the
+    permissive superset.
+    """
+    key = family_step_cfg_key(diff_path, diff_arch)
+    spec = FAMILY_STEP_CFG.get(key, FAMILY_STEP_CFG["none"])
+    extra = FAMILY_GENERATION_DEFAULTS.get(key, FAMILY_GENERATION_DEFAULTS["none"])
+    sizes = FAMILY_IMAGE_SIZES.get(key, IMAGE_SIZES)
+
+    def _size(preferred: int) -> int:
+        return preferred if preferred in sizes else min(sizes)
+
+    return {
+        "imagegen_width":  _size(DEFAULT_GENERATION_WIDTH),
+        "imagegen_height": _size(DEFAULT_GENERATION_HEIGHT),
+        "imagegen_steps":       spec["steps"][1],
+        "imagegen_cfg_scale":   spec["cfg"][3],
+        "imagegen_sampling":    extra["sampler"],
+        "imagegen_batch_count": extra["batch"],
+        "imagegen_strength":    extra["strength"],
+        # -1 = a fresh random seed each run. A pinned seed is only meaningful
+        # against one specific model at one specific size, so it never survives
+        # into a defaults set.
+        "imagegen_seed": -1,
+        "output_format": "png",
+        # 512x512 with the family's own steps/cfg/sampler IS the Fast (Turbo)
+        # preset (see GENERATION_PRESET_SIZES / resolve_preset), so naming it
+        # here keeps the dropdown honest rather than leaving it reading
+        # "Custom" over a set of values it would itself produce.
+        "imagegen_quality_preset": "Fast (Turbo)",
+    }
+
+
+def _default_generation() -> Dict[str, Any]:
+    """Defaults for generation.json. Kept in step with installer.py's
+    write_default_generation(); that one seeds the file at install time, this
+    one backfills gaps at load time.
+
+    Every key here must appear in GENERATION_KEYS, and none of them may appear
+    in _default_configuration() or _default_preferences()."""
+    return {
+        "imagegen_width": 512,
+        "imagegen_height": 512,
+        "imagegen_steps": 6,
+        "imagegen_cfg_scale": 1.0,
+        "imagegen_seed": -1,
+        "imagegen_sampling": "euler_a",
+        "imagegen_batch_count": 2,
+        "imagegen_quality_preset": "Fast (Turbo)",
+        # img2img denoise strength: 0.0 returns the init image untouched, 1.0
+        # ignores it entirely. sd.cpp's own default is 0.75, but I use 0.65.
+        "imagegen_strength": 0.65,
+        # Use All / Chain All. Chain All is the safer default (one reference
+        # resident at a time); see REF_MODE_DEFAULT.
+        "imagegen_ref_mode": REF_MODE_DEFAULT,
+        # The family_step_cfg_key() the saved steps/cfg/size values belong to.
+        # Steps and CFG mean different things per family -- cfg 1.5 is correct
+        # for a distilled model and badly wrong for SDXL base, which wants ~7 --
+        # so the Generation page needs to know whether the current values were
+        # chosen FOR the current family or inherited from a different one.
+        "imagegen_last_family": "",
+        "output_format": "png",
+        "last_prompt": "",
+        "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
+    }
+
+
+def load_generation() -> Dict[str, Any]:
+    """Load data/generation.json.
+
+    On the first load after this file was introduced it does not exist yet,
+    but the user's real values are sitting in configuration.json where they
+    used to live. Rather than silently resetting a working setup to factory
+    defaults, they are carried across here and REMOVED from the configuration
+    file, so exactly one file owns each key from then on. Same one-shot
+    migration pattern as load_preferences() uses for prompt_template.
+    """
+    path = get_generation_path()
+    if path.exists():
+        return _load_json_with_defaults(path, _default_generation())
+
+    migrated = _default_generation()
+    _migrate_legacy_persistent()
+    cfg_path = get_configuration_path()
+    if cfg_path.exists():
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                old_cfg = json.load(f)
+            if isinstance(old_cfg, dict):
+                moved = False
+                for key in GENERATION_KEYS:
+                    if key in old_cfg:
+                        migrated[key] = old_cfg.pop(key)
+                        moved = True
+                if moved:
+                    _save_json_atomic(cfg_path, old_cfg)
+        except (json.JSONDecodeError, IOError, OSError):
+            pass
+    try:
+        _save_json_atomic(path, migrated)
+    except OSError:
+        pass
+    return migrated
+
+
+def save_generation(data: Dict[str, Any]) -> None:
+    """Write generation.json, keeping ONLY the keys this file owns.
+
+    The filter matters because the caller is do_generate(), which holds a
+    merged configuration+preferences+generation dict (inference.py wants one
+    dict, not three). Writing that whole thing back would copy every model
+    path and the prompt template into this file, recreating the duplicate-key
+    problem the split exists to prevent."""
+    _save_json_atomic(get_generation_path(),
+                      {k: v for k, v in data.items() if k in GENERATION_KEYS})
+
+
+def update_generation(updates: Dict[str, Any]) -> Dict[str, Any]:
+    data = load_generation()
+    data.update({k: v for k, v in updates.items() if k in GENERATION_KEYS})
+    save_generation(data)
+    return data
+
+
+def generation_config() -> Dict[str, Any]:
+    """The single merged dict a generation run needs: configuration.json,
+    then preferences.json, then generation.json, later files winning.
+
+    inference.generate_image() and enhance_prompt() take ONE cfg dict and read
+    keys from all three pages out of it -- model paths and devices from
+    configuration, prompt_template from preferences, everything on the
+    Generation page from generation. Merged here, in the one place that knows
+    about all three files, so neither inference.py nor any save handler has to
+    know the split exists. The key sets are disjoint by construction, so the
+    merge order only matters as a tiebreak that should never fire."""
+    merged = dict(load_configuration())
+    merged.update(load_preferences())
+    merged.update(load_generation())
+    return merged
+
+
 def get_max_thumbnails() -> int:
     """Thumbnail display cap from preferences, clamped to a listed choice so a
     hand-edited preferences.json cannot ask the gallery for 100000 images."""
@@ -2283,6 +2794,23 @@ def get_max_thumbnails() -> int:
     except (TypeError, ValueError):
         return DEFAULT_MAX_THUMBNAILS
     return value if value in MAX_THUMBNAIL_CHOICES else DEFAULT_MAX_THUMBNAILS
+
+
+def get_input_thumbnail_size() -> int:
+    """Input-gallery row height in pixels, from preferences, clamped to a
+    listed choice so a hand-edited preferences.json cannot ask for a 4000px
+    row that would push the Output preview off the page entirely.
+
+    Read by BOTH display._build_generate_tab_inner (the gr.Gallery height=
+    kwarg) and display.build_app (the #input-gallery CSS, which carries
+    !important and would otherwise silently win). One accessor, so the two
+    cannot disagree."""
+    try:
+        value = int(load_preferences().get("input_thumbnail_size",
+                                           DEFAULT_INPUT_THUMBNAIL))
+    except (TypeError, ValueError):
+        return DEFAULT_INPUT_THUMBNAIL
+    return value if value in INPUT_THUMBNAIL_CHOICES else DEFAULT_INPUT_THUMBNAIL
 
 
 # ---------------------------------------------------------------------------
@@ -2456,20 +2984,29 @@ GENERATION_PRESET_SIZES: Dict[str, Optional[Tuple[int, int]]] = {
 
 def resolve_preset(name: str, diffuser_name: str = "") -> Dict[str, Any]:
     """Full settings for a preset given the loaded diffuser: the preset's
-    resolution plus the family's tuned steps / cfg / sampler (from
-    FAMILY_STEP_CFG defaults; sampler is always euler_a, the good default for
-    both families). Empty dict for 'Custom'/unknown -> caller leaves widgets
-    as they are."""
+    resolution plus the family's tuned steps / cfg / sampler. Empty dict for
+    'Custom'/unknown -> caller leaves widgets as they are.
+
+    The sampler comes from FAMILY_GENERATION_DEFAULTS rather than being
+    hardcoded to euler_a as it once was. That hardcoding meant picking any
+    named preset silently overwrote the family's correct sampler -- handing
+    euler_a to SDXL base (which wants dpm++2m) and to FLUX.1 (which wants
+    euler per docs/flux.md). One table now answers "what sampler does this
+    family want", for the presets, the defaults button and the model-change
+    snap alike."""
     size = GENERATION_PRESET_SIZES.get(name)
     if not size:
         return {}
     spec = family_step_cfg(diffuser_name)
     _, step_default = spec["steps"]
     _, _, _, cfg_default = spec["cfg"]
+    key = family_step_cfg_key(diffuser_name)
+    sampler = FAMILY_GENERATION_DEFAULTS.get(
+        key, FAMILY_GENERATION_DEFAULTS["none"])["sampler"]
     w, h = size
     return {
         "imagegen_width": w, "imagegen_height": h,
         "imagegen_steps": step_default,
         "imagegen_cfg_scale": cfg_default,
-        "imagegen_sampling": "euler_a",
+        "imagegen_sampling": sampler,
     }
