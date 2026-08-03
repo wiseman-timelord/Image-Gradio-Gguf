@@ -9,6 +9,7 @@ Writes:
 ./data/constants.ini      - hardware constants, thread counts, GPU info
 ./data/configuration.json - default Configuration page settings (only if absent)
 ./data/preferences.json   - default Preferences page settings (only if absent)
+./data/generation.json    - default Generation page settings (only if absent)
 ./data/prompt_cache.json  - default Positive/Negative Prompt (history) log (only if absent)
 No imports from scripts.* — this is self-contained.
 """
@@ -50,6 +51,13 @@ _CONST_PATH  = _DATA_DIR / "constants.ini"
 # is still lying around at runtime.
 _CONFIG_PATH  = _DATA_DIR / "configuration.json"
 _PREFS_PATH   = _DATA_DIR / "preferences.json"
+# generation.json - the Generation page's own settings (width/height/steps/cfg/
+# seed/sampler/batch/format/preset/strength/prompts). Third of the three
+# settings files, one per UI page. Seeded once and NEVER purged, like
+# preferences.json and prompt_cache.json: a reinstall invalidates nothing in
+# here, and the values are the user's last working generation setup. Kept in
+# step with scripts/configure.py's GENERATION_KEYS / _default_generation().
+_GENERATION_PATH = _DATA_DIR / "generation.json"
 _LEGACY_PERSIST_PATH = _DATA_DIR / "persistent.json"
 # prompt_cache.json - "Positive/Negative Prompt (history)" rolling log (see
 # scripts/configure.py's POSITIVE_HISTORY_KEYS / NEGATIVE_HISTORY_KEYS for the
@@ -749,14 +757,30 @@ def write_default_configuration(cpu: Dict[str, Any],
         # all leave these blank.
         "clip_l_model_path": "", "clip_l_model_name": "",
         "clip_g_model_path": "", "clip_g_model_name": "",
+        # T5-XXL, FLUX.1's SECOND text encoder (it takes clip_l + t5xxl, where
+        # split SDXL takes clip_l + clip_g). Accepts .safetensors or .gguf; a
+        # gguf quant is strongly preferred, because this program runs the
+        # FLUX.1 encoders on the CPU and t5xxl_fp16 is 9.8GB of system RAM for
+        # a single conditioning pass.
+        #
+        # These two were missing here while scripts/configure.py's
+        # _default_configuration() had them, so a fresh install wrote a
+        # configuration.json with no T5 keys at all and relied on the load-time
+        # backfill to invent them. Harmless in practice but a real drift
+        # between the two lists, and it is the FLUX.1 slot specifically -- the
+        # family that cannot generate at all without it.
+        "t5xxl_model_path": "", "t5xxl_model_name": "",
         "last_model_browse_dir": ".\\models",
         # Starting folder for the Generate page's "Add Image" picker. Models
         # live under .\models, but reference images are the user's own files,
         # so this starts at their Pictures folder for THIS login and is then
         # overwritten with wherever they actually browse to.
         "last_image_browse_dir": _default_pictures_dir(),
-        "backend_encoder": "CPU",
-        "backend_imagegen": "CPU",
+        # ONE choice for both halves of a run -- the encoder pass and the
+        # sd-cli pass. Replaced the separate backend_encoder / backend_imagegen
+        # pair, which were only ever set to the same value. Mirrors
+        # scripts/configure.py's _default_configuration().
+        "backend_processing": "CPU",
         "encoder_threads": dt,
         "encoder_batch_size": 512,
         "encoder_ctx_size": 4096,
@@ -768,17 +792,7 @@ def write_default_configuration(cpu: Dict[str, Any],
         "imagegen_vulkan_device": gpu,
         "imagegen_placement": ("Full GPU" if has_gpu else "Full CPU"),
         "imagegen_threads": dt,
-        "imagegen_width": 512,
-        "imagegen_height": 512,
-        "imagegen_steps": 6,
-        "imagegen_cfg_scale": 1.5,
-        "imagegen_seed": -1,
-        "imagegen_sampling": "euler_a",
-        "imagegen_batch_count": 2,
         "imagegen_clip_skip": 2,
-        # img2img denoise strength: 0.0 returns the input image untouched,
-        # 1.0 ignores it entirely. sd.cpp's own default is 0.75.
-        "imagegen_strength": 0.75,
         # v-prediction override for SDXL finetunes. "Auto" infers it from the
         # filename, since the gguf conversion drops the v-pred marker and
         # sd.cpp would otherwise assume eps and produce washed-out output.
@@ -787,13 +801,13 @@ def write_default_configuration(cpu: Dict[str, Any],
         # (sd.cpp-native checkpoints carry no architecture metadata, and many
         # SDXL finetunes have no "xl" token in the filename).
         "imagegen_family_override": "Auto",
-        # Which family the saved steps/cfg/size values were chosen for; see
-        # configure.py's matching entry.
-        "imagegen_last_family": "",
-        "imagegen_quality_preset": "Fast (Turbo)",
-        "output_format": "png",
+        # NOTE: the Generation page's own settings -- width, height, steps,
+        # cfg scale, seed, sampler, batch count, quality preset, strength,
+        # output format and the two prompts -- are NOT here. They live in
+        # generation.json (see write_default_generation). Listing a key in two
+        # files means it gets written by whichever page saved last and read
+        # from whichever file the caller happened to load.
         "auto_save": True,
-        "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
         "ui_theme": "Default",
         "first_run": True,
         "window_x": -1,
@@ -832,6 +846,11 @@ def write_default_preferences() -> None:
     defaults: Dict[str, Any] = {
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
         "max_thumbnails": 50,
+        # Pixel size of the Generation page's Input thumbnail strip. 128 is a
+        # deliberate middle: the strip shares the right-hand column with the
+        # 500px Output preview, so a larger value buys identifiability at the
+        # preview's expense. Mirrors configure.DEFAULT_INPUT_THUMBNAIL.
+        "input_thumbnail_size": 128,
         "encoder_model_debug": False,
     }
     tmp = _PREFS_PATH.with_suffix(".tmp")
@@ -839,6 +858,60 @@ def write_default_preferences() -> None:
         json.dump(defaults, f, indent=4, ensure_ascii=False)
     tmp.replace(_PREFS_PATH)
     log(f"preferences.json written -> {_PREFS_PATH}")
+
+
+def write_default_generation() -> None:
+    """Seed generation.json with defaults, if it does not already exist.
+
+    Takes no hardware arguments: nothing on the Generation page depends on the
+    machine. Like preferences.json and prompt_cache.json it is NOT purged by a
+    clean install or a config refresh -- these are the settings the user's last
+    working generation ran with, and a reinstall invalidates none of them.
+
+    A first run after upgrading from a build that predates this file finds it
+    absent here and creates it with factory defaults, but the user's REAL
+    values are still sitting in configuration.json where they used to live.
+    scripts/configure.py's load_generation() migrates them across (and strips
+    them from configuration.json) the first time the program reads this file,
+    so upgrading loses nothing whichever order the two run in: this function
+    only ever writes a file that is missing, and the migration only ever fires
+    when it is missing too.
+
+    Kept in step with scripts/configure.py's GENERATION_KEYS /
+    _default_generation(); that one backfills gaps at load time, this one seeds
+    the file at install time.
+    """
+    if _GENERATION_PATH.exists():
+        log(f"generation.json already present -> {_GENERATION_PATH} (kept)")
+        return
+
+    defaults: Dict[str, Any] = {
+        "imagegen_width": 512,
+        "imagegen_height": 512,
+        "imagegen_steps": 6,
+        "imagegen_cfg_scale": 1.0,
+        "imagegen_seed": -1,
+        "imagegen_sampling": "euler_a",
+        "imagegen_batch_count": 2,
+        "imagegen_quality_preset": "Fast (Turbo)",
+        # img2img denoise strength: 0.0 returns the input image untouched,
+        # 1.0 ignores it entirely. sd.cpp's own default is 0.75.
+        "imagegen_strength": 0.65,
+        # Use All / Chain All for multi-reference input. Chain All is the safe
+        # default: it holds one reference in VRAM at a time.
+        "imagegen_ref_mode": "Chain All",
+        # Which family the saved steps/cfg/size values were chosen for; see
+        # configure.py's matching entry.
+        "imagegen_last_family": "",
+        "output_format": "png",
+        "last_prompt": "",
+        "negative_prompt": "Visual obstructions. Cartoon. Blurry. Background people. Missing/mutated arms/legs. Missing/mutated hands/feet. Well covered, winter clothing. Phones, headphones.",
+    }
+    tmp = _GENERATION_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(defaults, f, indent=4, ensure_ascii=False)
+    tmp.replace(_GENERATION_PATH)
+    log(f"generation.json written -> {_GENERATION_PATH}")
 
 
 def write_default_prompt_cache() -> None:
@@ -869,6 +942,114 @@ def write_default_prompt_cache() -> None:
         json.dump(defaults, f, indent=4, ensure_ascii=False)
     tmp.replace(_PROMPT_CACHE_PATH)
     log(f"prompt_cache.json written -> {_PROMPT_CACHE_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Spellcheck dictionary (offline)
+# ---------------------------------------------------------------------------
+# The prompt boxes get red squiggles under misspelled words. That is a Chromium
+# feature and it works entirely in-process against a LOCAL binary dictionary --
+# nothing is sent anywhere. (Chromium's "spelling service", which does POST
+# text to Google, is a separate feature that is off by default and that
+# QtWebEngine exposes no way to enable, so there is no path by which prompt
+# text could leave the machine.)
+#
+# QtWebEngine will not accept a Hunspell dictionary directly: it needs the
+# Chromium .bdic binary format, produced from a .dic/.aff pair by
+# qwebengine_convert_dict, a tool that ships inside the PyQt6 wheel we already
+# install. So the install step is: fetch the two Hunspell files, run them
+# through the converter, drop the result in data/dictionaries.
+#
+# Source is the LibreOffice dictionaries repository -- the standard upstream
+# for en_US Hunspell files, already on the allow-list this installer downloads
+# everything else from.
+_DICT_DIR = _DATA_DIR / "dictionaries"
+_DICT_LANG = "en-US"
+_DICT_BASE = "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/en/"
+_DICT_FILES = ("en_US.aff", "en_US.dic")
+
+
+def _find_convert_dict_tool() -> Optional[Path]:
+    """Locate qwebengine_convert_dict(.exe) inside the installed PyQt6.
+
+    Its location has moved between PyQt6 releases, so several known layouts are
+    tried rather than one hardcoded path. Returns None if the tool is absent,
+    which is not an error -- spellcheck is a nicety and its absence must not
+    fail an install."""
+    site = _VENV_DIR / ("Lib/site-packages" if platform.system() == "Windows"
+                        else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+    exe = "qwebengine_convert_dict.exe" if platform.system() == "Windows" else "qwebengine_convert_dict"
+    candidates = [
+        site / "PyQt6" / "Qt6" / "bin" / exe,
+        site / "PyQt6" / "Qt6" / "libexec" / exe,
+        site / "PyQt6" / "Qt6" / "translations" / exe,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # Last resort: a full sweep of the PyQt6 tree.
+    pyqt = site / "PyQt6"
+    if pyqt.exists():
+        for found in pyqt.rglob(exe):
+            return found
+    return None
+
+
+def install_spellcheck_dictionary() -> None:
+    """Fetch and compile the en-US spellcheck dictionary, if not already present.
+
+    ENTIRELY NON-FATAL. Every failure path -- no converter in this PyQt6 build,
+    no network, a changed upstream layout, a converter that errors -- logs one
+    line and returns. The program runs identically without it; the prompt boxes
+    simply do not underline anything, which is exactly the behaviour before this
+    existed. An image generator must not refuse to install because a spelling
+    dictionary could not be built.
+
+    Like preferences.json this is seeded once and never purged: the .bdic is
+    derived data, but re-downloading it on every clean install would be a
+    pointless round trip.
+    """
+    section("Spellcheck dictionary...")
+    target = _DICT_DIR / f"{_DICT_LANG}.bdic"
+    if target.exists():
+        log(f"{_DICT_LANG}.bdic already present -> {target} (kept)")
+        return
+
+    tool = _find_convert_dict_tool()
+    if tool is None:
+        log("qwebengine_convert_dict not found in this PyQt6 build.")
+        log("  Skipping - prompt spellcheck will be inactive. Not an error.")
+        return
+
+    _DICT_DIR.mkdir(parents=True, exist_ok=True)
+    staging = _DICT_DIR / "_src"
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        # The converter derives the .aff name from the .dic name, so both must
+        # share a basename -- and that basename becomes the language code Qt
+        # matches against, hence en-US rather than the upstream en_US.
+        for remote in _DICT_FILES:
+            ext = Path(remote).suffix
+            dest = staging / f"{_DICT_LANG}{ext}"
+            log(f"Downloading {remote}...")
+            _http_download(_DICT_BASE + remote, dest)
+
+        log("Converting to Chromium .bdic format...")
+        result = subprocess.run(
+            [str(tool), str(staging / f"{_DICT_LANG}.dic"), str(target)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0 or not target.exists():
+            log(f"Converter failed (exit {result.returncode}).")
+            log(f"  {(result.stderr or result.stdout or '').strip()[:300]}")
+            log("  Skipping - prompt spellcheck will be inactive. Not an error.")
+            return
+        log(f"{_DICT_LANG}.bdic written -> {target}")
+    except Exception as e:
+        log(f"Could not build spellcheck dictionary: {e}")
+        log("  Skipping - prompt spellcheck will be inactive. Not an error.")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1941,9 +2122,10 @@ def _purge_for_clean_install() -> None:
     if _LEGACY_PERSIST_PATH.exists():
         _LEGACY_PERSIST_PATH.unlink()
         log("persistent.json removed (superseded by configuration.json).")
-    # preferences.json and prompt_cache.json are deliberately NOT purged --
-    # they hold the user's own standing choices and typed prompt history,
-    # none of which a reinstall can invalidate.
+    # preferences.json, generation.json and prompt_cache.json are deliberately
+    # NOT purged -- they hold the user's own standing choices, their last
+    # working generation settings, and their typed prompt history, none of
+    # which a reinstall can invalidate.
     if _CONST_PATH.exists():
         _CONST_PATH.unlink()
         log("constants.ini removed (will be regenerated).")
@@ -2094,6 +2276,8 @@ def _run_summary(t0: float) -> None:
     log(f"constants.ini: {_state(_CONST_PATH, 'hardware constants')}")
     log(f"configuration: {_state(_CONFIG_PATH, 'configuration page settings')}")
     log(f"preferences  : {_state(_PREFS_PATH, 'preferences page settings')}")
+    log(f"generation   : {_state(_GENERATION_PATH, 'generation page settings')}")
+    log(f"spellcheck   : {_state(_DICT_DIR / (_DICT_LANG + '.bdic'), 'prompt spellcheck dictionary - optional')}")
     log(f"venv python  : {_state(_venv_python(), 'python environment')}")
     log(f"llama        : {_state(_ROOT / LLAMA_BIN_DIR / LLAMA_BIN_NAME, 'encoder binary')}")
 
@@ -2183,7 +2367,9 @@ def main() -> None:
         write_constants(cpu, vk)
         write_default_configuration(cpu, vk)
         write_default_preferences()
+        write_default_generation()
         write_default_prompt_cache()
+        install_spellcheck_dictionary()
         log("Detection complete.")
         return
 
@@ -2192,7 +2378,9 @@ def main() -> None:
         write_constants(cpu, vk)
         write_default_configuration(cpu, vk)
         write_default_preferences()
+        write_default_generation()
         write_default_prompt_cache()
+        install_spellcheck_dictionary()
         t0 = time.time()
         _run_deps(cpu)
         _run_summary(t0)
@@ -2234,7 +2422,9 @@ def main() -> None:
             # be anchored to a GPU that actually exists on this machine.
             write_default_configuration(cpu, vk)
             write_default_preferences()
+            write_default_generation()
             write_default_prompt_cache()
+            install_spellcheck_dictionary()
             _run_summary(t0)
             return
         if choice == "2":
@@ -2248,7 +2438,9 @@ def main() -> None:
             write_constants(cpu, vk, use_vulkan=use_vulkan)
             write_default_configuration(cpu, vk)
             write_default_preferences()
+            write_default_generation()
             write_default_prompt_cache()
+            install_spellcheck_dictionary()
             _run_summary(t0)
             return
         if choice == "3":
@@ -2269,7 +2461,9 @@ def main() -> None:
             # preferences.json survives a config refresh: nothing in it is
             # machine-derived, so there is nothing to refresh.
             write_default_preferences()
+            write_default_generation()
             write_default_prompt_cache()
+            install_spellcheck_dictionary()
             _run_summary(t0)
             return
             

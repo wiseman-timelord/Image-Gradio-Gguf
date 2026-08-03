@@ -61,6 +61,83 @@ SERVER_NAME = "127.0.0.1"
 SERVER_PORT = 7860
 
 
+# Injected into the page <head>. Gradio renders its textareas with spellcheck
+# turned off, so even with a dictionary loaded Chromium would underline
+# nothing. This turns it back on for the two prompt boxes ONLY -- not for the
+# read-only status bar, the model-path boxes (full of filenames and drive
+# letters that are not words) or anything else.
+#
+# A MutationObserver is needed rather than a one-shot pass: Gradio mounts the
+# textareas after the initial document load, and re-mounts them whenever the
+# component re-renders, which would drop a statically-applied attribute. The
+# callback is idempotent and only touches nodes whose attribute is not already
+# correct, so the observer costs a cheap query per mutation batch and nothing
+# else.
+_SPELLCHECK_HEAD = """
+<script>
+(function () {
+  var SEL = '#prompt-positive textarea, #prompt-negative textarea';
+  var queued = false;
+  function apply() {
+    queued = false;
+    document.querySelectorAll(SEL).forEach(function (t) {
+      if (t.getAttribute('spellcheck') !== 'true') {
+        t.setAttribute('spellcheck', 'true');
+        t.setAttribute('lang', 'en-US');
+      }
+    });
+  }
+  function schedule() {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(apply);
+  }
+  document.addEventListener('DOMContentLoaded', schedule);
+  new MutationObserver(schedule).observe(document.documentElement, {
+    childList: true, subtree: true
+  });
+  schedule();
+})();
+</script>
+"""
+
+
+def _configure_spellcheck_env() -> bool:
+    """Point QtWebEngine at our local dictionary folder. Returns whether a
+    dictionary is actually present.
+
+    MUST run before the QApplication (and therefore before any QWebEngineProfile)
+    is created -- QtWebEngine reads this environment variable once, during engine
+    initialisation, and ignores later changes.
+
+    Everything here is local: a .bdic file on disk, read in-process by
+    Chromium's Hunspell. No network, no service, nothing leaves the machine.
+    Returns False when the installer could not build the dictionary, in which
+    case spellcheck stays off and the app is otherwise unchanged.
+    """
+    import os
+    dict_dir = configure.get_dictionaries_dir()
+    bdic = dict_dir / f"{configure.SPELLCHECK_LANGUAGE}.bdic"
+    if not bdic.exists():
+        return False
+    os.environ["QTWEBENGINE_DICTIONARIES_PATH"] = str(dict_dir)
+    return True
+
+
+def _enable_spellcheck(view) -> None:
+    """Switch on the profile's spellchecker. Off by default in QtWebEngine.
+
+    Wrapped because it is a nicety: a PyQt6 build without the spellcheck
+    feature compiled in raises on these calls, and that must cost the user a
+    squiggle, not their program."""
+    try:
+        profile = view.page().profile()
+        profile.setSpellCheckEnabled(True)
+        profile.setSpellCheckLanguages([configure.SPELLCHECK_LANGUAGE])
+    except Exception as e:
+        print(f"  NOTE: spellcheck unavailable ({e})")
+
+
 def _print_banner() -> None:
     cpu = configure.get_cpu_info()
     vk  = configure.get_vulkan_info()
@@ -155,6 +232,7 @@ class AppWindow(QMainWindow):
 
         self.view = QWebEngineView(self)
         self.view.setPage(_QuietPage(self.view))
+        _enable_spellcheck(self.view)
         self.setCentralWidget(self.view)
         self.view.load(QUrl(url))
 
@@ -247,7 +325,13 @@ def main() -> None:
     # resets the session-only entries (reference-image list, Use All /
     # Chain All mode) to their launch defaults.
     configure.init_session_state()
+    # Before the banner so its line reports the real state, and well before the
+    # QApplication -- QtWebEngine reads the dictionaries path exactly once, at
+    # engine start, and ignores it afterwards.
+    _spell_ok = _configure_spellcheck_env()
     _print_banner()
+    print(f"  Spellcheck: {'en-US dictionary loaded' if _spell_ok else 'no dictionary (prompt spellcheck off)'}")
+    print()
     blocks_app, _css = display.build_app()
 
     # Suppress the Starlette deprecation warning from Gradio internals
@@ -271,6 +355,9 @@ def main() -> None:
         show_error=True,
         theme=gr.themes.Soft(),
         css=_css,
+        # Re-enables the browser's own offline spellchecker on the two prompt
+        # boxes; see _SPELLCHECK_HEAD.
+        head=_SPELLCHECK_HEAD,
     )
 
     if not _wait_for_server(SERVER_NAME, SERVER_PORT):
