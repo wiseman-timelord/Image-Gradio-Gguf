@@ -905,7 +905,7 @@ def write_default_generation() -> None:
         "imagegen_last_family": "",
         "output_format": "png",
         "last_prompt": "",
-        "negative_prompt": "Visual obstructions. Cartoon. Blurry. Background people. Missing/mutated arms/legs. Missing/mutated hands/feet. Well covered, winter clothing. Phones, headphones.",
+        "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
     }
     tmp = _GENERATION_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -965,91 +965,88 @@ def write_default_prompt_cache() -> None:
 # everything else from.
 _DICT_DIR = _DATA_DIR / "dictionaries"
 _DICT_LANG = "en-US"
-_DICT_BASE = "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/en/"
-_DICT_FILES = ("en_US.aff", "en_US.dic")
+# Chromium publishes its spellcheck dictionaries ALREADY COMPILED to .bdic.
+# That matters: QtWebEngine will not read a Hunspell .dic/.aff pair, and the
+# qwebengine_convert_dict tool that would compile one is NOT shipped in the
+# PyQt6 wheels (verified against pyqt6_webengine_qt6 win_amd64, which contains
+# only QtWebEngineProcess.exe). So an earlier attempt to fetch Hunspell files
+# and convert them locally could never have worked on this install. Taking the
+# prebuilt file removes the converter from the picture entirely.
+#
+# This is the same source and the same URL scheme qutebrowser's dictcli.py
+# uses. Filenames are VERSIONED (en-US-10-1.bdic and so on), so the directory
+# is listed first rather than guessing a name that changes upstream.
+# ?format=JSON and ?format=TEXT are gitiles conventions: the former returns a
+# JSON listing behind an XSSI prefix, the latter returns the file base64-encoded.
+#
+# ONE download, at install time, of a static language file. Nothing is
+# consulted at runtime: Chromium's spellchecker reads the local .bdic
+# in-process, and the "spelling service" that would send text to Google is a
+# separate feature, off by default, with no way to enable it from QtWebEngine.
+_DICT_API = ("https://chromium.googlesource.com/chromium/deps/"
+             "hunspell_dictionaries.git/+/main/")
 
 
-def _find_convert_dict_tool() -> Optional[Path]:
-    """Locate qwebengine_convert_dict(.exe) inside the installed PyQt6.
-
-    Its location has moved between PyQt6 releases, so several known layouts are
-    tried rather than one hardcoded path. Returns None if the tool is absent,
-    which is not an error -- spellcheck is a nicety and its absence must not
-    fail an install."""
-    site = _VENV_DIR / ("Lib/site-packages" if platform.system() == "Windows"
-                        else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
-    exe = "qwebengine_convert_dict.exe" if platform.system() == "Windows" else "qwebengine_convert_dict"
-    candidates = [
-        site / "PyQt6" / "Qt6" / "bin" / exe,
-        site / "PyQt6" / "Qt6" / "libexec" / exe,
-        site / "PyQt6" / "Qt6" / "translations" / exe,
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    # Last resort: a full sweep of the PyQt6 tree.
-    pyqt = site / "PyQt6"
-    if pyqt.exists():
-        for found in pyqt.rglob(exe):
-            return found
+def _existing_bdic() -> Optional[Path]:
+    """Any en-US*.bdic already in place. Glob rather than an exact name because
+    the upstream files carry a version suffix, and Qt itself matches by prefix."""
+    if not _DICT_DIR.exists():
+        return None
+    for f in sorted(_DICT_DIR.glob(f"{_DICT_LANG}*.bdic")):
+        return f
     return None
 
 
 def install_spellcheck_dictionary() -> None:
-    """Fetch and compile the en-US spellcheck dictionary, if not already present.
+    """Fetch the prebuilt en-US spellcheck dictionary, if not already present.
 
-    ENTIRELY NON-FATAL. Every failure path -- no converter in this PyQt6 build,
-    no network, a changed upstream layout, a converter that errors -- logs one
-    line and returns. The program runs identically without it; the prompt boxes
-    simply do not underline anything, which is exactly the behaviour before this
-    existed. An image generator must not refuse to install because a spelling
-    dictionary could not be built.
+    ENTIRELY NON-FATAL. No network, a changed upstream layout, a proxy in the
+    way -- each logs one line and returns. The program runs identically without
+    it; the prompt boxes simply do not underline anything. An image generator
+    must not refuse to install because a spelling dictionary was unreachable.
 
-    Like preferences.json this is seeded once and never purged: the .bdic is
-    derived data, but re-downloading it on every clean install would be a
-    pointless round trip.
+    Seeded once and never purged, like preferences.json.
     """
     section("Spellcheck dictionary...")
-    target = _DICT_DIR / f"{_DICT_LANG}.bdic"
-    if target.exists():
-        log(f"{_DICT_LANG}.bdic already present -> {target} (kept)")
+    existing = _existing_bdic()
+    if existing is not None:
+        log(f"dictionary already present -> {existing} (kept)")
         return
 
-    tool = _find_convert_dict_tool()
-    if tool is None:
-        log("qwebengine_convert_dict not found in this PyQt6 build.")
-        log("  Skipping - prompt spellcheck will be inactive. Not an error.")
-        return
-
-    _DICT_DIR.mkdir(parents=True, exist_ok=True)
-    staging = _DICT_DIR / "_src"
-    staging.mkdir(parents=True, exist_ok=True)
     try:
-        # The converter derives the .aff name from the .dic name, so both must
-        # share a basename -- and that basename becomes the language code Qt
-        # matches against, hence en-US rather than the upstream en_US.
-        for remote in _DICT_FILES:
-            ext = Path(remote).suffix
-            dest = staging / f"{_DICT_LANG}{ext}"
-            log(f"Downloading {remote}...")
-            _http_download(_DICT_BASE + remote, dest)
+        import urllib.request, base64, json as _json
+        log("Listing available dictionaries...")
+        with urllib.request.urlopen(_DICT_API + "?format=JSON", timeout=60) as r:
+            raw = r.read().decode("utf-8", "replace")
+        # gitiles prefixes JSON with an anti-XSSI guard line that is not valid
+        # JSON; strip everything up to the first brace.
+        listing = _json.loads(raw[raw.index("{"):])
 
-        log("Converting to Chromium .bdic format...")
-        result = subprocess.run(
-            [str(tool), str(staging / f"{_DICT_LANG}.dic"), str(target)],
-            capture_output=True, text=True, timeout=180,
-        )
-        if result.returncode != 0 or not target.exists():
-            log(f"Converter failed (exit {result.returncode}).")
-            log(f"  {(result.stderr or result.stdout or '').strip()[:300]}")
+        names = [e.get("name", "") for e in listing.get("entries", [])]
+        matches = sorted(n for n in names
+                         if n.startswith(_DICT_LANG) and n.endswith(".bdic"))
+        if not matches:
+            log(f"No {_DICT_LANG} dictionary found upstream.")
             log("  Skipping - prompt spellcheck will be inactive. Not an error.")
             return
-        log(f"{_DICT_LANG}.bdic written -> {target}")
+        # Highest version last after a sort; the names embed -MAJOR-MINOR.
+        remote = matches[-1]
+
+        log(f"Downloading {remote}...")
+        with urllib.request.urlopen(_DICT_API + remote + "?format=TEXT",
+                                    timeout=180) as r:
+            payload = base64.b64decode(r.read())
+
+        _DICT_DIR.mkdir(parents=True, exist_ok=True)
+        target = _DICT_DIR / remote
+        tmp = target.with_suffix(".tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(target)
+        log(f"dictionary written -> {target} ({len(payload) // 1024} KB)")
     except Exception as e:
-        log(f"Could not build spellcheck dictionary: {e}")
+        log(f"Could not fetch spellcheck dictionary: {e}")
         log("  Skipping - prompt spellcheck will be inactive. Not an error.")
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        log("  Re-run installation later to retry; nothing else is affected.")
 
 
 # ---------------------------------------------------------------------------
@@ -2277,7 +2274,8 @@ def _run_summary(t0: float) -> None:
     log(f"configuration: {_state(_CONFIG_PATH, 'configuration page settings')}")
     log(f"preferences  : {_state(_PREFS_PATH, 'preferences page settings')}")
     log(f"generation   : {_state(_GENERATION_PATH, 'generation page settings')}")
-    log(f"spellcheck   : {_state(_DICT_DIR / (_DICT_LANG + '.bdic'), 'prompt spellcheck dictionary - optional')}")
+    _bd = _existing_bdic()
+    log(f"spellcheck   : {_state(_bd, 'prompt spellcheck dictionary - optional') if _bd else 'MISSING (optional - prompt spellcheck inactive)'}")
     log(f"venv python  : {_state(_venv_python(), 'python environment')}")
     log(f"llama        : {_state(_ROOT / LLAMA_BIN_DIR / LLAMA_BIN_NAME, 'encoder binary')}")
 

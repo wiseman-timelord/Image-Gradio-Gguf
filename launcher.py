@@ -117,8 +117,11 @@ def _configure_spellcheck_env() -> bool:
     """
     import os
     dict_dir = configure.get_dictionaries_dir()
-    bdic = dict_dir / f"{configure.SPELLCHECK_LANGUAGE}.bdic"
-    if not bdic.exists():
+    # Glob, not an exact filename: Chromium's dictionaries carry a version
+    # suffix (en-US-10-1.bdic), the installer keeps whatever name upstream
+    # published, and Qt itself matches by language-code PREFIX. Requiring an
+    # exact "en-US.bdic" would find the file only by luck.
+    if not any(dict_dir.glob(f"{configure.SPELLCHECK_LANGUAGE}*.bdic")):
         return False
     os.environ["QTWEBENGINE_DICTIONARIES_PATH"] = str(dict_dir)
     return True
@@ -330,7 +333,17 @@ def main() -> None:
     # engine start, and ignores it afterwards.
     _spell_ok = _configure_spellcheck_env()
     _print_banner()
-    print(f"  Spellcheck: {'en-US dictionary loaded' if _spell_ok else 'no dictionary (prompt spellcheck off)'}")
+    if _spell_ok:
+        print("  Spellcheck: en-US dictionary loaded (prompt boxes underline typos)")
+    else:
+        # Actionable, not just a status. The dictionary is built by the
+        # installer, so a user upgrading from a build that predates spellcheck
+        # has everything EXCEPT the .bdic and no reason to guess that re-running
+        # option 2 is what fixes it.
+        print("  Spellcheck: OFF - no dictionary at "
+              f"{configure.get_dictionaries_dir()}")
+        print("              Run option 2 (Installation) from the batch menu "
+              "to download it.")
     print()
     blocks_app, _css = display.build_app()
 
