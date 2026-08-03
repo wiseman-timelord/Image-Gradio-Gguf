@@ -717,7 +717,7 @@ def _allow_local_files(paths: List[str]) -> None:
 # prompt text before sd-cli ever sees it). Z-Image and Flux.2 are the opposite:
 # there the Encoder IS the conditioner and is mandatory.
 _ENC_LABEL_CONDITIONER = "Encoder Name"
-_ENC_LABEL_ENHANCER    = "External Encoder (optional)"
+_ENC_LABEL_ENHANCER    = "Encoder Name (optional)"
 _ENC_INFO_CONDITIONER  = "Qwen3 text encoder — required; conditions the diffuser."
 _ENC_INFO_ENHANCER     = ("Optional — used only to expand the prompt text. "
                           "This diffuser conditions through its own encoders "
@@ -2071,10 +2071,22 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
         This function existed before but was never wired to anything, which is
         why the reference list and (now) the input thumbnails could go stale
-        after a round trip through another tab."""
+        after a round trip through another tab.
+
+        Denoise Strength IS included, and is the one overlap with the other
+        handler. That is deliberate belt-and-braces: it is the widget whose
+        staleness is most visible and most misleading (a strength slider on
+        screen for Flux.2 promises a control sd-cli will never be given, since
+        Flux.2 conditions through -r references and has no strength parameter).
+        Both handlers compute it from the same _render_strength_visibility, so
+        they cannot disagree -- one just guarantees the other. The cost of the
+        duplicate is one redundant update per tab click; the cost of missing it
+        is a control that lies about what the model will do.
+        """
         imgs = configure.get_ref_images()
         gal, row = _render_input_gallery(imgs)
-        return _render_ref_list(imgs), gal, row
+        return (_render_ref_list(imgs), gal, row,
+                _render_strength_visibility(len(imgs)))
 
     def _on_ref_mode_change(mode):
         """Record the user's Use All / Chain All choice in session state, so
@@ -2278,7 +2290,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     _gen["generate_tab"].select(
         _resync_ref_widgets,
         inputs=None,
-        outputs=[_gen["ref_list_tb"], _gen["input_gallery"], _gen["input_row"]],
+        outputs=[_gen["ref_list_tb"], _gen["input_gallery"], _gen["input_row"],
+                 _gen["strength_sld"]],
     )
 
     # Clicking an input thumbnail puts that image in the preview box, so a
@@ -3050,6 +3063,37 @@ def _wire_config_events(status_box: gr.Textbox) -> None:
         ],
         outputs=[status_box, _gen["generate_row"], _gen["prompt_tb"],
                  _gen["negative_tb"]],
+    ).then(
+        # ── Refresh the Generation page AT THE MOMENT THE MODEL CHANGES ─────
+        # Saving here is the only way the diffusion model can change, and every
+        # family-dependent control on the Generation page is now stale: the
+        # Settings header names the old family, the steps/cfg/size choice lists
+        # are the old family's, and — the visible symptom that prompted this —
+        # Denoise Strength is still on screen after switching from FLUX.1 (which
+        # denoises from an -i init image and has a strength) to Flux.2 (which
+        # conditions through -r references and has no strength parameter at
+        # all, so the slider promises a control sd-cli will never receive).
+        #
+        # All of that WAS handled, but only by the generate_tab.select handler
+        # — so the correction landed whenever the user next clicked the tab,
+        # not when the change happened. Anything that got them back to the page
+        # without a fresh tab-select left the stale widgets showing. Driving the
+        # same helper from the save closes that window: by the time the user
+        # looks at the Generation page it is already correct, whatever route
+        # they took to get there.
+        #
+        # Identical function and identical outputs to the tab-select wiring, so
+        # the two paths cannot drift. Running it twice (save, then a tab click)
+        # is harmless: it is idempotent, and the second pass sees the family
+        # marker already updated and so does nothing.
+        _generate_family_updates,
+        inputs=[_gen["steps_dd"], _gen["cfg_scale_sld"],
+                _gen["width_dd"], _gen["height_dd"]],
+        outputs=[_gen["settings_header"], _gen["ref_row"], status_box,
+                 _gen["sampler_dd"], _gen["steps_dd"], _gen["cfg_scale_sld"],
+                 _gen["width_dd"], _gen["height_dd"], _gen["strength_sld"],
+                 _gen["ref_mode_radio"], _gen["batch_dd"],
+                 _gen["output_fmt_dd"], _gen["seed_num"], _gen["preset_dd"]],
     )
 
     # ── Revert To Defaults ──
@@ -3336,6 +3380,18 @@ def _collect_debug() -> str:
         pre = utilities.check_prerequisites()
         L.append(f"  cmake            : {pre['cmake_path'] or 'not found'}")
         L.append(f"  git              : {pre['git_path'] or 'not found'}")
+        # Prompt spellcheck. Reported here because it is invisible when it
+        # fails: the prompt boxes simply do not underline anything, which looks
+        # identical to "there are no typos". The dictionary is built by the
+        # installer, so the fix is always the same and is worth stating rather
+        # than leaving the user to work out.
+        _bdic = configure.get_dictionaries_dir() / f"{configure.SPELLCHECK_LANGUAGE}.bdic"
+        if _bdic.exists():
+            L.append(f"  spellcheck dict  : {_bdic}")
+        else:
+            L.append(f"  spellcheck dict  : NOT BUILT — prompt spellcheck is off")
+            L.append(f"                     expected at {_bdic}")
+            L.append(f"                     run option 2 (Installation) to build it")
         L.append("")
 
         # --- Models ---
