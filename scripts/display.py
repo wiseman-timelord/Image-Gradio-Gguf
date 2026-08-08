@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-display.py - Gradio 6 UI for Image-Glamour-Gguf.
+display.py - Gradio 6 UI for Image-Gradio-Gguf.
 Four tabs: Generate | Configuration | Preferences | Debug / Info
 Build/install functionality lives in installer.py only.
 
@@ -151,31 +151,12 @@ def _browse_file(file_types: Optional[List[Tuple[str, str]]] = None) -> str:
 # so the picker can never offer a format stb_image cannot decode — or hide one
 # it can. PNG/JPEG get their own entries because they are what people actually
 # have.
-#
-# EVERY JPEG SPELLING, AND PATTERNS AS TUPLES. Both are the fix for .jpeg
-# files not appearing in the dialog next to .jpg ones:
-#
-#   * .jpeg was in the extension set and .jfif/.jpe were not, so the "Image
-#     files" group covered two of the four spellings this format goes by.
-#     configure.JPEG_EXTS is now the single list, and stb_image sniffs file
-#     CONTENT rather than the name, so all four decode identically — an
-#     omitted spelling only ever hid a file the backend could read.
-#   * The patterns are TUPLES now, not one space-joined string per group.
-#     Tk hands a string straight to Tcl to be re-parsed as a list; a tuple is
-#     built as a list by tkinter itself, which is the documented form and does
-#     not depend on that round-trip. On a Tk build where the round-trip
-#     mangles a long group, the symptom is exactly this: some extensions in
-#     the group work and the rest are silently dropped.
-#
-# If a file still does not appear, the "All files" entry at the bottom of the
-# dialog's type dropdown always shows everything — nothing downstream filters
-# on extension except inference.py's decode gate, which reads the same set.
 _FILETYPES_IMAGE = [
-    ("Image files", tuple(f"*{ext}"
-                          for ext in sorted(configure.SUPPORTED_REF_IMAGE_EXTS))),
-    ("JPEG",        tuple(f"*{ext}" for ext in configure.JPEG_EXTS)),
-    ("PNG",         ("*.png",)),
-    ("All files",   ("*.*",)),
+    ("Image files", " ".join(f"*{ext}"
+                             for ext in sorted(configure.SUPPORTED_REF_IMAGE_EXTS))),
+    ("PNG",         "*.png"),
+    ("JPEG",        "*.jpg *.jpeg"),
+    ("All files",   "*.*"),
 ]
 
 
@@ -601,11 +582,7 @@ def _get_recent_images(max_images: Optional[int] = None) -> List[str]:
     if max_images is None:
         max_images = configure.get_max_thumbnails()
     out_dir = configure.get_output_dir()
-    # Built from the same set the picker and the decode gate use, plus .webp:
-    # sd.cpp cannot WRITE webp, but a user may well have dropped one into
-    # .\\output by hand and a thumbnail strip that hides files that are
-    # sitting in the folder is its own small mystery.
-    exts = set(configure.SUPPORTED_REF_IMAGE_EXTS) | {".webp"}
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
     try:
         current_mtime = out_dir.stat().st_mtime if out_dir.exists() else 0.0
         # If the directory hasn't changed, reuse the cached full list
@@ -1044,19 +1021,11 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
         except Exception:
             pass      # a failed write only costs one extra snap next time
 
-    # STEPS in glamour mode come from configure.GLAMOUR_STEP_CHOICES, not from
-    # the family table. The per-family lists exist to stop a saved 30 (SDXL)
-    # being pushed into a Z-Image dropdown that only offers 4-12 -- a problem
-    # this program no longer has, because it runs one family and offers one
-    # list. Pushing the family list here would silently widen the dropdown
-    # back to the full STEP_CHOICES range the moment the user visited the tab.
-    step_choices = configure.GLAMOUR_STEP_CHOICES
-    step_default = configure.GLAMOUR_DEFAULT_STEPS
     try:
         cs = int(cur_steps)
     except (TypeError, ValueError):
         cs = None
-    step_val = cs if cs in step_choices else step_default
+    step_val = step_default if family_changed else (cs if cs in step_choices else step_default)
     steps_upd = gr.update(choices=step_choices, value=step_val)
 
     try:
@@ -1087,21 +1056,13 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
     # every family -- which stopped being true once SDXL base (dpm++2m) and
     # FLUX.1 (euler) were supported, and left whichever sampler the previous
     # model wanted silently applied to the new one.
-    # PINNED WIDGETS GET NO-OPS. Sampler, batch, seed and quality preset are
-    # not user settings in glamour mode -- they are constants read straight
-    # from configure.GLAMOUR_* at run time -- so there is nothing for a family
-    # change to snap. Returning gr.update() rather than deleting these keeps
-    # the outputs= list in the two tab-select handlers valid without them
-    # having to know which widgets are live.
-    #
-    # OUTPUT FORMAT is also a no-op, but for a different reason: it IS a live
-    # user setting here, and snapping it on a family change would silently
-    # revert a deliberate choice of JPG the next time the tab was opened.
-    sampler_upd = gr.update()
-    batch_upd   = gr.update()
-    fmt_upd     = gr.update()
-    seed_upd    = gr.update()
-    preset_upd  = gr.update()
+    _snap = (lambda key: gr.update(value=defaults[key]) if family_changed
+             else gr.update())
+    sampler_upd = _snap("imagegen_sampling")
+    batch_upd   = _snap("imagegen_batch_count")
+    fmt_upd     = _snap("output_format")
+    seed_upd    = _snap("imagegen_seed")
+    preset_upd  = _snap("imagegen_quality_preset")
 
     # Strength carries a value as well as its visibility: it is meaningful only
     # for -i families with an image loaded, but when the family changes the
@@ -1113,11 +1074,7 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
 
     return (
         gr.update(value=f"### Settings ({fam_label})"),
-        # ref_row stays visible whatever the family reports. See the block
-        # comment where it is built: this program is Flux.2-only, so the
-        # input-image controls are never inapplicable, and re-hiding them on a
-        # tab visit would undo the fix for the fresh-install blank state.
-        gr.update(visible=True),
+        gr.update(visible=takes_image),
         status,
         sampler_upd,
         steps_upd,
@@ -1125,13 +1082,10 @@ def _generate_family_updates(cur_steps: Any = None, cur_cfg: Any = None,
         width_upd,
         height_upd,
         strength_upd,
-        # The Use All / Chain All radio is permanently hidden in glamour mode.
-        # Use All fuses every accumulated photo into ONE generation as multiple
-        # -r references, which is exactly wrong here: each photo is a different
-        # person and wants their own set of images, never a composite. Chaining
-        # is not a preference on this page, it is the only correct behaviour,
-        # so it is not offered as a decision.
-        gr.update(visible=False),
+        # The mode radio depends on the FAMILY as well as the image count, so
+        # it is re-synced here: switching from Flux.2 to SDXL on the
+        # Configuration page must retract it even though no image changed.
+        gr.update(visible=bool(takes_multi and len(configure.get_ref_images()) > 1)),
         batch_upd,
         fmt_upd,
         seed_upd,
@@ -1193,148 +1147,48 @@ def _build_generate_tab_inner() -> None:
         # sections read left-to-right as: tune → describe/input/go → view.
         with gr.Column(scale=1):
             _gen["settings_header"] = gr.Markdown(f"### Settings ({_initial_family_label})")
-
-            # ── The three controls glamour mode actually exposes ─────────────
-            # Subject Count is framing, not a resolution picker. The user
-            # knows how many people are in the photo; they should not also
-            # have to know that three people want 768x512. The mapping lives
-            # in configure.SUBJECT_COUNT_SIZES and is applied at run time.
-            _gen["subject_count_radio"] = gr.Radio(
-                label="Subject Count",
-                choices=configure.SUBJECT_COUNT_CHOICES,
-                value=_seed(gen.get("imagegen_subject_count",
-                                    configure.SUBJECT_COUNT_DEFAULT),
-                            configure.SUBJECT_COUNT_CHOICES,
-                            configure.SUBJECT_COUNT_DEFAULT),
-                info="Sets framing: portrait, square or landscape.",
-            )
-
-            # Subject Gender sits immediately under Subject Count because the
-            # two are read TOGETHER: it is the pair, not either alone, that
-            # picks the word substituted into the subject clause's <gender>
-            # mark (configure.GENDER_WORDS -- nine combinations, seven
-            # distinct words, since "males"/"females" cover 2 and 3+ alike).
-            #
-            # This is the fix for the long-haired-man problem: with the text
-            # silent on gender, Flux.2 infers presentation from hair and build
-            # and puts men in dresses. One word in the prompt settles it, and
-            # it must be a switch rather than prompt text because the right
-            # word changes with the headcount.
-            _gen["gender_radio"] = gr.Radio(
-                label="Subject Gender",
-                choices=configure.GENDER_CHOICES,
-                value=_seed(gen.get("imagegen_gender",
-                                    configure.GENDER_DEFAULT),
-                            configure.GENDER_CHOICES,
-                            configure.GENDER_DEFAULT),
-                info=("Fills <gender> in the subject clause. M+F(s) at "
-                      "1 Person reads as transgender."),
-            )
-
-            # Subject Bodyshape, the second half of "who is in the shot" that
-            # Flux.2 will otherwise invent. Its prior runs gym-fit: a slight
-            # person comes back broader than they are, which is the same class
-            # of error as the long-haired man in a dress.
-            #
-            # SIX CHOICES ON ONE ROW, ordered skinny -> obese so the control
-            # reads as a scale rather than a menu. Unlike gender this does not
-            # interact with Subject Count -- "a bodyshape of skinny" describes
-            # one person and four equally well -- so it is a flat map
-            # (configure.BODYSHAPE_WORDS) and the wording is tuned there, not
-            # by editing the three clauses.
-            _gen["bodyshape_radio"] = gr.Radio(
-                label="Subject Bodyshape",
-                choices=configure.BODYSHAPE_CHOICES,
-                value=_seed(gen.get("imagegen_bodyshape",
-                                    configure.BODYSHAPE_DEFAULT),
-                            configure.BODYSHAPE_CHOICES,
-                            configure.BODYSHAPE_DEFAULT),
-                info=("Fills <bodyshape>. Average is not a no-op — it is what "
-                      "counters the model's gym-fit default."),
-            )
-
-            # Four-way, not a single/all toggle. Picking one scene is how a
-            # prompt gets tuned: run Scene 3 alone, read the result, edit
-            # Scene 3 on the Preferences page, run it again. A single/all
-            # toggle would make that cost a full three-scene run each time
-            # with two thirds discarded.
-            _gen["location_mode_radio"] = gr.Radio(
-                label="Scene Selection",
-                choices=configure.LOCATION_MODE_CHOICES,
-                value=_seed(gen.get("imagegen_location_mode",
-                                    configure.LOCATION_MODE_DEFAULT),
-                            configure.LOCATION_MODE_CHOICES,
-                            configure.LOCATION_MODE_DEFAULT),
-                info=("All Scenes runs the three in series — one photo "
-                      "becomes three images."),
-            )
-
             with gr.Row():
-                _gen["steps_dd"] = gr.Dropdown(
-                    label="Diffuse Steps",
-                    choices=configure.GLAMOUR_STEP_CHOICES,
-                    value=_seed(gen.get("imagegen_steps",
-                                        configure.GLAMOUR_DEFAULT_STEPS),
-                                configure.GLAMOUR_STEP_CHOICES,
-                                configure.GLAMOUR_DEFAULT_STEPS),
-                )
-                _gen["output_fmt_dd"] = gr.Dropdown(
-                    label="Output Format", choices=configure.OUTPUT_FORMATS,
-                    value=_seed(gen.get("output_format",
-                                        configure.GLAMOUR_OUTPUT_FORMAT),
-                                configure.OUTPUT_FORMATS,
-                                configure.GLAMOUR_OUTPUT_FORMAT),
-                )
-
-            # ── Retained-but-hidden widgets ──────────────────────────────────
-            # These are NOT dead code and should not be deleted casually. A
-            # dozen handlers elsewhere in this file list them in inputs= or
-            # outputs= (_generate_family_updates, the Configuration page's
-            # save_all, the two tab-select refreshers, _restore_generation_
-            # defaults). Gradio raises at build time on a handler naming a
-            # component that does not exist, so removing them here means
-            # editing every one of those call sites in the same commit.
-            #
-            # They are kept visible=False and their values are IGNORED at run
-            # time: do_generate() reads configure.GLAMOUR_* directly rather
-            # than trusting what is in them. So whatever a stale
-            # generation.json or a family-update handler writes into these
-            # boxes, it cannot change what actually runs.
-            with gr.Column(visible=False):
                 _gen["preset_dd"] = gr.Dropdown(
                     label="Quality Preset", choices=list(presets.keys()),
                     value=gen.get("imagegen_quality_preset", "Fast (Turbo)"),
-                    visible=False,
                 )
                 _gen["sampler_dd"] = gr.Dropdown(
                     label="Sampler Type", choices=list(configure.SAMPLER_MAP.keys()),
-                    value="euler_a", visible=False,
+                    value=gen.get("imagegen_sampling", "euler_a"),
                 )
-                _gen["width_dd"] = gr.Dropdown(
+            with gr.Row():
+                _gen["width_dd"]  = gr.Dropdown(
                     label="Image Width", choices=_initial_sizes,
                     value=_seed(gen.get("imagegen_width", 512), _initial_sizes, 512),
-                    visible=False,
                 )
                 _gen["height_dd"] = gr.Dropdown(
                     label="Image Height", choices=_initial_sizes,
-                    value=_seed(gen.get("imagegen_height", 768), _initial_sizes, 512),
-                    visible=False,
+                    value=_seed(gen.get("imagegen_height", 512), _initial_sizes, 512),
+                )
+            with gr.Row():
+                _gen["steps_dd"] = gr.Dropdown(
+                    label="Diffuse Steps", choices=_initial_steps,
+                    value=_seed(gen.get("imagegen_steps", 4), _initial_steps,
+                                configure.family_step_cfg(_initial_diff)["steps"][1]),
                 )
                 _gen["cfg_scale_sld"] = gr.Slider(
                     label="CFG Scale",
                     minimum=_initial_cfg_rng[0], maximum=_initial_cfg_rng[1],
                     step=_initial_cfg_rng[2],
-                    value=1.0,
-                    visible=False,
+                    value=gen.get("imagegen_cfg_scale", _initial_cfg_rng[3]),
                 )
-                _gen["batch_dd"] = gr.Dropdown(
-                    label="Batch Count", choices=configure.BATCH_COUNT_CHOICES,
-                    value=1, visible=False,
+            with gr.Row():
+                _gen["batch_dd"] = gr.Dropdown(label="Batch Count",
+                                               choices=configure.BATCH_COUNT_CHOICES,
+                                               value=gen.get("imagegen_batch_count", 1)
                 )
-                _gen["seed_num"] = gr.Number(
-                    label="Gen Seed (-1 = random)",
-                    value=-1, precision=0, visible=False,
+                _gen["output_fmt_dd"] = gr.Dropdown(
+                    label="Output Format", choices=configure.OUTPUT_FORMATS,
+                    value=gen.get("output_format", "png"),
                 )
+            with gr.Row():
+                _gen["seed_num"] = gr.Number(label="Gen Seed (-1 = random)",
+                                             value=gen.get("imagegen_seed", -1), precision=0)
             # ── Restore To Defaults ──────────────────────────────────────────
             # Repaints this whole settings panel to the loaded model's optimal
             # values (configure.family_generation_defaults). Deliberately NOT
@@ -1373,20 +1227,7 @@ def _build_generate_tab_inner() -> None:
             # -i + --strength). Hidden for Z-Image, which is text-to-image only.
             _img_in_now = _family_takes_input_image(cfg.get("imagegen_model_path", ""))
             _init_now = _family_uses_init_image(cfg.get("imagegen_model_path", ""))
-            # BUILT VISIBLE UNCONDITIONALLY. The old gate hid this whole column
-            # -- Add Image, Clear Images and the file list with it -- whenever
-            # the configured diffuser could not take an input image, which on a
-            # fresh install includes the case where no diffuser is set yet. The
-            # result was a Generation page that looked like it had no way to
-            # add a photo, with no hint that a Configuration setting was the
-            # cause.
-            #
-            # That gate had a job in a multi-family build: Z-Image is
-            # text-to-image only and genuinely has nothing to add an image to.
-            # This program runs Flux.2 and nothing else, and a run without an
-            # input photo is refused outright in do_generate -- so the controls
-            # are never inapplicable, and hiding them can only ever be wrong.
-            with gr.Column(visible=True) as _gen["ref_row"]:
+            with gr.Column(visible=_img_in_now) as _gen["ref_row"]:
                 gr.Markdown("#### Input Image (img+txt to img)")
                 # Reference images for image-to-image / editing (sd.cpp -r,
                 # repeatable). "Add Image" opens a native file picker and
@@ -1480,70 +1321,9 @@ def _build_generate_tab_inner() -> None:
             # panel (same handler both directions). History is pre-loaded at
             # build time and re-fetched on every toggle so a just-made
             # generation shows without a reload.
-            # ── Input: thumbnails of the images added just above ────────────
-            # This sits where a prompt preview used to. The preview restated
-            # the three scene prompts, which are already on the Preferences
-            # page where they are edited -- so it spent the most crowded
-            # column in the layout on a read-only second copy of something the
-            # operator had just finished reading. The thumbnails cannot be
-            # seen anywhere else, so they get the space instead.
-            #
-            # Directly under Add Image / Clear Images, rather than over in the
-            # Output column, so that adding a file and seeing it appear are
-            # the same glance.
-            #
-            # ALWAYS MOUNTED, never toggled. The block used to hide itself
-            # while the list was empty; that is what made the empty state look
-            # like a missing feature rather than an empty box. It also runs
-            # into the Gradio 6 problem described on ref_list_tb, where a
-            # component receiving value and visibility in one update may not
-            # paint (gradio issues #11768 / #12511). A permanently mounted
-            # gallery with a heading is immune to both.
-            #
-            # SIZE is a Preferences setting (Input Thumbnail Size), defaulting
-            # to 96px. Read once here at build time, for the same reason
-            # build_app() reads it once for the CSS: the two must agree, and
-            # Gradio has no runtime stylesheet hook.
-            _input_thumb = configure.get_input_thumbnail_size()
-            _refs_now = configure.get_ref_images()
-            with gr.Column(visible=True) as _gen["input_row"]:
-                gr.Markdown("#### Input")
-                # Same one-row horizontal scroller as the Thumbnails Gallery at
-                # the bottom of the page (see the #input-gallery CSS in
-                # build_app). A wrapping grid would grow a second and third row
-                # as images are added and push everything below it down the
-                # page, which is precisely what this row must not do.
-                # allow_preview=False keeps a click from opening Gradio's
-                # full-screen lightbox -- clicking a thumbnail here sends the
-                # image to the Output preview instead.
-                _gen["input_gallery"] = gr.Gallery(
-                    value=_refs_now,
-                    columns=16, rows=1,
-                    height=_input_thumb,
-                    object_fit="contain",
-                    allow_preview=False,
-                    show_label=False,
-                    fit_columns=False,
-                    elem_id="input-gallery",
-                )
-
-            # ── Retained-but-hidden prompt widgets ───────────────────────────
-            # Same reasoning as the hidden settings block above: the prompt
-            # history wiring (_wire_prompt_history_events), the Configuration
-            # page's save_all and three tab-select handlers all name these in
-            # inputs= or outputs=. They are hidden and their VALUES ARE
-            # IGNORED — do_generate() builds its prompts from
-            # configure.active_location_prompts() and its negative from
-            # configure.get_glamour_negative(), never from these boxes.
-            #
-            # The history panels are hidden with them. Prompt history logs
-            # what the user typed, and in glamour mode the user types nothing,
-            # so the feature has nothing to show; leaving the toggles visible
-            # would advertise an empty drawer.
             _gen["positive_history_toggle"] = gr.Button(
                 "Positive Prompt (click for history)",
                 elem_id="positive-history-toggle",
-                visible=False,
             )
             _gen["prompt_tb"] = gr.Textbox(
                 show_label=False,
@@ -1551,7 +1331,6 @@ def _build_generate_tab_inner() -> None:
                 lines=2, max_lines=10,
                 value=gen.get("last_prompt", ""),
                 elem_id="prompt-positive",
-                visible=False,
             )
             _positive_history = configure.get_prompt_history("positive")
             with gr.Column(visible=False, elem_id="positive-history-panel") as _gen["positive_history_panel"]:
@@ -1567,7 +1346,6 @@ def _build_generate_tab_inner() -> None:
             _gen["negative_history_toggle"] = gr.Button(
                 "Negative Prompt (click for history)",
                 elem_id="negative-history-toggle",
-                visible=False,
             )
             _gen["negative_tb"] = gr.Textbox(
                 show_label=False,
@@ -1575,7 +1353,6 @@ def _build_generate_tab_inner() -> None:
                 lines=2, max_lines=10,
                 value=gen.get("negative_prompt", ""),
                 elem_id="prompt-negative",
-                visible=False,
             )
             _negative_history = configure.get_prompt_history("negative")
             with gr.Column(visible=False, elem_id="negative-history-panel") as _gen["negative_history_panel"]:
@@ -1596,6 +1373,57 @@ def _build_generate_tab_inner() -> None:
 
         # ── Column 3: input thumbnails, then image preview ───────────────────
         with gr.Column(scale=1):
+            # ── Input: thumbnails of the centre column's reference images ────
+            # One row per the requirement, mirroring the centre column's list:
+            # every image added there gets a thumbnail here, so the pile can be
+            # identified visually rather than by filename alone.
+            #
+            # The whole block is hidden while the list is empty, so on a
+            # text-to-image model (or before the first Add) this column opens
+            # straight onto "### Output" exactly as it did before — no reserved
+            # blank space, no shifted preview.
+            #
+            # "Input" is deliberately a #### heading against Output's ###: this
+            # is the subordinate, supporting row of the two, and the subtler
+            # weight keeps the eye on the preview underneath.
+            #
+            # SIZE is a Preferences setting (Input Thumbnail Size), because it
+            # is a straight trade against the preview below — see
+            # configure.INPUT_THUMBNAIL_CHOICES. Read once here, at build time,
+            # for the same reason build_app() reads it once for the CSS: the
+            # two must agree, and Gradio has no runtime stylesheet hook.
+            _input_thumb = configure.get_input_thumbnail_size()
+            _refs_now = configure.get_ref_images()
+            # The COLUMN toggles; the gallery inside it is built visible=True
+            # and stays that way. That is the same shape as the ref_row block
+            # in column 2, and it matters for the reason spelled out on
+            # ref_list_tb: Gradio 6 does not always paint a component whose
+            # value and visibility arrive in the same update, so the first Add
+            # can drop its content (gradio issues #11768 / #12511). Two things
+            # guard against it here — the gallery itself never toggles, and the
+            # ref_images_state .change handler pushes the same updates a second
+            # time from the list state, independently of the button click. If
+            # the first pass ever misses, the second lands.
+            with gr.Column(visible=bool(_refs_now)) as _gen["input_row"]:
+                gr.Markdown("#### Input")
+                # Same one-row horizontal scroller as the Thumbnails Gallery at
+                # the bottom of the page (see the #input-gallery CSS in
+                # build_app), for the same reason: a wrapping grid would grow a
+                # second and third row as images are added and push the Output
+                # section down the page, which is precisely what this row must
+                # not do. allow_preview=False keeps a click from opening
+                # Gradio's full-screen lightbox — clicking a thumbnail here
+                # sends the image to the preview box below instead.
+                _gen["input_gallery"] = gr.Gallery(
+                    value=_refs_now,
+                    columns=16, rows=1,
+                    height=_input_thumb,
+                    object_fit="contain",
+                    allow_preview=False,
+                    show_label=False,
+                    fit_columns=False,
+                    elem_id="input-gallery",
+                )
             gr.Markdown("### Output")
             # Single currently-selected/in-progress image — most recent
             # generation, the live phase status image, or a clicked gallery
@@ -1720,11 +1548,10 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             _timeout_timer["handle"].cancel()
             _timeout_timer["handle"] = None
 
-    def do_generate(subject_count, gender, bodyshape, location_mode, steps,
-                    output_format, ref_images=None):
+    def do_generate(prompt, negative, width, height, steps, sampler,
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None,
+    ref_mode=None, strength=None):
         """
-        Glamour-mode generation: every input photo, at every active location.
-
         Generator: yields (preview_img, gallery, status, btn_update) tuples
         so the preview box can switch between program_encoding.jpg /
         program_diffusion.jpg while generation runs, WITHOUT using Gradio's
@@ -1737,34 +1564,28 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         and rescans .\\output into the gallery — the gallery never receives
         a per-call image list, only full folder rescans.
 
-        THE RUN PLAN is a flat list of jobs built from two nested loops:
-        images on the outside, locations on the inside. N input photos in All
-        Three Locations mode is 3N generations, each one a separate call to
-        inference.generate_image() carrying exactly ONE reference image and
-        ONE positive prompt.
-
-        Image-outer/location-inner is the deliberate order. It means a photo
-        is finished — all three landmarks — before the next photo starts, so
-        an interrupted or failed run leaves complete sets rather than three
-        partial ones. It also keeps one reference resident at a time, which
-        is what Chain All buys on an 8GB card.
-
-        THE SIX ARGUMENTS ARE THE WHOLE UI. Everything else a run needs is
-        read here from the two settings files rather than passed in from a
-        widget: prompts and negative from preferences.json (the Preferences
-        page owns them), and sampler / CFG / seed / batch from
-        configure.GLAMOUR_* constants. subject_count, gender and bodyshape
-        travel together because they describe one thing between them -- who is
-        in the shot -- and none of them means much alone: the count picks the
-        clause, and the other two fill its two marks. See the hidden-widget note in
-        _build_generate_tab_inner for why the old widgets still exist and why
-        their values are not consulted.
+        ref_mode (configure.REF_MODE_USE_ALL / REF_MODE_CHAIN_ALL) only
+        matters when 2+ reference images are accumulated:
+          - REF_MODE_CHAIN_ALL (default): each image is run through its OWN
+            generation, one after another (see chain_mode / ref_batches
+            below); with N images and a batch count of B this produces
+            N*B images total, and the status line gets a "Chain Position
+            i/N;" prefix identifying which run in the sequence is active. Only
+            one reference is ever resident at a time, which is the safer
+            choice memory-wise.
+          - REF_MODE_USE_ALL: every accumulated image is instead handed to
+            ONE generation as multiple -r references — a deliberate opt-in,
+            since sd.cpp holds all of them in VRAM at once for that single
+            run and the OOM risk grows with each added image.
         """
         gallery_now  = _get_recent_images()
         preview_now  = _idle_preview_image()
         _btn_generate = gr.update(value="Generate Image", variant="primary", interactive=True)
         _btn_wait     = gr.update(value="..Please Wait..", variant="primary", interactive=False)
 
+        if not prompt or not prompt.strip():
+            yield preview_now, gallery_now, "Please enter a prompt.", _btn_generate
+            return
         missing = _missing_models()
         if missing:
             yield (preview_now, gallery_now,
@@ -1773,39 +1594,15 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             return
         c = _cfg()
 
-        # ── Flux.2 gate ──────────────────────────────────────────────────────
-        # Checked here and not only in the UI. The Configuration page can load
-        # any diffuser the program supports, and this pipeline is meaningless
-        # without the -r reference path: FLUX.1 and SDXL would denoise FROM the
-        # photo (restyling it, not relocating the person) and Z-Image would
-        # ignore it entirely and invent a stranger. Producing three confident
-        # wrong images is worse than refusing, so refuse.
-        _diff_path = c.get("imagegen_model_path", "")
-        if not configure.is_flux2_diffuser(_diff_path):
-            fam = configure.diffuser_family_label(_diff_path) or "none"
-            yield (preview_now, gallery_now,
-                   f"This program requires a Flux.2 model — the loaded "
-                   f"diffuser is {fam}. Select a flux-2-klein file on the "
-                   f"Configuration page.", _btn_generate)
-            return
-
-        # ── Input photos are mandatory ───────────────────────────────────────
-        # Not optional-with-a-fallback: without a reference there is no
-        # "individual from the provided image" for the prompts to refer to,
-        # and every one of them would generate an invented person at a
-        # landmark. That is not what this program is for, so it does not run.
-        if ref_images is None:
-            _refs = []
-        elif isinstance(ref_images, (list, tuple)):
-            _refs = [str(r) for r in ref_images if r]
-        else:
-            _refs = [str(ref_images)]
-
-        if not _refs:
-            yield (preview_now, gallery_now,
-                   "Add at least one input image — this program works from a "
-                   "photo, not from a prompt alone.", _btn_generate)
-            return
+        # Record this submission into prompt_cache.json's "Positive/Negative
+        # Prompt (history)" log. Each field is recorded independently and is
+        # a no-op if it matches the most-recent saved entry for that field,
+        # so e.g. re-using the same negative prompt across several positive
+        # prompts adds no duplicate negative-history rows (see
+        # configure.record_prompt_history). Recorded on every submission,
+        # not only on success, since the user did type it either way.
+        configure.record_prompt_history("positive", prompt)
+        configure.record_prompt_history("negative", negative)
 
         # Cancel any pending unload while we are generating
         _cancel_inactivity_timer()
@@ -1818,86 +1615,20 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # any save handler has to know the split exists.
         # ref_images is added per-run below (see ref_batches) rather than
         # here, since Chain All needs a different list on each run.
-        # Resolution is DERIVED from Subject Count, never read from a widget.
-        # See configure.SUBJECT_COUNT_SIZES for the three pairs and why the
-        # pixel budget is held roughly level across them.
-        if subject_count not in configure.SUBJECT_COUNT_CHOICES:
-            subject_count = configure.SUBJECT_COUNT_DEFAULT
-        _width, _height = configure.subject_count_size(subject_count)
-
-        # Gender affects the prompt text only -- never the resolution, which
-        # is framing and belongs to the headcount alone. Validated the same
-        # way as everything else on this page: an unrecognised value (a hand-
-        # edited generation.json, or a file from the build before the switch
-        # existed) falls back to the shipped default rather than reaching
-        # configure.gender_word() and being silently defaulted there.
-        if gender not in configure.GENDER_CHOICES:
-            gender = configure.GENDER_DEFAULT
-        if bodyshape not in configure.BODYSHAPE_CHOICES:
-            bodyshape = configure.BODYSHAPE_DEFAULT
-
-        if location_mode not in configure.LOCATION_MODE_CHOICES:
-            location_mode = configure.LOCATION_MODE_DEFAULT
-
-        try:
-            _steps = int(steps)
-        except (TypeError, ValueError):
-            _steps = configure.GLAMOUR_DEFAULT_STEPS
-        if _steps not in configure.GLAMOUR_STEP_CHOICES:
-            _steps = configure.GLAMOUR_DEFAULT_STEPS
-
-        if output_format not in configure.OUTPUT_FORMATS:
-            output_format = configure.GLAMOUR_OUTPUT_FORMAT
-
-        # The shared negative, from preferences.json. Sent on every job.
-        _negative = configure.get_glamour_negative()
-
-        # ── The pinned run parameters ────────────────────────────────────────
-        # Literals, here, in the function that sends them. They were briefly
-        # configure.GLAMOUR_* constants; that was the wrong shape for values
-        # nothing is allowed to vary, because a named constant advertises a
-        # dial and invites a second reader of it to appear elsewhere. These
-        # are written into generation.json a few lines below, so the Debug
-        # page reports what actually ran by reading that file back rather than
-        # by keeping its own copy of the numbers.
-        #
-        #   euler_a   measured, not assumed: plain euler comes out semi-
-        #             garbled on this sd.cpp build on the target hardware.
-        #   seed -1   random, always. Three scenes from one photo at a fixed
-        #             seed would be three variations of one pose; the point of
-        #             the set is that they differ.
-        #   batch 1   the multiplier is already spoken for by the scene loop —
-        #             one photo becomes three images because there are three
-        #             scenes. A batch of 2 on top would quietly make that six.
-        _sampler = "euler_a"
-        _seed = -1
-        _batch = 1
-
-        # CFG is the one that is not a flat literal, and it keys off the MODEL
-        # FILE, never off the subject count. Distilled Klein is guidance-
-        # distilled: real classifier-free guidance was trained out of it, so
-        # above 1.0 sd.cpp starts emitting the negative branch, spends two
-        # forward passes per step instead of one, and burns the image for the
-        # trouble. Klein BASE is an ordinary flow model that does consume CFG
-        # and looks washed out at 1.0. Two different files, two different
-        # correct answers, neither of them a preference.
-        _cfg_scale = 4.0 if configure.is_flux2_base_variant(_diff_path) else 1.0
-
         base_gen_cfg = configure.generation_config()
         base_gen_cfg.update(
-            imagegen_width=_width, imagegen_height=_height,
-            imagegen_steps=_steps,
-            imagegen_sampling=_sampler,
-            imagegen_cfg_scale=_cfg_scale,
-            imagegen_seed=_seed,
-            imagegen_batch_count=_batch,
-            negative_prompt=_negative,
+            imagegen_width=int(width), imagegen_height=int(height),
+            imagegen_steps=int(steps), imagegen_sampling=sampler,
+            imagegen_cfg_scale=float(cfg_scale),
+            imagegen_seed=int(seed), imagegen_batch_count=int(batch),
+            negative_prompt=negative,
             output_format=output_format,
         )
-        # imagegen_strength is left at whatever generation.json holds. Flux.2
-        # conditions through -r and has no strength parameter at all, so it is
-        # never read on this path; it stays in the dict only because a Flux.2
-        # run and an (unreachable) init-image run share one cfg shape.
+        # img2img denoise strength, from the Generate page slider. Falls back
+        # to the saved value (then sd.cpp's own 0.75) when the slider is
+        # hidden, which is every family that does not use the -i path.
+        if strength is not None:
+            base_gen_cfg["imagegen_strength"] = float(strength)
 
         # ── Save the whole Generation page to generation.json ───────────────
         # ON SUBMISSION, before a single pixel is generated — not on success,
@@ -1925,70 +1656,69 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # remembering, but not at the cost of the run the user just asked for.
         try:
             configure.update_generation({
-                "imagegen_subject_count": subject_count,
-                "imagegen_gender": gender,
-                "imagegen_bodyshape": bodyshape,
-                "imagegen_location_mode": location_mode,
-                "imagegen_steps": _steps,
+                "imagegen_quality_preset": quality_preset,
+                "imagegen_width": int(width), "imagegen_height": int(height),
+                "imagegen_steps": int(steps), "imagegen_sampling": sampler,
+                "imagegen_cfg_scale": float(cfg_scale),
+                "imagegen_seed": int(seed), "imagegen_batch_count": int(batch),
+                "imagegen_strength": float(base_gen_cfg.get("imagegen_strength", 0.65)),
+                "imagegen_ref_mode": (ref_mode if ref_mode in configure.REF_MODE_CHOICES
+                                      else configure.get_ref_mode()),
                 "output_format": output_format,
-                # Derived and pinned values are written too, so the file is an
-                # honest record of what the run used rather than a mix of live
-                # settings and stale ones from a previous build.
-                "imagegen_width": _width, "imagegen_height": _height,
-                "imagegen_sampling": _sampler,
-                "imagegen_cfg_scale": _cfg_scale,
-                "imagegen_seed": _seed,
-                "imagegen_batch_count": _batch,
-                "negative_prompt": _negative,
+                "last_prompt": prompt,
+                "negative_prompt": negative,
             })
         except Exception as e:
             print(f"[generate] WARNING: could not save generation.json: {e}",
                   flush=True)
 
-        # ── The run plan ─────────────────────────────────────────────────────
-        # Images outer, locations inner. Each job is one call to
-        # inference.generate_image() with exactly one reference and one
-        # positive prompt; nothing is ever fused, so only one photo is
-        # resident at a time regardless of how many were added.
+        # Reference images (Flux.2 -r). The accumulated list arrives from
+        # ref_images_state as a list of real on-disk paths (the native picker
+        # hands over the user's own files, not Gradio temp copies); a lone
+        # string or None are still tolerated, so normalise to a list.
+        # READ ONLY — the list is not emptied here or anywhere downstream; it
+        # survives the run and is cleared only by the "Clear Images" button.
+        # inference.generate_image() ignores this entirely for Z-Image and
+        # only uses it when the diffuser is Flux.2.
+        if ref_images is None:
+            _refs = []
+        elif isinstance(ref_images, (list, tuple)):
+            _refs = [str(r) for r in ref_images if r]
+        else:
+            _refs = [str(ref_images)]
+
+        # Chain All only kicks in with 2+ images -- with 0 or 1 there is
+        # nothing to split, so it collapses to the same single-run behaviour
+        # as Use All. Each chain "link" is a single-image list, run through
+        # its own call to inference.generate_image(); Use All is one run
+        # carrying the whole list.
         #
-        # The reference list is READ ONLY here — it is not emptied by a run
-        # and survives it, cleared only by the "Clear Images" button, so the
-        # same batch can be re-run at different step counts without re-adding.
-        _locations = configure.active_location_prompts(location_mode)
-
-        # The positive prompt is assembled ONCE per scene, not per job: the
-        # subject clause is chosen by the Subject Count switch, the gender
-        # word is substituted into it, and the scene half is fixed -- so every
-        # photo in this run gets identical text. Built through
-        # configure.build_positive_prompt so the run loop and the Debug page
-        # cannot disagree about how the parts join.
+        # WHO GETS A CHOICE, AND WHO DOES NOT
+        # Only the "ref" families can consume several images in ONE run:
+        # Flux.2 repeats -r per reference. The "init" families -- SDXL and
+        # FLUX.1 -- denoise from a single -i and sd-cli has no way to accept a
+        # second, so "Use All" would promise something it cannot do and the
+        # radio stays hidden for them (_render_ref_mode_visibility).
         #
-        # ONE gender and ONE bodyshape for the whole run, like one count: the
-        # switches describe the batch of photos in front of the operator, and
-        # a batch that mixes a man and a woman is what M+F(s) is for. Per-photo
-        # settings would mean a control per thumbnail, which is a different
-        # program -- add the photos that share a description, run, then swap.
-        _assembled = [(lbl, configure.build_positive_prompt(txt, subject_count,
-                                                            gender, bodyshape))
-                      for lbl, txt in _locations]
-
-        _jobs: List[Dict[str, Any]] = []
-        for _img_idx, _ref in enumerate(_refs, start=1):
-            for _loc_label, _loc_prompt in _assembled:
-                _jobs.append({
-                    "ref": [_ref],
-                    "label": _loc_label,
-                    "prompt": _loc_prompt,
-                    "image_index": _img_idx,
-                })
-
-        # Chain All is not a choice in glamour mode -- it is the only mode.
-        # The old Use All option handed every accumulated photo to ONE run as
-        # multiple -r references, which fuses them into a single composite;
-        # that is wrong here by definition, since each photo is a different
-        # person who wants their own set of images. So the ref_mode radio is
-        # hidden on this page and the plan above always chains.
-        chain_total = len(_jobs)
+        # Hidden choice does NOT mean no chaining. This used to drop the extra
+        # images with a console note and run only the first, which is why a
+        # nine-image FLUX.1 job stopped after image one and never showed a
+        # chain position. Every family can process a pile of images one at a
+        # time; only the ability to fuse them into a single run is special. So
+        # the init families are now FORCED to chain rather than truncated, and
+        # the radio's absence just means the one available behaviour is not
+        # presented as a decision.
+        #
+        # Note the interaction with Batch Count, which is deliberate and not a
+        # bug: each link is a full generation and still honours it, so nine
+        # images at a batch of 2 produce eighteen outputs. Batch Count is
+        # "how many variations per input", not "how many images in total".
+        _supports_use_all = _family_fuses_refs(c.get("imagegen_model_path", ""))
+        chain_mode = len(_refs) > 1 and (
+            not _supports_use_all or ref_mode == configure.REF_MODE_CHAIN_ALL)
+        ref_batches: List[List[str]] = ([[r] for r in _refs] if chain_mode
+                                        else [_refs])
+        chain_total = len(ref_batches)
 
         configure.APP_STATE["cancel_requested"] = False
 
@@ -1996,15 +1726,10 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         last_gallery = gallery_now
         last_result: Dict[str, Any] = {"success": False, "message": "Unknown error"}
         chain_successes = 0
-        image_total = len(_refs)
-        loc_total = len(_locations)
 
-        for chain_idx, job in enumerate(_jobs, start=1):
+        for chain_idx, ref_batch in enumerate(ref_batches, start=1):
             gen_cfg = dict(base_gen_cfg)
-            gen_cfg["ref_images"] = job["ref"]
-            prompt = job["prompt"]
-            job_label = job["label"]
-            job_image_index = job["image_index"]
+            gen_cfg["ref_images"] = ref_batch
 
             # ── Run generation on a worker thread; main thread yields preview
             #    + status updates based on phase, polled from a shared mutable
@@ -2014,7 +1739,7 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             #    from a prior generation this session, the timer becomes an
             #    ETA countdown-style display ("~Ns left"); until then it just
             #    counts up, since there's nothing to estimate against yet. ──
-            _batch_count = _batch
+            _batch_count = int(batch)
             _phase: Dict[str, Any] = {
                 "name": "encoding", "result": None, "done": False,
                 "phase_start": time.time(), "step": 0, "total_steps": 0,
@@ -2066,14 +1791,8 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                 batch_cur = _phase["batch_current"]
                 batch_tot = _phase["batch_total"]
 
-                # Position prefix: which photo, and which scene within it.
-                # Both, because "3/9" alone does not say whether photo two is
-                # finished — "Image 1/3; Scene 3" does. The scene name is kept
-                # even when only one scene is selected, since on a Scene 2-only
-                # run it is the thing being tested and worth naming. Suppressed
-                # entirely for a lone single generation, which has no position.
-                chain_prefix = (f"Image {job_image_index}/{image_total}; "
-                                f"{job_label}; ") if chain_total > 1 else ""
+                chain_prefix = (f"Chain Position {chain_idx}/{chain_total}; "
+                                if chain_total > 1 else "")
 
                 # Previous batch elapsed suffix — only shown when we have a
                 # recorded time from a completed batch earlier this session.
@@ -2184,27 +1903,17 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
             else:
                 last_gallery = _get_recent_images()
 
-            # Position prefix for the per-job messages, matching the live
-            # status line's "Image i/N; Scene X" shape so the finished message
-            # and the running one read as the same sequence.
-            msg_prefix = (f"Image {job_image_index}/{image_total}; "
-                          f"{job_label}; ") if chain_total > 1 else ""
-
             if is_last_link and chain_total > 1:
-                # Whole run finished: report the aggregate rather than just
-                # the last job's own message. Counted in images as well as
-                # generations, because "9/9 succeeded" does not tell the user
-                # they are holding three complete sets.
-                msg = (f"Complete: {chain_successes}/{chain_total} images "
-                       f"generated from {image_total} "
-                       f"photo{'s' if image_total != 1 else ''} "
-                       f"across {loc_total} "
-                       f"scene{'s' if loc_total != 1 else ''}.")
+                # Chain finished: report the aggregate result rather than
+                # just the last link's own message.
+                msg = f"Chain complete: {chain_successes}/{chain_total} succeeded."
             elif result.get("success") and result.get("output_path"):
-                msg = (f"{msg_prefix}{result['message']} | Seed: {result['seed_used']} "
+                chain_prefix = f"Chain Position {chain_idx}/{chain_total}; " if chain_total > 1 else ""
+                msg = (f"{chain_prefix}{result['message']} | Seed: {result['seed_used']} "
                        f"| Time: {int(round(result['elapsed_seconds']))}s")
             else:
-                msg = f"{msg_prefix}{result.get('message', 'Unknown error')}"
+                chain_prefix = f"Chain Position {chain_idx}/{chain_total}; " if chain_total > 1 else ""
+                msg = f"{chain_prefix}{result.get('message', 'Unknown error')}"
 
             if result.get("success") and result.get("output_path"):
                 preview_update = last_preview
@@ -2226,23 +1935,23 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         # the prompt, seed, batch count and output format on every preset run.
 
 
-    def on_generate_click(subject_count, gender, bodyshape, location_mode,
-                          steps, output_format, ref_images=None):
+    def on_generate_click(prompt, negative, width, height, steps, sampler,
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images=None,
+    ref_mode=None, strength=None):
         """Dispatch a click on the single dynamic button. The button reads
         "Generate" when idle and starts a run (delegating to the do_generate
-        generator, which yields its own button-state updates). While a run is
-        in progress the button is disabled and shows "..Please Wait..",
-        preventing concurrent runs.
-
-        Six inputs, because glamour mode has six controls. ref_images is the
-        Flux.2 input-photo list from ref_images_state. Everything else a run
-        needs — the three positive prompts, the negative, sampler, CFG, seed,
-        batch and resolution — is resolved inside do_generate from
-        preferences.json and the configure.GLAMOUR_* constants. Flash
-        attention is still decided automatically from the selected GPU's fp16
-        capability, no input here."""
-        yield from do_generate(subject_count, gender, bodyshape,
-                               location_mode, steps, output_format, ref_images)
+        generator, which yields its own button-state updates). While a run
+        is in progress the button is disabled and shows "..Please Wait..",
+        preventing concurrent runs. ref_images is the Flux.2 input-image list
+        (from ref_images_state); it is ignored for Z-Image runs inside
+        inference.generate_image(). ref_mode (from ref_mode_radio) selects
+        Use All vs Chain All when 2+ reference images are present — see
+        do_generate's chain_mode handling. Flash attention is decided
+        automatically from the selected GPU's fp16 capability — no input
+        here."""
+        yield from do_generate(prompt, negative, width, height, steps, sampler,
+    cfg_scale, seed, batch, output_format, quality_preset, ref_images, ref_mode,
+    strength)
 
     # ── Reference-image Add / Clear handlers ────────────────────────────────
     def _render_input_gallery(paths: List[str]) -> Tuple[Any, Any]:
@@ -2310,16 +2019,10 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
         Hiding the radio does not disable chaining. Those families always
         chain when given several images -- see do_generate. All the hidden
         radio means is that there is one possible behaviour rather than two,
-        so there is nothing to ask about.
-
-        IN GLAMOUR MODE THAT IS ALWAYS THE CASE, so this always returns
-        hidden. Use All would fuse several photos into one generation, and
-        every photo here is a different person who wants their own set of
-        images -- a composite is never the wanted answer. The function is kept
-        rather than inlined as a constant because three call sites pass it a
-        count and expect a gr.update back.
-        """
-        return gr.update(visible=False)
+        so there is nothing to ask about."""
+        c = configure.load_configuration()
+        return gr.update(visible=bool(
+            _family_fuses_refs(c.get("imagegen_model_path", "")) and count > 1))
 
     def _add_ref_images(current):
         """Open the native picker and APPEND whatever was chosen to the
@@ -2435,10 +2138,12 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
     # post-run reference-image clear, which is gone (see the note below).
     _gen["generate_btn"].click(
         on_generate_click,
-        inputs=[_gen["subject_count_radio"], _gen["gender_radio"],
-                _gen["bodyshape_radio"], _gen["location_mode_radio"],
-                _gen["steps_dd"], _gen["output_fmt_dd"],
-                _gen["ref_images_state"]],
+        inputs=[_gen["prompt_tb"], _gen["negative_tb"],
+        _gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
+        _gen["sampler_dd"], _gen["cfg_scale_sld"],
+        _gen["seed_num"], _gen["batch_dd"], _gen["output_fmt_dd"],
+        _gen["preset_dd"], _gen["ref_images_state"], _gen["ref_mode_radio"],
+        _gen["strength_sld"]],
         outputs=[_gen["preview_img"], _gen["output_gallery"], status_box,
         _gen["generate_btn"]],
     )
@@ -2450,45 +2155,70 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
 
     # ── Restore To Defaults (Generation page) ───────────────────────────────
     def _restore_generation_defaults() -> tuple:
-        """Repaint the Generation page to this program's factory settings.
+        """Repaint the settings panel to the loaded model's optimal values.
 
-        Six widgets, because glamour mode has six controls. There is no
-        family-defaults lookup any more: sampler, CFG, seed, batch and
-        resolution are not settings on this page, they are constants
-        (configure.GLAMOUR_*) or derived from Subject Count, so there is
-        nothing for a restore to put back.
+        Reads the SAME configure.family_generation_defaults() that a model
+        change applies, so "restore" and "switch models" can never disagree
+        about what optimal means for a given family. Choice lists are pushed
+        alongside the values, because a stale dropdown could otherwise reject
+        the very value being restored (steps 20 is not in Z-Image's list).
 
-        The PROMPTS are not touched. They live on the Preferences page and
-        have their own Revert To Defaults button there — a settings button on
-        this page has no business overwriting the three landmark descriptions
-        the user wrote, and someone clicking "restore" here is asking about
-        framing and step count, not about content.
+        The POSITIVE prompt is not touched — it is the user's own writing and
+        a settings button has no business deleting it. The NEGATIVE prompt IS
+        reset, because it is factory boilerplate with a real default
+        (configure.DEFAULT_NEGATIVE_PROMPT) rather than authored content, and
+        someone clicking "Restore To Defaults" plainly means to include it.
 
-        Nothing is written to disk. The restored values persist on the next
-        Generate click like any other change to this page.
+        Nothing is written to disk here. The restored values persist on the
+        next Generate click like any other change to this page.
         """
+        diff = configure.load_configuration().get("imagegen_model_path", "")
+        d = configure.family_generation_defaults(diff)
+        spec = configure.family_step_cfg(diff)
+        step_choices, _ = spec["steps"]
+        cfg_min, cfg_max, cfg_step, _ = spec["cfg"]
+        sizes = configure.family_image_sizes(diff)
+        fam_label = configure.diffuser_family_label(diff)
         try:
-            gr.Info("Generation settings restored to defaults.")
+            gr.Info(f"Generation settings restored to the {fam_label} defaults.")
         except Exception:
             pass
         return (
-            gr.update(value=configure.SUBJECT_COUNT_DEFAULT),
-            gr.update(value=configure.GENDER_DEFAULT),
-            gr.update(value=configure.BODYSHAPE_DEFAULT),
-            gr.update(value=configure.LOCATION_MODE_DEFAULT),
-            gr.update(choices=configure.GLAMOUR_STEP_CHOICES,
-                      value=configure.GLAMOUR_DEFAULT_STEPS),
-            gr.update(value=configure.GLAMOUR_OUTPUT_FORMAT),
+            gr.update(choices=sizes, value=d["imagegen_width"]),
+            gr.update(choices=sizes, value=d["imagegen_height"]),
+            gr.update(choices=step_choices, value=d["imagegen_steps"]),
+            gr.update(minimum=cfg_min, maximum=cfg_max, step=cfg_step,
+                      value=d["imagegen_cfg_scale"]),
+            gr.update(value=d["imagegen_sampling"]),
+            gr.update(value=d["imagegen_batch_count"]),
+            gr.update(value=d["output_format"]),
+            gr.update(value=d["imagegen_seed"]),
+            gr.update(value=d["imagegen_strength"]),
+            gr.update(value=configure.DEFAULT_NEGATIVE_PROMPT),
+            # The preset name. Be aware this one may not stick: every widget
+            # above carries a .change handler that forces the preset to
+            # "Custom" (see _set_custom), and those fire on the frontend after
+            # this handler's outputs land, regardless of the order they are
+            # listed in here. So the dropdown will often settle on "Custom"
+            # a moment after the restore.
+            #
+            # Left as-is rather than worked around, because it is cosmetic and
+            # the honest fix is disproportionate: _set_custom receives only the
+            # one widget's value, so teaching it "these values ARE a named
+            # preset, do not say Custom" means re-plumbing it to take the whole
+            # panel as input. The VALUES restored are correct either way, and
+            # "Custom" over a hand-restored set is not a lie.
+            gr.update(value=d["imagegen_quality_preset"]),
         )
 
     _gen["restore_defaults_btn"].click(
         _restore_generation_defaults,
         inputs=None,
-        outputs=[_gen["subject_count_radio"], _gen["gender_radio"],
-                 _gen["bodyshape_radio"], _gen["location_mode_radio"],
-                 _gen["steps_dd"], _gen["output_fmt_dd"]],
+        outputs=[_gen["width_dd"], _gen["height_dd"], _gen["steps_dd"],
+                 _gen["cfg_scale_sld"], _gen["sampler_dd"], _gen["batch_dd"],
+                 _gen["output_fmt_dd"], _gen["seed_num"], _gen["strength_sld"],
+                 _gen["negative_tb"], _gen["preset_dd"]],
     )
-
 
     _gen["thumbnails_link"].click(
         _open_output_folder,
@@ -2546,7 +2276,6 @@ def _wire_generate_events(status_box: gr.Textbox) -> None:
                  _gen["ref_mode_radio"], _gen["batch_dd"],
                  _gen["output_fmt_dd"], _gen["seed_num"], _gen["preset_dd"]],
     )
-
 
     _gen["prompt_tb"].focus(
         _generate_gate_updates,
@@ -2867,30 +2596,16 @@ def _build_config_tab_inner() -> None:
                 _cfg_w["img_clip_dd"] = gr.Dropdown(label="CLIP Skip",
                                           choices=configure.CLIP_SKIP_CHOICES,
                                           value=cfg.get("imagegen_clip_skip", 2))
-                # v-prediction override, HIDDEN. It exists only for SDXL
-                # finetunes: the gguf conversion drops the flag marking a
-                # checkpoint as v-pred, so sd.cpp assumes eps and the output
-                # washes out, and this forces it back. Flux.2 is a flow-
-                # matching model and has no eps/v-pred distinction at all, so
-                # on a Flux.2-only program the control is not merely unused,
-                # it is unanswerable -- every setting including Auto means the
-                # same nothing.
-                #
-                # Kept mounted rather than deleted for the usual reason (see
-                # the hidden-widget note in _build_generate_tab_inner): the
-                # Configuration page's save_all names it in inputs= and the
-                # restore-defaults handler in outputs=, and Gradio raises at
-                # build time on a handler naming a component that is not
-                # there. It sits on PREDICTION_AUTO, and
-                # configure.sdxl_prediction_override() omits the sd-cli flag
-                # entirely for anything that is not an SDXL v-pred finetune,
-                # so nothing reaches the command line either way.
+                # v-prediction override for SDXL finetunes. The gguf conversion
+                # drops the flag that marks a checkpoint as v-pred, so sd.cpp
+                # assumes eps and the output comes out washed out. Auto infers
+                # it from the filename (noobai vpred, wai-*-vpred*); force it
+                # here when a v-pred model is not named as one.
                 _cfg_w["img_pred_dd"] = gr.Dropdown(
                     label="Prediction (SDXL)",
                     choices=configure.PREDICTION_CHOICES,
                     value=cfg.get("imagegen_prediction", configure.PREDICTION_AUTO),
                     info="Auto detects v-pred from the filename.",
-                    visible=False,
                 )
             with gr.Row():
                 # sd.cpp has no per-layer GPU offload for the diffuser (no
@@ -3466,109 +3181,6 @@ def _build_preferences_tab_inner() -> None:
     prefs = _prefs()
 
     gr.Markdown("### Preferences")
-
-    # ── Prompt editor: scenes left, subject clauses right, negative below ────
-    # The two columns are the two halves of every positive prompt sent, and
-    # they are side by side because that is how they are read: the assembled
-    # prompt is a subject clause followed by a scene, and seeing both at once
-    # is the only way to catch the sentence that reads badly across the join.
-    # (Stacked, the pair being joined can be a screen apart.)
-    #
-    # The negative sits full width UNDER both, because it is not half of
-    # anything -- one negative is sent with every generation regardless of
-    # which scene runs or how many subjects were chosen. Putting it in either
-    # column would imply it belonged to that column.
-    #
-    # FIXED TEMPLATES, NOT A FRAME WITH A HOLE. There is deliberately no
-    # {location} or {subject} placeholder to fill: the phrasing that works for
-    # standing beside a statue is not the phrasing that works for a rooftop
-    # observation deck, and a shared frame would force every landmark into
-    # whichever sentence structure was written first. The one dynamic seam is
-    # the join between the two columns, and it is a concatenation rather than
-    # a token, so nothing can be lost by mistyping it.
-    #
-    # Clearing any box does NOT disable it -- configure's accessors fall back
-    # to the shipped default on blank, because an empty half sends a prompt
-    # that never says who is in the picture or where. Use the Generation
-    # page's scene selector to run fewer than three scenes.
-    gr.Markdown("### Prompts")
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("#### Scene Prompts")
-            gr.Markdown(
-                "Landmark, lighting and camera angle. These say nothing about "
-                "how many people are in the shot — that is the right-hand "
-                "column's job, so the Subject Count switch can change without "
-                "three prompts being hand-edited."
-            )
-            _prf["location_a_tb"] = gr.Textbox(
-                label="Scene 1 Prompt",
-                value=prefs.get("location_prompt_a",
-                                configure.DEFAULT_LOCATION_PROMPT_A),
-                lines=4,
-            )
-            _prf["location_b_tb"] = gr.Textbox(
-                label="Scene 2 Prompt",
-                value=prefs.get("location_prompt_b",
-                                configure.DEFAULT_LOCATION_PROMPT_B),
-                lines=4,
-            )
-            _prf["location_c_tb"] = gr.Textbox(
-                label="Scene 3 Prompt",
-                value=prefs.get("location_prompt_c",
-                                configure.DEFAULT_LOCATION_PROMPT_C),
-                lines=4,
-            )
-
-        with gr.Column(scale=1):
-            gr.Markdown("#### Subject Clauses")
-            gr.Markdown(
-                "Who is in the shot. One per Subject Count setting; the "
-                "matching one is prepended to whichever scene runs. Refer to "
-                "the person as *from the provided image* so the model "
-                "conditions on the input photo.\n\n"
-                "**Keep the `<gender>` and `<bodyshape>` marks in all "
-                "three.** The Generation page's two switches fill them: "
-                "`<gender>` becomes *male*, *males*, *female*, *females*, "
-                "*transgender*, *male and female* or *males and females* "
-                "(depending on that switch and the Subject Count), and "
-                "`<bodyshape>` becomes *skinny*, *slim*, *average*, "
-                "*bodybuilder*, *overweight* or *obese*. A clause that loses a "
-                "mark still runs — that switch simply stops affecting it — and "
-                "saving will say so."
-            )
-            _prf["subject_one_tb"] = gr.Textbox(
-                label="Subject Clause — 1 Person  (keep <gender> <bodyshape>)",
-                value=prefs.get("subject_clause_one",
-                                configure.DEFAULT_SUBJECT_CLAUSE_ONE),
-                lines=4,
-            )
-            _prf["subject_two_tb"] = gr.Textbox(
-                label="Subject Clause — 2 People  (keep <gender> <bodyshape>)",
-                value=prefs.get("subject_clause_two",
-                                configure.DEFAULT_SUBJECT_CLAUSE_TWO),
-                lines=4,
-            )
-            _prf["subject_many_tb"] = gr.Textbox(
-                label="Subject Clause — 3+ People  (keep <gender> <bodyshape>)",
-                value=prefs.get("subject_clause_many",
-                                configure.DEFAULT_SUBJECT_CLAUSE_MANY),
-                lines=4,
-            )
-
-    with gr.Row():
-        _prf["glamour_negative_tb"] = gr.Textbox(
-            label="Negative Prompt (all scenes, all subject counts)",
-            value=prefs.get("glamour_negative_prompt",
-                            configure.DEFAULT_GLAMOUR_NEGATIVE),
-            info=("Sent with every generation. Note: distilled Flux.2 runs at "
-                  "CFG 1.0, and sd.cpp only consults the negative above 1.0 — "
-                  "so this takes effect on klein-BASE models, not "
-                  "klein-distilled."),
-            lines=3,
-        )
-
-    gr.Markdown("#### General")
     _prf["prompt_template_tb"] = gr.Textbox(
         label="Prompt Template",
         value=prefs.get("prompt_template", configure.DEFAULT_PROMPT_TEMPLATE),
@@ -3627,8 +3239,7 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
     output listing is unsliced (see _get_recent_images), so this costs a
     re-render, not a rescan.
     """
-    def save_prefs(loc_a, loc_b, loc_c, glam_neg, subj_1, subj_2, subj_3,
-                   prompt_template, max_thumbs, input_thumb, encoder_debug):
+    def save_prefs(prompt_template, max_thumbs, input_thumb, encoder_debug):
         try:
             thumbs = int(max_thumbs)
         except (TypeError, ValueError):
@@ -3641,29 +3252,7 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
             in_thumb = configure.DEFAULT_INPUT_THUMBNAIL
         if in_thumb not in configure.INPUT_THUMBNAIL_CHOICES:
             in_thumb = configure.DEFAULT_INPUT_THUMBNAIL
-        # Blank -> shipped default, matching what configure's accessors do at
-        # read time. Normalising on the way IN as well means the box repaints
-        # with the default the user is actually going to get, rather than
-        # staying empty and leaving them to discover the fallback by running.
-        def _or_default(value: Any, fallback: str) -> str:
-            return value.strip() if isinstance(value, str) and value.strip() else fallback
-
-        loc_a_v = _or_default(loc_a, configure.DEFAULT_LOCATION_PROMPT_A)
-        loc_b_v = _or_default(loc_b, configure.DEFAULT_LOCATION_PROMPT_B)
-        loc_c_v = _or_default(loc_c, configure.DEFAULT_LOCATION_PROMPT_C)
-        neg_v   = _or_default(glam_neg, configure.DEFAULT_GLAMOUR_NEGATIVE)
-        subj_1_v = _or_default(subj_1, configure.DEFAULT_SUBJECT_CLAUSE_ONE)
-        subj_2_v = _or_default(subj_2, configure.DEFAULT_SUBJECT_CLAUSE_TWO)
-        subj_3_v = _or_default(subj_3, configure.DEFAULT_SUBJECT_CLAUSE_MANY)
-
         configure.update_preferences({
-            "location_prompt_a": loc_a_v,
-            "location_prompt_b": loc_b_v,
-            "location_prompt_c": loc_c_v,
-            "glamour_negative_prompt": neg_v,
-            "subject_clause_one":  subj_1_v,
-            "subject_clause_two":  subj_2_v,
-            "subject_clause_many": subj_3_v,
             "prompt_template": prompt_template,
             "max_thumbnails":  thumbs,
             "input_thumbnail_size": in_thumb,
@@ -3674,52 +3263,14 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
         # Thumbnail Size cannot do the same — it lives in the stylesheet, which
         # is fixed for the life of the process — so the message says so rather
         # than letting the user wonder.
-        # The boxes are repainted from the values just WRITTEN, not from the
-        # widget contents, so a box left blank visibly comes back holding the
-        # default it fell back to rather than staying empty and leaving the
-        # operator to discover the fallback by running a generation.
-        #
-        # THE MARK CHECK. Warn, never rewrite. A clause without a mark is a
-        # perfectly valid prompt -- it just pins that attribute regardless of
-        # the switch -- so restoring the default over it would discard a
-        # deliberate edit to fix a problem the user may not have. Naming the
-        # specific clause AND the specific mark is the point: "something is
-        # missing" would leave three boxes and two marks to re-read.
-        _warnings: List[str] = []
-        for _label, _value in (("1 Person", subj_1_v),
-                               ("2 People", subj_2_v),
-                               ("3+ People", subj_3_v)):
-            _gone = configure.missing_subject_tokens(_value)
-            if _gone:
-                _warnings.append(f"{_label} ({' '.join(_gone)})")
-        _msg = ("All preferences saved! Input Thumbnail Size applies on next "
-                "launch.")
-        if _warnings:
-            _msg += (" NOTE: missing mark(s) in the subject clause(s) for "
-                     + "; ".join(_warnings)
-                     + " — the matching switch will not affect them until "
-                       "the mark is put back.")
-
-        return ((_msg),
-                _get_recent_images(thumbs),
-                gr.update(value=loc_a_v), gr.update(value=loc_b_v),
-                gr.update(value=loc_c_v), gr.update(value=neg_v),
-                gr.update(value=subj_1_v), gr.update(value=subj_2_v),
-                gr.update(value=subj_3_v))
+        return ("All preferences saved! Input Thumbnail Size applies on next "
+                "launch."), _get_recent_images(thumbs)
 
     _prf["save_prefs_btn"].click(
         save_prefs,
-        inputs=[_prf["location_a_tb"], _prf["location_b_tb"],
-                _prf["location_c_tb"], _prf["glamour_negative_tb"],
-                _prf["subject_one_tb"], _prf["subject_two_tb"],
-                _prf["subject_many_tb"],
-                _prf["prompt_template_tb"], _prf["max_thumbs_dd"],
+        inputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
                 _prf["input_thumb_dd"], _prf["encoder_debug_chk"]],
-        outputs=[status_box, _gen["output_gallery"],
-                 _prf["location_a_tb"], _prf["location_b_tb"],
-                 _prf["location_c_tb"], _prf["glamour_negative_tb"],
-                 _prf["subject_one_tb"], _prf["subject_two_tb"],
-                 _prf["subject_many_tb"]],
+        outputs=[status_box, _gen["output_gallery"]],
     )
 
     # ── Revert To Defaults ──
@@ -3734,13 +3285,6 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
         except Exception:
             pass
         return (
-            gr.update(value=configure.DEFAULT_LOCATION_PROMPT_A),  # location_a_tb
-            gr.update(value=configure.DEFAULT_LOCATION_PROMPT_B),  # location_b_tb
-            gr.update(value=configure.DEFAULT_LOCATION_PROMPT_C),  # location_c_tb
-            gr.update(value=configure.DEFAULT_GLAMOUR_NEGATIVE),   # glamour_negative_tb
-            gr.update(value=configure.DEFAULT_SUBJECT_CLAUSE_ONE),  # subject_one_tb
-            gr.update(value=configure.DEFAULT_SUBJECT_CLAUSE_TWO),  # subject_two_tb
-            gr.update(value=configure.DEFAULT_SUBJECT_CLAUSE_MANY), # subject_many_tb
             gr.update(value=configure.DEFAULT_PROMPT_TEMPLATE),  # prompt_template_tb
             gr.update(value=configure.DEFAULT_MAX_THUMBNAILS),   # max_thumbs_dd
             gr.update(value=configure.DEFAULT_INPUT_THUMBNAIL),  # input_thumb_dd
@@ -3750,11 +3294,7 @@ def _wire_preferences_events(status_box: gr.Textbox) -> None:
     _prf["revert_prefs_btn"].click(
         revert_prefs,
         inputs=[],
-        outputs=[_prf["location_a_tb"], _prf["location_b_tb"],
-                 _prf["location_c_tb"], _prf["glamour_negative_tb"],
-                 _prf["subject_one_tb"], _prf["subject_two_tb"],
-                 _prf["subject_many_tb"],
-                 _prf["prompt_template_tb"], _prf["max_thumbs_dd"],
+        outputs=[_prf["prompt_template_tb"], _prf["max_thumbs_dd"],
                  _prf["input_thumb_dd"], _prf["encoder_debug_chk"]],
     )
 
@@ -3867,116 +3407,6 @@ def _collect_debug() -> str:
                 L.append(f"             {p}")
         L.append("")
 
-        # --- Glamour run settings ---
-        # What THIS program will actually do on the next Generate click, as
-        # opposed to what the settings files happen to contain. The
-        # distinction matters here more than it would in a general-purpose
-        # build: most of the numbers a run uses are pinned constants or
-        # derived from Subject Count, so reading them out of generation.json
-        # would report values that are never consulted.
-        #
-        # The Flux.2 line is first because it is the single most likely reason
-        # for a refused run -- the Configuration page will happily load an
-        # SDXL or Z-Image file, and this pipeline cannot use one.
-        g = configure.load_generation()
-        _diff = c.get("imagegen_model_path", "")
-        rule("GLAMOUR RUN SETTINGS")
-
-        _is_flux2 = configure.is_flux2_diffuser(_diff)
-        _fam = configure.diffuser_family_label(_diff) or "none"
-        L.append(f"  Flux.2 gate  : {'PASS' if _is_flux2 else 'FAIL'}  "
-                 f"(loaded family: {_fam})")
-        if not _is_flux2:
-            L.append("                 Generation is blocked. This program")
-            L.append("                 conditions on the input photo through")
-            L.append("                 Flux.2's -r reference path; no other")
-            L.append("                 family can do it. Select a")
-            L.append("                 flux-2-klein file on Configuration.")
-
-        _subject = g.get("imagegen_subject_count", configure.SUBJECT_COUNT_DEFAULT)
-        _gender = g.get("imagegen_gender", configure.GENDER_DEFAULT)
-        if _gender not in configure.GENDER_CHOICES:
-            _gender = configure.GENDER_DEFAULT
-        _shape = g.get("imagegen_bodyshape", configure.BODYSHAPE_DEFAULT)
-        if _shape not in configure.BODYSHAPE_CHOICES:
-            _shape = configure.BODYSHAPE_DEFAULT
-        _w, _h = configure.subject_count_size(_subject)
-        _mode = g.get("imagegen_location_mode", configure.LOCATION_MODE_DEFAULT)
-        _active = configure.active_location_prompts(_mode)
-
-        L.append(f"  Subject count: {_subject}")
-        L.append(f"  Subject gender: {_gender}"
-                 f'  -> "{configure.gender_word(_gender, _subject)}"'
-                 f"  (substituted for {configure.GENDER_TOKEN})")
-        L.append(f"  Bodyshape    : {_shape}"
-                 f'  -> "{configure.bodyshape_word(_shape)}"'
-                 f"  (substituted for {configure.BODYSHAPE_TOKEN})")
-        L.append(f"  Resolution   : {_w}x{_h}  (derived from subject count)")
-        L.append(f"  Location mode: {_mode}")
-        L.append(f"  Per photo    : {len(_active)} image"
-                 f"{'s' if len(_active) != 1 else ''}")
-        L.append(f"  Steps        : {g.get('imagegen_steps', configure.GLAMOUR_DEFAULT_STEPS)}"
-                 f"  (choices: {configure.GLAMOUR_STEP_CHOICES})")
-        L.append(f"  Output format: {g.get('output_format', 'jpg')}")
-        L.append("")
-        # READ BACK from generation.json rather than restated as literals.
-        # do_generate hard-codes these and writes them to that file on every
-        # run, so this reports what the last run actually sent; a second copy
-        # of the numbers here could drift from the ones being used and would
-        # be believed precisely because it appears on the diagnostics page.
-        # Before a first run the file holds the installer's seed values, which
-        # are the same numbers.
-        L.append("  Pinned (hard-coded in do_generate; shown as last written):")
-        L.append(f"    Sampler    : {g.get('imagegen_sampling', 'euler_a')}")
-        L.append(f"    CFG scale  : {g.get('imagegen_cfg_scale', 1.0)}"
-                 f"  ({'klein-base' if _diff and configure.is_flux2_base_variant(_diff) else 'distilled'})")
-        L.append(f"    Seed       : {g.get('imagegen_seed', -1)} (always random)")
-        L.append(f"    Batch count: {g.get('imagegen_batch_count', 1)}")
-        L.append("")
-
-        # The prompts as they will be SENT, resolved through configure's
-        # accessors rather than read raw from preferences.json -- so a blank
-        # or hand-deleted key shows the default that will actually be used
-        # instead of an empty line that implies nothing gets sent.
-        # ASSEMBLED, not raw. What is stored in preferences.json is two halves
-        # -- a subject clause and a scene -- and neither is what sd-cli
-        # receives. Printing the halves would mean the one page whose job is
-        # to say what the program does could not answer the most basic
-        # question about it, so the join is applied here exactly as the run
-        # loop applies it (configure.build_positive_prompt).
-        # Shown BOTH ways on purpose. The stored line is what the
-        # Preferences page holds and what an operator would edit; the resolved
-        # line is what sd-cli receives. Printing only the first would hide
-        # whether the substitution fired at all, which is the single most
-        # likely thing to be wrong here after a hand-edit.
-        L.append(f"  Subject clause ({_subject}) as stored:")
-        L.append(f"      {configure.get_subject_clause(_subject)}")
-        _gone = configure.missing_subject_tokens(
-            configure.get_subject_clause(_subject))
-        if _gone:
-            L.append(f"      [!] missing mark(s): {' '.join(_gone)} — the")
-            L.append("          matching switch(es) do not affect this")
-            L.append("          clause. Put them back on Preferences.")
-        L.append(f"  Subject clause ({_subject}) as sent:")
-        L.append("      "
-                 + configure.resolve_subject_clause(_subject, _gender, _shape))
-        L.append("")
-        L.append("  Prompts as sent (subject clause + switches + scene):")
-        _active_labels = {lbl for lbl, _ in _active}
-        for _label, _text in configure.get_location_prompts():
-            _mark = " " if _label in _active_labels else "-"
-            _state = "" if _label in _active_labels else "  [skipped this mode]"
-            L.append(f"  {_mark} {_label}{_state}")
-            L.append("      " + configure.build_positive_prompt(
-                _text, _subject, _gender, _shape))
-        L.append("    Negative")
-        L.append(f"      {configure.get_glamour_negative()}")
-        L.append("")
-        L.append("  Note: sd.cpp only consults the negative prompt at CFG")
-        L.append("  above 1.0, so it is inert on distilled Klein and live on")
-        L.append("  klein-base. It is sent either way.")
-        L.append("")
-
         # --- Env ---
         rule("RELEVANT ENVIRONMENT")
         env = utilities.get_relevant_env()
@@ -4021,7 +3451,7 @@ def _copy_to_clipboard(text: str) -> str:
 def _build_debug_tab_inner() -> gr.Textbox:
     """Build Debug tab widgets; info section above, debug info below."""
     with gr.Group():
-        gr.Markdown("### Image-Glamour-Gguf")
+        gr.Markdown("### Image-Gradio-Gguf")
         gr.HTML(
             "<p>A Windows local image generator using Gradio, llama.cpp and stable-diffusion.cpp, by "
             "<a href=\"mailto:wiseman-timelord@mail.com\">WiseMan-Time-Lord</a> at "
@@ -4394,8 +3824,8 @@ Input/Output sections around. ────────────────�
     _css = _css.replace("__INPUT_THUMB__", str(configure.get_input_thumbnail_size()))
     _css = _css.replace("__INPUT_PAD__", str(configure.INPUT_GALLERY_PADDING))
 
-    with gr.Blocks(title="Image-Glamour-Gguf") as app:
-        gr.Markdown("# Image-Glamour-Gguf")
+    with gr.Blocks(title="Image-Gradio-Gguf") as app:
+        gr.Markdown("# Image-Gradio-Gguf")
 
         # ── Tabs ──────────────────────────────────────────────────────────────
         with gr.Tabs():

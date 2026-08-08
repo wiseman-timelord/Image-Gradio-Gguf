@@ -243,17 +243,9 @@ DIFFUSER_FAMILY_SDXL   = "sdxl"
 # Note WebP is an OUTPUT-only format in sd.cpp (libwebp encode), not decodable
 # as an input here. Extensions are compared lowercased, leading dot included.
 SUPPORTED_REF_IMAGE_EXTS = {
-    ".png", ".jpg", ".jpeg", ".jfif", ".jpe", ".bmp", ".tga", ".gif",
+    ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".gif",
     ".psd", ".hdr", ".pic", ".pnm", ".ppm", ".pgm",
 }
-
-# The JPEG spellings, kept as their own list because the file picker needs
-# them as a group and because they are the ones people actually have a mix of
-# on disk. stb_image (what sd.cpp decodes with) sniffs the CONTENT and never
-# looks at the extension, so .jpeg, .jfif and .jpe are decoded identically to
-# .jpg -- the extension list is purely this program's own gate, and leaving a
-# spelling out of it rejects a file the backend would have read happily.
-JPEG_EXTS = (".jpg", ".jpeg", ".jfif", ".jpe")
 
 # Reference-image handling mode when 2+ images are accumulated in the Flux.2
 # "Image Edit" input list (see display.py's ref_images_state / ref_mode_radio
@@ -1496,294 +1488,6 @@ CLIP_SKIP_CHOICES = [1, 2, 3]
 BATCH_COUNT_CHOICES = [1, 2, 3, 4]
 OUTPUT_FORMATS    = ["png", "jpg", "bmp"]
 
-
-# ---------------------------------------------------------------------------
-# GLAMOUR MODE -- the streamlined single-purpose pipeline
-# ---------------------------------------------------------------------------
-# This program has one job: take a photo of a person and place that person at
-# three fixed landmarks. What lives in this section is the tables and choice
-# lists that several modules need to agree on.
-#
-# THE PINNED VALUES ARE NOT HERE. Sampler, seed, batch count and CFG are
-# hard-coded as literals inside display.do_generate(), the one function that
-# sends them, and written into generation.json from there so the Debug page
-# can report what actually ran by reading that file back.
-#
-# They were constants in this file first, and that was the wrong shape: a
-# named module-level constant looks like a dial, and a dial attracts a second
-# reader. Two readers of a value nothing may change is two places to keep in
-# step for no benefit. What remains here are the things that ARE choices --
-# the step list, the format, the subject and scene tables -- because those
-# genuinely are read from several places and need one home.
-GLAMOUR_OUTPUT_FORMAT: str  = "jpg"
-
-# Diffuse Steps -- the one numeric the user still chooses. 6 is the default
-# because Klein distilled is a 4-step model: 4-6 is its ideal band, 8 is the
-# practical ceiling and past that quality DROPS rather than plateaus. 10 and
-# 12 are offered because a klein-base model wants more, not because the
-# distilled one benefits.
-GLAMOUR_STEP_CHOICES: List[int] = [6, 8, 10, 12]
-GLAMOUR_DEFAULT_STEPS: int      = 6
-
-# Subject Count -> output resolution. Framing follows headcount: one person
-# wants height, a crowd wants width. The pixel budget is held roughly constant
-# across all three (393k / 262k / 393k) so switching framing does not quietly
-# turn a run that fits in VRAM into one that does not.
-SUBJECT_ONE:   str = "1 Person"
-SUBJECT_TWO:   str = "2 People"
-SUBJECT_MANY:  str = "3+ People"
-SUBJECT_COUNT_CHOICES: List[str] = [SUBJECT_ONE, SUBJECT_TWO, SUBJECT_MANY]
-SUBJECT_COUNT_DEFAULT: str = SUBJECT_ONE
-SUBJECT_COUNT_SIZES: Dict[str, tuple] = {
-    SUBJECT_ONE:  (512, 768),   # portrait
-    SUBJECT_TWO:  (512, 512),   # square
-    SUBJECT_MANY: (768, 512),   # landscape
-}
-
-# Subject Gender -- the second half of the subject description, and the only
-# TOKEN substitution in the whole prompt system.
-#
-# WHY IT EXISTS. Flux.2 reads the reference photo for identity but takes its
-# cue on presentation from the text, and with the text silent it guesses from
-# hair and build. A long-haired man comes back in a dress. Saying the word in
-# the prompt costs nothing and settles it.
-#
-# WHY IT IS A TOKEN AND THE SUBJECT CLAUSE IS NOT. The count and the gender
-# are two independent axes -- 3 counts x 3 gender settings is 9 combinations --
-# and one clause per combination would be nine boxes on the Preferences page
-# that all say almost the same thing. So the count still picks which clause
-# runs (three boxes, unchanged) and the gender is substituted INTO it at the
-# <gender> mark. That is a deliberate exception to the "no placeholders" rule
-# the scene prompts follow, and it is safe for the opposite reason the scene
-# prompts are: a scene prompt that loses its subject still renders something
-# plausible and wrong, whereas a clause that loses <gender> is caught on save
-# and reported (see display.save_prefs) because the token is a fixed literal
-# that can be searched for.
-GENDER_MALE:   str = "Male(s)"
-GENDER_MIXED:  str = "M+F(s)"
-GENDER_FEMALE: str = "Female(s)"
-GENDER_CHOICES: List[str] = [GENDER_MALE, GENDER_MIXED, GENDER_FEMALE]
-
-# Male(s), not M+F(s), is the shipped default -- NOT a statement about who is
-# expected to use this, but because M+F(s) at 1 Person resolves to
-# "transgender", and a factory default should not describe the subject of an
-# unread photo that specifically. Male(s) at 1 Person resolves to "male",
-# which is the mildest of the three wrong answers if the operator forgets to
-# set the switch, and the switch sits directly under Subject Count where it
-# cannot be missed.
-GENDER_DEFAULT: str = GENDER_MALE
-
-# The literal mark the substitution looks for, inside the subject clauses.
-# Angle brackets because nothing else in a prose prompt uses them, so a
-# search for it cannot hit ordinary prompt text. Matched case-insensitively
-# at substitution time, so <Gender> and <GENDER> both work.
-GENDER_TOKEN: str = "<gender>"
-
-# (gender setting, subject count) -> the word that replaces <gender>.
-#
-# Nine cells, seven distinct words: "males" covers 2 People and 3+ People
-# alike, as does "females", because English does not distinguish two from many
-# and inventing a distinction ("a pair of males") would read as instruction to
-# the model rather than description. The mixed row is the one that genuinely
-# needs all three: one person of mixed gender is not a group, it is a single
-# individual, and "transgender" is the word that describes them.
-GENDER_WORDS: Dict[str, Dict[str, str]] = {
-    GENDER_MALE: {
-        SUBJECT_ONE:  "male",
-        SUBJECT_TWO:  "males",
-        SUBJECT_MANY: "males",
-    },
-    GENDER_MIXED: {
-        SUBJECT_ONE:  "transgender",
-        SUBJECT_TWO:  "male and female",
-        SUBJECT_MANY: "males and females",
-    },
-    GENDER_FEMALE: {
-        SUBJECT_ONE:  "female",
-        SUBJECT_TWO:  "females",
-        SUBJECT_MANY: "females",
-    },
-}
-
-# Subject Bodyshape -- the second token, and the second thing Flux.2 invents
-# when the prompt does not say.
-#
-# WHY IT EXISTS, and why it is not just more prompt text: Flux.2 has a strong
-# prior toward gym-fit bodies. Left unsaid, a slight person comes back visibly
-# broader than they are, which is the same class of error as the long-haired
-# man in a dress -- the model filling a silence with its training average
-# rather than reading the photo. Naming the shape closes it.
-#
-# UNLIKE GENDER, THIS DOES NOT VARY WITH SUBJECT COUNT. "A bodyshape of
-# skinny" reads the same whether it is describing one person or four, so the
-# table is a flat label -> word map rather than a grid. One shape applies to
-# the whole batch, the same way one gender does; a photo whose subjects differ
-# wants two runs.
-BODYSHAPE_SKINNY:      str = "Skinny"
-BODYSHAPE_SLIM:        str = "Slim"
-BODYSHAPE_AVERAGE:     str = "Average"
-BODYSHAPE_BODYBUILDER: str = "Bodybuilder"
-BODYSHAPE_OVERWEIGHT:  str = "Overweight"
-BODYSHAPE_OBESE:       str = "Obese"
-BODYSHAPE_CHOICES: List[str] = [
-    BODYSHAPE_SKINNY, BODYSHAPE_SLIM, BODYSHAPE_AVERAGE,
-    BODYSHAPE_BODYBUILDER, BODYSHAPE_OVERWEIGHT, BODYSHAPE_OBESE,
-]
-
-# Average is the default, and it is NOT a no-op. Saying "a bodyshape of
-# average" is the whole point -- it is what pushes back on the gym-fit prior
-# for the majority of photos, and a default that substituted nothing would
-# leave exactly the silence this switch exists to fill. Ordered skinny -> obese
-# so the radio reads as a scale, with the default sitting in the middle of it.
-BODYSHAPE_DEFAULT: str = BODYSHAPE_AVERAGE
-
-BODYSHAPE_TOKEN: str = "<bodyshape>"
-
-# Switch label -> the word that replaces <bodyshape>. Mostly the label
-# lowercased, which is deliberate: a one-to-one mapping means what the operator
-# picked on the Generation page is legible in the Debug page's prompt dump
-# without a lookup. This dict is the place to tune wording if a shape comes
-# out weak -- "bodybuilder" to "heavily muscled bodybuilder", say -- rather
-# than editing the three subject clauses, which would have to agree.
-BODYSHAPE_WORDS: Dict[str, str] = {
-    BODYSHAPE_SKINNY:      "skinny",
-    BODYSHAPE_SLIM:        "slim",
-    BODYSHAPE_AVERAGE:     "average",
-    BODYSHAPE_BODYBUILDER: "bodybuilder",
-    BODYSHAPE_OVERWEIGHT:  "overweight",
-    BODYSHAPE_OBESE:       "obese",
-}
-
-# WHICH SCENE(S) TO RUN. Four options, not two.
-#
-# A plain single/all toggle could only ever test Scene 1, which is the wrong
-# shape for the job this program is actually doing right now: the three scene
-# prompts are being TUNED, and tuning Scene 3 means running Scene 3 on its own
-# and looking at the result. With a single/all toggle that costs a full
-# three-scene run every time, two thirds of it discarded, or an edit to
-# whichever prompt happens to sit in slot A.
-#
-# So each scene is individually selectable and "All Scenes" is the production
-# setting. Nothing else changes: All Scenes still runs the three in series,
-# one generation each, so N photos at All Scenes is 3N images.
-SCENE_1:    str = "Scene 1"
-SCENE_2:    str = "Scene 2"
-SCENE_3:    str = "Scene 3"
-ALL_SCENES: str = "All Scenes"
-LOCATION_MODE_CHOICES: List[str] = [SCENE_1, SCENE_2, SCENE_3, ALL_SCENES]
-LOCATION_MODE_DEFAULT: str = ALL_SCENES
-
-# mode -> which entries of LOCATION_PROMPT_KEYS to run, in order. Kept as an
-# explicit map rather than parsed out of the label, so renaming a scene in the
-# UI cannot silently change which prompt it runs.
-LOCATION_MODE_SLICES: Dict[str, List[int]] = {
-    SCENE_1:    [0],
-    SCENE_2:    [1],
-    SCENE_3:    [2],
-    ALL_SCENES: [0, 1, 2],
-}
-
-# The three location prompts and the shared negative, as shipped. These are
-# DEFAULTS ONLY -- the live values live in preferences.json and are edited on
-# the Preferences page. They are full, fixed templates rather than a frame
-# with a {location} hole: the phrasing that works for a statue is not the
-# phrasing that works for a rooftop, and a shared frame would force both into
-# whichever one was written first.
-# THE SCENE HALF of each prompt: landmark, lighting, camera angle. It says
-# nothing about WHO is in the shot or how many -- that is the subject clause's
-# job (below), and the two are concatenated at run time.
-#
-# This split exists because the subject wording has to change with the Subject
-# Count switch and the scene wording must not. Before the split, every scene
-# prompt opened "The individual from the provided image", which flatly
-# contradicted the 2 People and 3+ People settings: the switch would widen the
-# canvas to fit a group while the prompt still asked for one person. Editing
-# that out of three prompts by hand, every time the count changed, is exactly
-# the manual step worth removing.
-DEFAULT_LOCATION_PROMPT_A: str = (
-    "Standing next to a large stone statue of a lion, New York style. "
-    "The optimal front camera angle for the scene."
-)
-DEFAULT_LOCATION_PROMPT_B: str = (
-    "Standing on top of the Empire State Building observation deck, city "
-    "skyline background. The optimal front camera angle for the scene."
-)
-DEFAULT_LOCATION_PROMPT_C: str = (
-    "Standing in front of the Eiffel Tower at sunset. "
-    "The optimal front camera angle for the scene."
-)
-
-# THE SUBJECT HALF: who is in the shot, chosen by the Subject Count switch.
-# One clause per count, each a complete sentence, prepended to whichever scene
-# prompt is running.
-#
-# This is the ONLY dynamic seam in the prompt system. Everything else is sent
-# verbatim -- there are no placeholders, no substitution, nothing assembled
-# from fragments. Concatenation rather than a {subject} token in the scene
-# text is deliberate: a token can be deleted or mistyped while editing a scene
-# on the Preferences page, and a scene prompt that silently lost its subject
-# would still run and still produce an image, just of the wrong thing.
-# EVERY ONE OF THE THREE MUST CONTAIN BOTH <gender> AND <bodyshape>. The
-# 1-Person clause takes the gender as an adjective ("the single male
-# individual") because one word slots in cleanly there; the 2- and 3+-clauses
-# take it as an appositive set off by commas ("the two individuals, male and
-# female,") because the mixed words are phrases, not adjectives, and "the two
-# male and female individuals" does not parse.
-#
-# THE BODYSHAPE IS ITS OWN SENTENCE, second, not another adjective piled onto
-# the first. Two reasons. Stacking ("the single skinny male individual") buries
-# it mid-noun-phrase where it competes with the gender word for the same
-# attention, and a short declarative sentence of its own is how sd.cpp prompts
-# reliably carry a physical attribute. It stays in the SUBJECT half either way
-# -- it describes the person, not the landmark -- so it inherits the subject
-# clause's front position in the assembled prompt, which is where a
-# front-weighted attention model needs it. Edit the wording freely, keep both
-# marks.
-DEFAULT_SUBJECT_CLAUSE_ONE: str = (
-    "Photo-realistic glamour shot of the single <gender> individual from the "
-    "provided image, alone in the foreground. A bodyshape of <bodyshape>."
-)
-DEFAULT_SUBJECT_CLAUSE_TWO: str = (
-    "Photo-realistic glamour shot of the two individuals from the provided "
-    "image, <gender>, together in the foreground. A bodyshape of <bodyshape>."
-)
-DEFAULT_SUBJECT_CLAUSE_MANY: str = (
-    "Photo-realistic glamour shot of the individuals from the provided image, "
-    "<gender>, grouped together in the foreground. A bodyshape of <bodyshape>."
-)
-
-# Subject Count label -> (preferences key, shipped default). Same one-list
-# discipline as LOCATION_PROMPT_KEYS: the switch, the Preferences fields and
-# the prompt builder all read this, so they cannot disagree about which clause
-# belongs to which count.
-SUBJECT_CLAUSE_KEYS: Dict[str, tuple] = {
-    SUBJECT_ONE:  ("subject_clause_one",  DEFAULT_SUBJECT_CLAUSE_ONE),
-    SUBJECT_TWO:  ("subject_clause_two",  DEFAULT_SUBJECT_CLAUSE_TWO),
-    SUBJECT_MANY: ("subject_clause_many", DEFAULT_SUBJECT_CLAUSE_MANY),
-}
-
-DEFAULT_GLAMOUR_NEGATIVE: str = (
-    "Cartoon. Blurry. Visual obstructions. People in the Background. "
-    "Missing/mutated arms/legs. Missing/mutated hands/feet. "
-    "Clothes merging with skin. Phones, headphones."
-)
-
-# preferences.json key <-> display label, in run order. One list, so the
-# Preferences page, the Generation page's read-only preview and the run
-# builder can never disagree about how many scenes there are or what they are
-# called.
-#
-# THE JSON KEYS STAY a/b/c WHILE THE LABELS READ "Scene 1/2/3". The keys are
-# what a hand-edited preferences.json and any older file on disk already use,
-# and renaming them would strand those; the labels are what the operator sees
-# and are matched to the scene selector. This list is the only place the two
-# meet, so they cannot drift.
-LOCATION_PROMPT_KEYS: List[tuple] = [
-    ("location_prompt_a", SCENE_1, DEFAULT_LOCATION_PROMPT_A),
-    ("location_prompt_b", SCENE_2, DEFAULT_LOCATION_PROMPT_B),
-    ("location_prompt_c", SCENE_3, DEFAULT_LOCATION_PROMPT_C),
-]
-
 # ---------------------------------------------------------------------------
 # Preferences (data/preferences.json — the Preferences page)
 # ---------------------------------------------------------------------------
@@ -1858,7 +1562,7 @@ THUMBNAIL_GALLERY_HEIGHT: int = 123
 # rather than the moment Save is clicked. Gradio has no runtime stylesheet
 # hook to do better without shipping a <style> injection hack.
 INPUT_THUMBNAIL_CHOICES: List[int] = [96, 128, 160, 196]
-DEFAULT_INPUT_THUMBNAIL: int = 96
+DEFAULT_INPUT_THUMBNAIL: int = 128
 
 # Vertical padding Gradio's own .grid-wrap adds above and below the row (8px
 # each). Subtracted when deriving the square cell width from the row height,
@@ -2752,22 +2456,6 @@ def _default_preferences() -> Dict[str, Any]:
         "max_thumbnails": DEFAULT_MAX_THUMBNAILS,
         "input_thumbnail_size": DEFAULT_INPUT_THUMBNAIL,
         "encoder_model_debug": False,
-        # The three location prompts and the one shared negative. These live
-        # in PREFERENCES rather than generation.json because they are standing
-        # taste -- the set of landmarks this install offers -- not the state of
-        # one run. Consequences that make this the right file: they survive a
-        # clean install, and they are not rewritten on every Generate click,
-        # so an edit made on the Preferences page cannot be clobbered by a run
-        # that started before it.
-        "location_prompt_a": DEFAULT_LOCATION_PROMPT_A,
-        "location_prompt_b": DEFAULT_LOCATION_PROMPT_B,
-        "location_prompt_c": DEFAULT_LOCATION_PROMPT_C,
-        "glamour_negative_prompt": DEFAULT_GLAMOUR_NEGATIVE,
-        # One subject sentence per Subject Count setting. Prepended to
-        # whichever scene prompt is running -- see build_positive_prompt.
-        "subject_clause_one":  DEFAULT_SUBJECT_CLAUSE_ONE,
-        "subject_clause_two":  DEFAULT_SUBJECT_CLAUSE_TWO,
-        "subject_clause_many": DEFAULT_SUBJECT_CLAUSE_MANY,
     }
 
 
@@ -2856,14 +2544,6 @@ GENERATION_KEYS: List[str] = [
     "imagegen_last_family",
     "output_format",
     "last_prompt", "negative_prompt",
-    # Glamour mode: the three things still on the Generation page that the
-    # user picks and expects to find again next launch. Subject Count and
-    # Subject Gender are here rather than in preferences because they describe
-    # the batch of photos in front of you right now, which is exactly what
-    # generation.json is for -- the CLAUSES they select between are standing
-    # taste and live in preferences.json instead.
-    "imagegen_subject_count", "imagegen_location_mode",
-    "imagegen_gender", "imagegen_bodyshape",
 ]
 
 
@@ -3006,30 +2686,14 @@ def _default_generation() -> Dict[str, Any]:
     Every key here must appear in GENERATION_KEYS, and none of them may appear
     in _default_configuration() or _default_preferences()."""
     return {
-        # Width/height are still stored, but glamour mode DERIVES them from
-        # Subject Count on every run (see subject_count_size) rather than
-        # reading them back. They are seeded to the 1-Person portrait pair so
-        # a file inspected by hand is not misleading about what will run.
         "imagegen_width": 512,
-        "imagegen_height": 768,
-        "imagegen_steps": GLAMOUR_DEFAULT_STEPS,
-        # Literals, matching what display.do_generate() hard-codes and
-        # overwrites on every run. Seeded here only so a generation.json read
-        # by hand before the first run is not misleading.
+        "imagegen_height": 512,
+        "imagegen_steps": 6,
         "imagegen_cfg_scale": 1.0,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
-        "imagegen_batch_count": 1,
+        "imagegen_batch_count": 2,
         "imagegen_quality_preset": "Fast (Turbo)",
-        "imagegen_subject_count": SUBJECT_COUNT_DEFAULT,
-        "imagegen_location_mode": LOCATION_MODE_DEFAULT,
-        # Subject Gender -> the word substituted into the subject clause's
-        # <gender> mark. See GENDER_WORDS for the nine-cell table and
-        # GENDER_DEFAULT for why Male(s) rather than M+F(s) ships as default.
-        "imagegen_gender": GENDER_DEFAULT,
-        # Subject Bodyshape -> the word substituted into <bodyshape>. Average
-        # is the default and is NOT a no-op; see BODYSHAPE_DEFAULT.
-        "imagegen_bodyshape": BODYSHAPE_DEFAULT,
         # img2img denoise strength: 0.0 returns the init image untouched, 1.0
         # ignores it entirely. sd.cpp's own default is 0.75, but I use 0.65.
         "imagegen_strength": 0.65,
@@ -3042,16 +2706,9 @@ def _default_generation() -> Dict[str, Any]:
         # so the Generation page needs to know whether the current values were
         # chosen FOR the current family or inherited from a different one.
         "imagegen_last_family": "",
-        # JPG, not PNG. These are photographic outputs headed for a client,
-        # and at 512x768 a PNG is several times the size for no visible gain.
-        "output_format": GLAMOUR_OUTPUT_FORMAT,
-        # last_prompt is vestigial in glamour mode -- the positive prompts come
-        # from preferences.json, not from a box on this page -- but the key
-        # stays so an older generation.json still loads without a backfill
-        # warning, and so the Debug page can show what a pre-glamour build
-        # left behind.
+        "output_format": "png",
         "last_prompt": "",
-        "negative_prompt": DEFAULT_GLAMOUR_NEGATIVE,
+        "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
     }
 
 
@@ -3154,220 +2811,6 @@ def get_input_thumbnail_size() -> int:
     except (TypeError, ValueError):
         return DEFAULT_INPUT_THUMBNAIL
     return value if value in INPUT_THUMBNAIL_CHOICES else DEFAULT_INPUT_THUMBNAIL
-
-
-# ---------------------------------------------------------------------------
-# Glamour-mode accessors
-# ---------------------------------------------------------------------------
-# All four read preferences.json and all four fall back to the shipped
-# default when the stored value is missing, non-string or blank. Blank
-# matters: the Preferences page lets the user clear a box, and an empty
-# positive prompt sent to sd-cli is a run that wastes a minute producing
-# noise. Clearing a box therefore restores the default rather than disabling
-# the location -- use Single Location mode to run fewer than three.
-
-def get_location_prompts() -> List[tuple]:
-    """The three (label, prompt_text) pairs, in run order A, B, C.
-
-    Reads preferences.json once and resolves every slot against
-    LOCATION_PROMPT_KEYS, so a hand-edited file that is missing a key, or has
-    it set to null or "", still yields three usable prompts.
-    """
-    prefs = load_preferences()
-    out: List[tuple] = []
-    for key, label, fallback in LOCATION_PROMPT_KEYS:
-        value = prefs.get(key, fallback)
-        if not isinstance(value, str) or not value.strip():
-            value = fallback
-        out.append((label, value.strip()))
-    return out
-
-
-def active_location_prompts(mode: str) -> List[tuple]:
-    """The (label, prompt) pairs a run should actually use, in run order.
-
-    Scene 1/2/3 -> that one prompt alone. All Scenes -> all three, which is
-    what makes one input photo produce three output images.
-
-    An unrecognised mode -- from a hand-edited generation.json, or a file
-    written by the older two-way build that stored "All Three Locations" --
-    falls back to ALL_SCENES rather than to a single scene. That is the safer
-    failure of the two: producing the full set the program exists to produce
-    is immediately visible and re-runnable, whereas silently dropping to one
-    scene looks like a successful run that quietly did a third of the work.
-    """
-    prompts = get_location_prompts()
-    indices = LOCATION_MODE_SLICES.get(mode, LOCATION_MODE_SLICES[ALL_SCENES])
-    return [prompts[i] for i in indices if i < len(prompts)]
-
-
-def get_glamour_negative() -> str:
-    """The single shared negative prompt, from preferences.json."""
-    value = load_preferences().get("glamour_negative_prompt",
-                                   DEFAULT_GLAMOUR_NEGATIVE)
-    if not isinstance(value, str) or not value.strip():
-        return DEFAULT_GLAMOUR_NEGATIVE
-    return value.strip()
-
-
-def get_subject_clause(subject_count: str) -> str:
-    """The subject sentence for a Subject Count label, from preferences.json.
-
-    Falls back to the shipped default on a missing, non-string or blank value,
-    and to the 1-Person clause on an unrecognised count -- the same blank-means-
-    default rule the scene prompts follow, for the same reason: an empty half
-    would send a prompt that never says who is in the picture.
-    """
-    key, fallback = SUBJECT_CLAUSE_KEYS.get(
-        subject_count, SUBJECT_CLAUSE_KEYS[SUBJECT_ONE])
-    value = load_preferences().get(key, fallback)
-    if not isinstance(value, str) or not value.strip():
-        return fallback
-    return value.strip()
-
-
-def gender_word(gender: str, subject_count: str) -> str:
-    """The word that replaces <gender>, for a (gender, count) pair.
-
-    Both arguments are validated against the choice lists rather than trusted,
-    because both can arrive from a hand-edited generation.json. An unknown
-    gender falls back to GENDER_DEFAULT and an unknown count to SUBJECT_ONE --
-    the same rule subject_count_size() already uses, and for the same reason:
-    one person is the overwhelmingly common case.
-    """
-    row = GENDER_WORDS.get(gender, GENDER_WORDS[GENDER_DEFAULT])
-    return row.get(subject_count, row[SUBJECT_ONE])
-
-
-def bodyshape_word(bodyshape: str) -> str:
-    """The word that replaces <bodyshape>.
-
-    Takes no subject count, unlike gender_word: the shape word is the same for
-    one person or four. Validated rather than trusted, for the same reason --
-    the value can arrive from a hand-edited generation.json.
-    """
-    return BODYSHAPE_WORDS.get(bodyshape, BODYSHAPE_WORDS[BODYSHAPE_DEFAULT])
-
-
-# The two marks a subject clause is expected to carry, as (token, what it is
-# for) pairs. ONE list, so the Preferences warning, the Debug page's check and
-# the substitution itself cannot disagree about how many marks there are --
-# adding a third token later is an edit here plus its word table, not a hunt
-# through three files.
-SUBJECT_TOKENS: List[tuple] = [
-    (GENDER_TOKEN,    "Subject Gender"),
-    (BODYSHAPE_TOKEN, "Subject Bodyshape"),
-]
-
-
-def missing_subject_tokens(text: str) -> List[str]:
-    """Which of SUBJECT_TOKENS a clause has lost, as a list of marks.
-
-    Used by the Preferences page to warn on save and by the Debug page to
-    flag. It is NOT used to reject or rewrite the edit: a clause without a
-    mark is still a valid prompt, just one where that switch has no effect,
-    and silently restoring the default over someone's deliberate wording would
-    be worse than telling them what they have done.
-    """
-    if not isinstance(text, str):
-        return [tok for tok, _ in SUBJECT_TOKENS]
-    low = text.lower()
-    return [tok for tok, _ in SUBJECT_TOKENS if tok.lower() not in low]
-
-
-def clause_has_gender_token(text: str) -> bool:
-    """True when a subject clause still carries the <gender> mark.
-
-    Kept as its own predicate because it reads better at the one call site
-    that cares only about gender; everything that wants the full picture calls
-    missing_subject_tokens() instead.
-    """
-    if not isinstance(text, str):
-        return False
-    return GENDER_TOKEN.lower() in text.lower()
-
-
-def apply_subject_tokens(text: str, subject_count: str, gender: str,
-                         bodyshape: str) -> str:
-    """Substitute BOTH marks into a clause, case-insensitively.
-
-    <gender>, <Gender> and <GENDER> all match, and the same for <bodyshape>,
-    so an edit that capitalised a mark at the start of a sentence still works.
-    Text with a mark missing is returned with the others done -- see
-    missing_subject_tokens for why a missing mark is a warning, not an error.
-
-    Substitution is done in ONE pass per token against the ORIGINAL marks, so
-    a word that happened to contain another mark's text could not be
-    re-substituted on a later pass. The double space a substitution can leave
-    behind is collapsed, because sd.cpp tokenises the prompt as written.
-    """
-    if not isinstance(text, str) or not text:
-        return ""
-    out = re.sub(re.escape(GENDER_TOKEN), gender_word(gender, subject_count),
-                 text, flags=re.IGNORECASE)
-    out = re.sub(re.escape(BODYSHAPE_TOKEN), bodyshape_word(bodyshape),
-                 out, flags=re.IGNORECASE)
-    return re.sub(r"[ \t]{2,}", " ", out).strip()
-
-
-def resolve_subject_clause(subject_count: str, gender: str,
-                           bodyshape: str = BODYSHAPE_DEFAULT) -> str:
-    """The subject clause with both marks already substituted.
-
-    get_subject_clause() returns what is STORED (marks and all); this returns
-    what is SENT. Anything reporting on a run -- the Debug page -- wants this
-    one, so that the page whose job is to say what the program does is not
-    showing marks the model never sees.
-    """
-    return apply_subject_tokens(get_subject_clause(subject_count),
-                                subject_count, gender, bodyshape)
-
-
-def build_positive_prompt(scene_prompt: str, subject_count: str,
-                          gender: str = GENDER_DEFAULT,
-                          bodyshape: str = BODYSHAPE_DEFAULT) -> str:
-    """Assemble the full positive prompt actually sent to sd-cli.
-
-    Subject clause first, then the scene. That order because the subject is
-    the thing being generated and the scene is where it is put -- and because
-    diffusion attention is front-weighted, so the person the whole program
-    exists to render should not be trailing a landmark description.
-
-    This is the one place the parts meet -- gender and bodyshape into the
-    clause, clause onto scene. Anything that wants to know what will be sent
-    -- the run loop, the Debug page -- calls this rather than concatenating
-    for itself, so there is no second copy of the join to drift.
-
-    `gender` and `bodyshape` default to their shipped values rather than being
-    required, so a call site that predates either switch still produces a
-    complete, sendable prompt instead of one with a literal mark left in it.
-    """
-    subject = resolve_subject_clause(subject_count, gender, bodyshape)
-    scene = (scene_prompt or "").strip()
-    if not scene:
-        return subject
-    return f"{subject} {scene}"
-
-
-def subject_count_size(label: str) -> tuple:
-    """(width, height) for a Subject Count label; portrait for anything
-    unrecognised, since one person is the overwhelmingly common case."""
-    return SUBJECT_COUNT_SIZES.get(label, SUBJECT_COUNT_SIZES[SUBJECT_ONE])
-
-
-def is_flux2_diffuser(diff_path: str, diff_arch: str = "") -> bool:
-    """True when the configured diffuser is a Flux.2 file of either variant.
-
-    This program is Flux.2-only by design -- the whole pipeline assumes the -r
-    reference-image path, which is how Flux.2 conditions on an input photo.
-    SDXL and FLUX.1 denoise from a single -i init image instead, which
-    restyles the photo rather than placing the person in a new scene, and
-    Z-Image takes no input image at all. Rather than let those produce
-    confusing output, the Generation page gates on this.
-    """
-    if not diff_path:
-        return False
-    return diffuser_family(diff_path, diff_arch) == DIFFUSER_FAMILY_FLUX2
 
 
 # ---------------------------------------------------------------------------
