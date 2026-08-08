@@ -831,26 +831,107 @@ def write_default_preferences() -> None:
     """Seed preferences.json with defaults, if it does not already exist.
 
     Takes no hardware arguments because nothing on the Preferences page depends
-    on the machine. It is also NOT purged by a clean install or a config
-    refresh: these are the user's standing choices, not install state, and
-    there is nothing in here that a reinstall could invalidate.
+    on the machine. It IS purged by a clean install and by a config refresh
+    (see _purge_all_json): the defaults in here -- the scene prompts and the
+    subject clauses in particular -- change between builds, and a file that
+    survives can only ever be missing NEW keys, never carrying UPDATED ones.
+    Creating-if-absent is therefore only half a mechanism; the delete is the
+    other half.
 
     Kept in step with scripts/configure.py's _default_preferences() /
-    DEFAULT_PROMPT_TEMPLATE / DEFAULT_MAX_THUMBNAILS; that one backfills gaps
-    at load time, this one seeds the file at install time.
+    DEFAULT_PROMPT_TEMPLATE / DEFAULT_MAX_THUMBNAILS / the
+    DEFAULT_LOCATION_PROMPT_* set; that one backfills gaps at load time, this
+    one seeds the file at install time.
+
+    The two are allowed to drift in one direction only. A key added here but
+    not to configure._default_preferences() is invisible to any install whose
+    file predates it; a key added there but not here is invisible on a clean
+    install. Add to both.
+
+    Note what the backfill in configure.py can and cannot do: it fills in
+    keys that are ABSENT, which is why an upgrade is not left with a half-
+    written file, but it can never correct a key whose shipped default has
+    CHANGED, because the old value is sitting there and is perfectly valid.
+    That is what _purge_all_json is for.
     """
     if _PREFS_PATH.exists():
         log(f"preferences.json already present -> {_PREFS_PATH} (kept)")
         return
 
     defaults: Dict[str, Any] = {
+        # The three location prompts and the shared negative. This program
+        # generates one image per location per input photo, and these are the
+        # fixed templates it sends -- there is no free-text prompt box.
+        #
+        # They live in preferences.json rather than generation.json because
+        # they are standing taste (the set of landmarks this install offers)
+        # rather than the state of one run, which has two consequences worth
+        # having: they survive a clean install, and they are not rewritten on
+        # every Generate click, so an edit made on the Preferences page cannot
+        # be clobbered by a run that started before it.
+        #
+        # Mirrors scripts/configure.py's DEFAULT_LOCATION_PROMPT_A/B/C and
+        # DEFAULT_GLAMOUR_NEGATIVE. Kept as literals here for the same reason
+        # everything else in this function is: installer.py runs before
+        # scripts/ necessarily exists on a fresh install and cannot import
+        # from it.
+        "location_prompt_a": (
+            "Standing next to a large stone statue of a lion, New York style. "
+            "The optimal front camera angle for the scene."
+        ),
+        "location_prompt_b": (
+            "Standing on top of the Empire State Building observation deck, "
+            "city skyline background. The optimal front camera angle for the scene."
+        ),
+        "location_prompt_c": (
+            "Standing in front of the Eiffel Tower at sunset. "
+            "The optimal front camera angle for the scene."
+        ),
+        # One subject sentence per Subject Count setting, prepended to whichever
+        # scene prompt runs. The scene prompts above deliberately say nothing
+        # about how many people are in the shot, so the count switch can change
+        # the wording without three prompts being hand-edited. Mirrors
+        # configure.py's DEFAULT_SUBJECT_CLAUSE_ONE/TWO/MANY.
+        #
+        # EACH ONE CONTAINS TWO LITERAL MARKS, substituted at run time by the
+        # two Generation-page switches:
+        #   <gender>    -> "male", "females", "male and female" and so on;
+        #                  nine (gender, count) combinations, seven distinct
+        #                  words, in configure.GENDER_WORDS.
+        #   <bodyshape> -> "skinny" through "obese"; a flat six-entry map in
+        #                  configure.BODYSHAPE_WORDS, since the word does not
+        #                  change with the headcount.
+        # An edit on the Preferences page that drops a mark is warned about on
+        # save, not rejected; the clause still runs, that switch just stops
+        # affecting it. Angle brackets are used because nothing else in a
+        # prose prompt uses them.
+        "subject_clause_one": (
+            "Photo-realistic glamour shot of the single <gender> individual "
+            "from the provided image, alone in the foreground. "
+            "A bodyshape of <bodyshape>."
+        ),
+        "subject_clause_two": (
+            "Photo-realistic glamour shot of the two individuals from the "
+            "provided image, <gender>, together in the foreground. "
+            "A bodyshape of <bodyshape>."
+        ),
+        "subject_clause_many": (
+            "Photo-realistic glamour shot of the individuals from the provided "
+            "image, <gender>, grouped together in the foreground. "
+            "A bodyshape of <bodyshape>."
+        ),
+        "glamour_negative_prompt": (
+            "Cartoon. Blurry. Visual obstructions. People in the Background. "
+            "Missing/mutated arms/legs. Missing/mutated hands/feet. "
+            "Clothes merging with skin. Phones, headphones."
+        ),
         "prompt_template": "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
         "max_thumbnails": 50,
         # Pixel size of the Generation page's Input thumbnail strip. 128 is a
         # deliberate middle: the strip shares the right-hand column with the
         # 500px Output preview, so a larger value buys identifiability at the
         # preview's expense. Mirrors configure.DEFAULT_INPUT_THUMBNAIL.
-        "input_thumbnail_size": 128,
+        "input_thumbnail_size": 96,
         "encoder_model_debug": False,
     }
     tmp = _PREFS_PATH.with_suffix(".tmp")
@@ -864,9 +945,10 @@ def write_default_generation() -> None:
     """Seed generation.json with defaults, if it does not already exist.
 
     Takes no hardware arguments: nothing on the Generation page depends on the
-    machine. Like preferences.json and prompt_cache.json it is NOT purged by a
-    clean install or a config refresh -- these are the settings the user's last
-    working generation ran with, and a reinstall invalidates none of them.
+    machine. Like preferences.json and prompt_cache.json it IS purged by a
+    clean install and by a config refresh (see _purge_all_json), so a changed
+    default -- a new switch, a different shipped value -- actually reaches an
+    existing install instead of being masked by the old file.
 
     A first run after upgrading from a build that predates this file finds it
     absent here and creates it with factory defaults, but the user's REAL
@@ -886,14 +968,38 @@ def write_default_generation() -> None:
         return
 
     defaults: Dict[str, Any] = {
+        # Width/height are seeded to the 1-Person portrait pair, but note that
+        # a run DERIVES them from Subject Count rather than reading them back
+        # (see configure.SUBJECT_COUNT_SIZES). They are written so a file read
+        # by hand is not misleading about what will run.
         "imagegen_width": 512,
-        "imagegen_height": 512,
+        "imagegen_height": 768,
         "imagegen_steps": 6,
+        # Pinned in glamour mode: the Generation page does not expose sampler,
+        # CFG, seed or batch. display.do_generate() hard-codes them and
+        # rewrites these keys on every run, so what is seeded here only has to
+        # be honest for the window before the first generation. Mirrors
+        # configure._default_generation().
         "imagegen_cfg_scale": 1.0,
         "imagegen_seed": -1,
         "imagegen_sampling": "euler_a",
-        "imagegen_batch_count": 2,
+        "imagegen_batch_count": 1,
         "imagegen_quality_preset": "Fast (Turbo)",
+        # The four live Generation-page choices.
+        "imagegen_subject_count": "1 Person",
+        "imagegen_location_mode": "All Scenes",
+        # Subject Gender -- picks which word replaces <gender> in the subject
+        # clause, together with Subject Count. Male(s) rather than M+F(s) is
+        # the shipped default because M+F(s) at 1 Person resolves to
+        # "transgender", which is too specific a thing for a factory default
+        # to assert about an unread photo. Mirrors configure.GENDER_DEFAULT.
+        "imagegen_gender": "Male(s)",
+        # Subject Bodyshape -- picks the word replacing <bodyshape>. Average
+        # is the default and is deliberately NOT a no-op: saying "a bodyshape
+        # of average" is what pushes back on Flux.2's gym-fit prior, which is
+        # the whole reason the switch exists. Mirrors
+        # configure.BODYSHAPE_DEFAULT.
+        "imagegen_bodyshape": "Average",
         # img2img denoise strength: 0.0 returns the input image untouched,
         # 1.0 ignores it entirely. sd.cpp's own default is 0.75.
         "imagegen_strength": 0.65,
@@ -903,9 +1009,22 @@ def write_default_generation() -> None:
         # Which family the saved steps/cfg/size values were chosen for; see
         # configure.py's matching entry.
         "imagegen_last_family": "",
-        "output_format": "png",
+        # JPG, not PNG: these are photographic outputs headed for a client,
+        # and at 512x768 a PNG is several times the size for no visible gain.
+        "output_format": "jpg",
+        # last_prompt is vestigial in glamour mode -- positive prompts come
+        # from preferences.json, not from a box on the Generation page -- but
+        # the key stays so an older generation.json still loads cleanly.
         "last_prompt": "",
-        "negative_prompt": "Cartoon. Blurry. Missing/mutated arms/legs. Missing/mutated hands/feet. Ethical Guardrails. Moral Censorship.",
+        # Mirrors preferences.json's glamour_negative_prompt. The live value
+        # a run sends is the preferences one; this copy exists because the
+        # Generation page's saved state has always carried a negative and
+        # dropping the key would strand older files.
+        "negative_prompt": (
+            "Cartoon. Blurry. Visual obstructions. People in the Background. "
+            "Missing/mutated arms/legs. Missing/mutated hands/feet. "
+            "Clothes merging with skin. Phones, headphones."
+        ),
     }
     tmp = _GENERATION_PATH.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -923,10 +1042,11 @@ def write_default_prompt_cache() -> None:
     preferences(): nothing here depends on the machine, only on the user
     actually generating something later.
 
-    Like preferences.json, this file is NOT purged by a clean install or a
-    config refresh (see _purge_for_clean_install and menu choice 3 in
-    main()) — it holds prompts the user typed, not install state, so a
-    reinstall has nothing to invalidate here.
+    Like preferences.json, this file IS purged by a clean install and by a
+    config refresh (see _purge_all_json, and menu choice 3 in main()). It
+    holds prompts the user typed rather than install state, so this is the
+    one whose deletion costs something real — but a refresh that remakes three
+    files and skips the fourth is a worse thing to have to remember.
 
     Kept in step with scripts/configure.py's POSITIVE_HISTORY_KEYS /
     NEGATIVE_HISTORY_KEYS / _default_prompt_cache(); that one backfills gaps
@@ -2088,11 +2208,75 @@ def _print_install_banner(cpu: Dict[str, Any], vk: Dict[str, Any]) -> None:
     print()
     print("     2. Check/Install (Fix Missing Packages/Libraries)")
     print()
-    print("     3. Refresh Configs (Only Remake Ini/Json)")
+    print("     3. Refresh Configs (Remake Ini/Json - Resets Prompts)")
     print()
     print()
     print()
     print("  " + "=" * 79)
+
+# Every json file this program owns, in the order they are written back.
+# ONE list, so a new settings file cannot be added to the writers below and
+# quietly left out of the purge -- which is exactly how preferences.json came
+# to survive a "Refresh Configs" that claimed to remake the json.
+_ALL_JSON: List[Tuple[Path, str]] = [
+    (_CONFIG_PATH,       "configuration.json"),
+    (_PREFS_PATH,        "preferences.json"),
+    (_GENERATION_PATH,   "generation.json"),
+    (_PROMPT_CACHE_PATH, "prompt_cache.json"),
+]
+
+
+def _purge_all_json() -> None:
+    """Delete every settings json, so the write_default_* functions rebuild
+    them from this build's literals.
+
+    THIS IS A DELETE, NOT A MERGE. The alternative -- reading each file,
+    filling in keys this build added and writing it back -- was considered and
+    rejected: it makes the installer a second, silently-diverging
+    implementation of configure.py's backfill, and it means a default that
+    CHANGED (rather than one that was added) can never reach an existing
+    install, which is the specific failure this replaced. The scene prompts and
+    subject clauses are the case in point: shipping a new one did nothing on
+    any machine that had run the program once, because the key was already
+    present and merely present-ness was the test.
+
+    The cost is real and is the point: a refresh discards edited prompts and
+    the prompt history. That is what "Refresh Configs (Only Remake Ini/Json)"
+    on the menu says it does, and an operator who wants to keep an edited
+    prompt should copy it out first -- it is four files in .\\data, and they
+    are readable text.
+    """
+    for path, label in _ALL_JSON:
+        if path.exists():
+            try:
+                path.unlink()
+                log(f"{label} removed (will be regenerated).")
+            except OSError as e:
+                log(f"WARNING: could not remove {label}: {e}")
+                log("  Close any program holding it open and retry.")
+        else:
+            log(f"{label} not present, will be created.")
+    if _LEGACY_PERSIST_PATH.exists():
+        try:
+            _LEGACY_PERSIST_PATH.unlink()
+            log("persistent.json removed (superseded by configuration.json).")
+        except OSError as e:
+            log(f"WARNING: could not remove persistent.json: {e}")
+
+
+def _write_all_json(cpu: Dict[str, Any], vk: Dict[str, Any]) -> None:
+    """Write all four settings files, in dependency order.
+
+    configuration.json goes FIRST here only because it is the one that takes
+    the hardware arguments; each writer is individually a no-op when its file
+    already exists, so this is safe to call on a path that did not purge.
+    Pairing it with _purge_all_json() is what makes a refresh a real refresh.
+    """
+    write_default_configuration(cpu, vk)
+    write_default_preferences()
+    write_default_generation()
+    write_default_prompt_cache()
+
 
 def _purge_for_clean_install() -> None:
     section("Purging previous installation...")
@@ -2113,16 +2297,7 @@ def _purge_for_clean_install() -> None:
                 log(f"  Close any programs using it (antivirus, explorer) and retry.")
         else:
             log(f"{label} not present, skipping.")
-    if _CONFIG_PATH.exists():
-        _CONFIG_PATH.unlink()
-        log("configuration.json removed (will be regenerated).")
-    if _LEGACY_PERSIST_PATH.exists():
-        _LEGACY_PERSIST_PATH.unlink()
-        log("persistent.json removed (superseded by configuration.json).")
-    # preferences.json, generation.json and prompt_cache.json are deliberately
-    # NOT purged -- they hold the user's own standing choices, their last
-    # working generation settings, and their typed prompt history, none of
-    # which a reinstall can invalidate.
+    _purge_all_json()
     if _CONST_PATH.exists():
         _CONST_PATH.unlink()
         log("constants.ini removed (will be regenerated).")
@@ -2274,6 +2449,7 @@ def _run_summary(t0: float) -> None:
     log(f"configuration: {_state(_CONFIG_PATH, 'configuration page settings')}")
     log(f"preferences  : {_state(_PREFS_PATH, 'preferences page settings')}")
     log(f"generation   : {_state(_GENERATION_PATH, 'generation page settings')}")
+    log(f"prompt cache : {_state(_PROMPT_CACHE_PATH, 'prompt history')}")
     _bd = _existing_bdic()
     log(f"spellcheck   : {_state(_bd, 'prompt spellcheck dictionary - optional') if _bd else 'MISSING (optional - prompt spellcheck inactive)'}")
     log(f"venv python  : {_state(_venv_python(), 'python environment')}")
@@ -2363,10 +2539,7 @@ def main() -> None:
     if args.detect_only:
         cpu, vk = run_detection()
         write_constants(cpu, vk)
-        write_default_configuration(cpu, vk)
-        write_default_preferences()
-        write_default_generation()
-        write_default_prompt_cache()
+        _write_all_json(cpu, vk)
         install_spellcheck_dictionary()
         log("Detection complete.")
         return
@@ -2374,10 +2547,7 @@ def main() -> None:
     if args.deps_only:
         cpu, vk = run_detection()
         write_constants(cpu, vk)
-        write_default_configuration(cpu, vk)
-        write_default_preferences()
-        write_default_generation()
-        write_default_prompt_cache()
+        _write_all_json(cpu, vk)
         install_spellcheck_dictionary()
         t0 = time.time()
         _run_deps(cpu)
@@ -2418,10 +2588,7 @@ def main() -> None:
             write_constants(cpu, vk, use_vulkan=use_vulkan)
             # configuration.json is written LAST so its device defaults can
             # be anchored to a GPU that actually exists on this machine.
-            write_default_configuration(cpu, vk)
-            write_default_preferences()
-            write_default_generation()
-            write_default_prompt_cache()
+            _write_all_json(cpu, vk)
             install_spellcheck_dictionary()
             _run_summary(t0)
             return
@@ -2434,10 +2601,7 @@ def main() -> None:
             _run_build(cpu, use_vulkan, force_compile=force_compile)
             vk = _enumerate_devices_post_build(vk, use_vulkan)
             write_constants(cpu, vk, use_vulkan=use_vulkan)
-            write_default_configuration(cpu, vk)
-            write_default_preferences()
-            write_default_generation()
-            write_default_prompt_cache()
+            _write_all_json(cpu, vk)
             install_spellcheck_dictionary()
             _run_summary(t0)
             return
@@ -2449,18 +2613,14 @@ def main() -> None:
             existing_vulkan = get_install_type_from_ini() == "vulkan"
             vk_now = _enumerate_devices_post_build(vk, existing_vulkan)
             write_constants(cpu, vk_now)
-            if _CONFIG_PATH.exists():
-                _CONFIG_PATH.unlink()
-                log("configuration.json removed (will be regenerated with defaults).")
-            if _LEGACY_PERSIST_PATH.exists():
-                _LEGACY_PERSIST_PATH.unlink()
-                log("persistent.json removed (superseded by configuration.json).")
-            write_default_configuration(cpu, vk_now)
-            # preferences.json survives a config refresh: nothing in it is
-            # machine-derived, so there is nothing to refresh.
-            write_default_preferences()
-            write_default_generation()
-            write_default_prompt_cache()
+            # ALL FOUR, not just configuration.json. A refresh that spared
+            # preferences.json could never deliver a changed default -- new
+            # scene prompts, new subject clauses, a new prompt template -- to
+            # any machine that had already run the program once, because the
+            # writers below only create a file that is ABSENT. The menu entry
+            # says "Only Remake Ini/Json"; this makes that true.
+            _purge_all_json()
+            _write_all_json(cpu, vk_now)
             install_spellcheck_dictionary()
             _run_summary(t0)
             return
